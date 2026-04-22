@@ -92,6 +92,20 @@ export async function handleLogin(request: Request, env: Env): Promise<Response>
   return jsonResponse({ token, user: { id: user.id, email: user.email, name: user.name } });
 }
 
+export async function handleMe(request: Request, env: Env): Promise<Response> {
+  if (request.method !== 'GET') return new Response('Method not allowed', { status: 405 });
+  const auth = await requireAuth(request, env);
+  if (auth instanceof Response) return auth;
+
+  const user = await env.DB
+    .prepare('SELECT id, email, name, created_at FROM users WHERE id = ?')
+    .bind(auth.userId)
+    .first<Pick<User, 'id' | 'email' | 'name' | 'created_at'>>();
+
+  if (!user) return jsonResponse({ error: 'User not found' }, 404);
+  return jsonResponse({ user });
+}
+
 export async function requireAuth(request: Request, env: Env): Promise<{ userId: string; email: string } | Response> {
   const auth = request.headers.get('Authorization') ?? '';
   const token = auth.startsWith('Bearer ') ? auth.slice(7) : null;

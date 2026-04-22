@@ -1,6 +1,6 @@
 /// <reference types="@cloudflare/workers-types" />
 
-import { handleLogin, handleRegister } from './auth';
+import { handleLogin, handleRegister, handleMe } from './auth';
 
 interface Env {
   DB: D1Database;
@@ -26,6 +26,7 @@ export default {
     // API routes
     if (path === '/api/auth/register') return addCors(await handleRegister(request, env));
     if (path === '/api/auth/login')    return addCors(await handleLogin(request, env));
+    if (path === '/api/me')            return addCors(await handleMe(request, env));
 
     // UI routes
     if (path === '/') {
@@ -42,6 +43,12 @@ export default {
 
     if (path === '/register') {
       return new Response(REGISTER_PAGE, {
+        headers: { 'Content-Type': 'text/html; charset=utf-8' }
+      });
+    }
+
+    if (path === '/dashboard') {
+      return new Response(DASHBOARD_PAGE, {
         headers: { 'Content-Type': 'text/html; charset=utf-8' }
       });
     }
@@ -1055,11 +1062,40 @@ const LOGIN_PAGE = `<!DOCTYPE html>
 <body>
   <div class="container">
     <h1>Log In</h1>
-    <input type="email" placeholder="Email address" />
-    <input type="password" placeholder="Password" />
-    <button onclick="alert('Login coming soon')">Log In</button>
+    <div id="error" style="display:none;color:#f87171;background:rgba(248,113,113,0.1);border:1px solid rgba(248,113,113,0.3);border-radius:8px;padding:0.75rem 1rem;margin-bottom:1.2rem;font-size:0.9rem;"></div>
+    <input id="email" type="email" placeholder="Email address" />
+    <input id="password" type="password" placeholder="Password" />
+    <button id="btn" onclick="doLogin()">Log In</button>
     <p>No account? <a href="/register">Sign up</a></p>
   </div>
+  <script>
+    async function doLogin() {
+      const email = document.getElementById('email').value.trim();
+      const password = document.getElementById('password').value;
+      const err = document.getElementById('error');
+      const btn = document.getElementById('btn');
+      err.style.display = 'none';
+      if (!email || !password) { err.textContent = 'Please fill in all fields.'; err.style.display = 'block'; return; }
+      btn.textContent = 'Logging in…'; btn.disabled = true;
+      try {
+        const res = await fetch('/api/auth/login', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ email, password })
+        });
+        const data = await res.json();
+        if (!res.ok) { err.textContent = data.error || 'Login failed.'; err.style.display = 'block'; return; }
+        localStorage.setItem('dagama_token', data.token);
+        localStorage.setItem('dagama_user', JSON.stringify(data.user));
+        window.location.href = '/dashboard';
+      } catch (e) {
+        err.textContent = 'Network error. Please try again.'; err.style.display = 'block';
+      } finally {
+        btn.textContent = 'Log In'; btn.disabled = false;
+      }
+    }
+    document.addEventListener('keydown', e => { if (e.key === 'Enter') doLogin(); });
+  </script>
 </body>
 </html>`;
 
@@ -1157,11 +1193,153 @@ const REGISTER_PAGE = `<!DOCTYPE html>
 <body>
   <div class="container">
     <h1>Get Started</h1>
-    <input type="text" placeholder="Full name" />
-    <input type="email" placeholder="Email address" />
-    <input type="password" placeholder="Password" />
-    <button onclick="alert('Registration coming soon')">Sign Up</button>
+    <div id="error" style="display:none;color:#f87171;background:rgba(248,113,113,0.1);border:1px solid rgba(248,113,113,0.3);border-radius:8px;padding:0.75rem 1rem;margin-bottom:1.2rem;font-size:0.9rem;"></div>
+    <input id="name" type="text" placeholder="Full name" />
+    <input id="email" type="email" placeholder="Email address" />
+    <input id="password" type="password" placeholder="Password (min 8 characters)" />
+    <button id="btn" onclick="doRegister()">Sign Up</button>
     <p>Already have an account? <a href="/login">Log in</a></p>
   </div>
+  <script>
+    async function doRegister() {
+      const name = document.getElementById('name').value.trim();
+      const email = document.getElementById('email').value.trim();
+      const password = document.getElementById('password').value;
+      const err = document.getElementById('error');
+      const btn = document.getElementById('btn');
+      err.style.display = 'none';
+      if (!name || !email || !password) { err.textContent = 'Please fill in all fields.'; err.style.display = 'block'; return; }
+      if (password.length < 8) { err.textContent = 'Password must be at least 8 characters.'; err.style.display = 'block'; return; }
+      btn.textContent = 'Creating account…'; btn.disabled = true;
+      try {
+        const res = await fetch('/api/auth/register', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ name, email, password })
+        });
+        const data = await res.json();
+        if (!res.ok) { err.textContent = data.error || 'Registration failed.'; err.style.display = 'block'; return; }
+        localStorage.setItem('dagama_token', data.token);
+        localStorage.setItem('dagama_user', JSON.stringify(data.user));
+        window.location.href = '/dashboard';
+      } catch (e) {
+        err.textContent = 'Network error. Please try again.'; err.style.display = 'block';
+      } finally {
+        btn.textContent = 'Sign Up'; btn.disabled = false;
+      }
+    }
+    document.addEventListener('keydown', e => { if (e.key === 'Enter') doRegister(); });
+  </script>
+</body>
+</html>`;
+
+const DASHBOARD_PAGE = `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Dashboard — DaGama</title>
+  <link href="https://fonts.googleapis.com/css2?family=Playfair+Display:wght@700&family=Outfit:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    :root {
+      --navy: #0F1419; --navy-light: #1a2235; --gold: #D4AF37; --gold-light: #E8C547;
+      --slate-400: #94A3B8; --slate-700: #334155; --slate-800: #1E293B; --white: #F5F5F5;
+    }
+    body { font-family: 'Outfit', sans-serif; background: linear-gradient(135deg, var(--navy) 0%, #1a2844 100%); color: var(--white); min-height: 100vh; }
+    nav {
+      display: flex; align-items: center; justify-content: space-between;
+      padding: 1.2rem 2rem; border-bottom: 1px solid rgba(212,175,55,0.15);
+      background: rgba(15,20,25,0.8); backdrop-filter: blur(20px); position: sticky; top: 0; z-index: 10;
+    }
+    .logo { font-family: 'Playfair Display', serif; font-size: 1.5rem; background: linear-gradient(135deg, #F5F5F5, #D4AF37); -webkit-background-clip: text; -webkit-text-fill-color: transparent; background-clip: text; }
+    .nav-right { display: flex; align-items: center; gap: 1rem; }
+    .user-badge { background: rgba(212,175,55,0.1); border: 1px solid rgba(212,175,55,0.2); border-radius: 20px; padding: 0.4rem 1rem; font-size: 0.85rem; color: var(--gold); }
+    .logout-btn { background: transparent; border: 1px solid rgba(212,175,55,0.3); color: var(--slate-400); border-radius: 8px; padding: 0.4rem 1rem; cursor: pointer; font-family: 'Outfit', sans-serif; font-size: 0.85rem; transition: all 0.2s; }
+    .logout-btn:hover { border-color: var(--gold); color: var(--gold); }
+    main { max-width: 1100px; margin: 0 auto; padding: 3rem 2rem; }
+    .welcome { margin-bottom: 2.5rem; }
+    .welcome h1 { font-family: 'Playfair Display', serif; font-size: 2rem; margin-bottom: 0.5rem; }
+    .welcome p { color: var(--slate-400); }
+    .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 1.5rem; margin-bottom: 3rem; }
+    .stat-card {
+      background: linear-gradient(135deg, rgba(30,41,59,0.9), rgba(30,41,59,0.6));
+      border: 1px solid rgba(212,175,55,0.15); border-radius: 16px; padding: 1.5rem;
+      transition: transform 0.2s, box-shadow 0.2s;
+    }
+    .stat-card:hover { transform: translateY(-4px); box-shadow: 0 8px 30px rgba(212,175,55,0.1); }
+    .stat-label { font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.1em; color: var(--slate-400); margin-bottom: 0.5rem; }
+    .stat-value { font-size: 2.2rem; font-weight: 700; color: var(--gold); }
+    .stat-sub { font-size: 0.85rem; color: var(--slate-400); margin-top: 0.3rem; }
+    .section-title { font-size: 1.1rem; font-weight: 600; margin-bottom: 1.2rem; color: var(--white); }
+    .empty-state {
+      background: linear-gradient(135deg, rgba(30,41,59,0.6), rgba(30,41,59,0.3));
+      border: 1px dashed rgba(212,175,55,0.2); border-radius: 16px; padding: 3rem;
+      text-align: center; color: var(--slate-400);
+    }
+    .empty-state .icon { font-size: 2.5rem; margin-bottom: 1rem; }
+    .empty-state p { font-size: 0.95rem; line-height: 1.6; }
+    .coming-soon { display: inline-block; background: rgba(212,175,55,0.1); border: 1px solid rgba(212,175,55,0.2); color: var(--gold); border-radius: 12px; padding: 0.25rem 0.75rem; font-size: 0.75rem; font-weight: 600; margin-left: 0.5rem; vertical-align: middle; }
+    @keyframes fadeIn { from { opacity: 0; transform: translateY(20px); } to { opacity: 1; transform: translateY(0); } }
+    main { animation: fadeIn 0.6s ease-out; }
+  </style>
+</head>
+<body>
+  <nav>
+    <span class="logo">DaGama</span>
+    <div class="nav-right">
+      <span class="user-badge" id="user-badge">Loading…</span>
+      <button class="logout-btn" onclick="logout()">Log out</button>
+    </div>
+  </nav>
+  <main>
+    <div class="welcome">
+      <h1 id="welcome-msg">Welcome back</h1>
+      <p>Your trade show intelligence hub</p>
+    </div>
+    <div class="stats">
+      <div class="stat-card">
+        <div class="stat-label">Trade Shows Tracked</div>
+        <div class="stat-value">0</div>
+        <div class="stat-sub">Connect your first show to get started</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-label">Leads Captured</div>
+        <div class="stat-value">0</div>
+        <div class="stat-sub">Via Telegram bot</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-label">AI Insights</div>
+        <div class="stat-value">0</div>
+        <div class="stat-sub">Powered by Gemini</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-label">Account Status</div>
+        <div class="stat-value" style="font-size:1.2rem;padding-top:0.4rem;">Free</div>
+        <div class="stat-sub">Upgrade for unlimited access</div>
+      </div>
+    </div>
+    <div class="section-title">Recent Activity <span class="coming-soon">Phase 4</span></div>
+    <div class="empty-state">
+      <div class="icon">🗺️</div>
+      <p>No activity yet.<br>Connect your Telegram bot to start capturing leads at trade shows.</p>
+    </div>
+  </main>
+  <script>
+    (function() {
+      const token = localStorage.getItem('dagama_token');
+      if (!token) { window.location.href = '/login'; return; }
+      const user = JSON.parse(localStorage.getItem('dagama_user') || '{}');
+      if (user.name) {
+        document.getElementById('welcome-msg').textContent = 'Welcome back, ' + user.name.split(' ')[0];
+        document.getElementById('user-badge').textContent = user.email;
+      }
+    })();
+    function logout() {
+      localStorage.removeItem('dagama_token');
+      localStorage.removeItem('dagama_user');
+      window.location.href = '/';
+    }
+  </script>
 </body>
 </html>`;
