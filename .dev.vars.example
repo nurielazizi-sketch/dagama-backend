@@ -1,0 +1,25 @@
+# DaGama Development Environment Variables Template
+# 
+# Copy this file to .dev.vars and fill in your actual values.
+# IMPORTANT: .dev.vars should NEVER be committed to Git
+
+# Telegram Bot - Get from @BotFather on Telegram
+TELEGRAM_BOT_TOKEN=your_test_telegram_token_here
+
+# Gemini API - Get from https://makersuite.google.com/app/apikey
+GEMINI_API_KEY=your_gemini_api_key_here
+
+# Google OAuth - Create at https://console.cloud.google.com
+GOOGLE_CLIENT_ID=your_google_client_id.apps.googleusercontent.com
+GOOGLE_CLIENT_SECRET=your_google_client_secret_here
+GOOGLE_REDIRECT_URI=http://localhost:8787/api/auth/google/callback
+
+# Stripe - Get from https://dashboard.stripe.com/apikeys (use TEST keys)
+STRIPE_SECRET_KEY=sk_test_your_stripe_secret_key_here
+STRIPE_PUBLIC_KEY=pk_test_your_stripe_public_key_here
+STRIPE_WEBHOOK_SECRET=whsec_test_your_webhook_secret_here
+
+# Application Config
+ENVIRONMENT=development
+ORIGIN=http://localhost:8787
+WEBHOOK_SECRET=dev_webhook_secret_123456
