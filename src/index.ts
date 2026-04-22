@@ -1,11 +1,8 @@
 /// <reference types="@cloudflare/workers-types" />
 
-import { handleLogin, handleRegister, handleMe } from './auth';
-
-interface Env {
-  DB: D1Database;
-  WEBHOOK_SECRET: string;
-}
+import { handleLogin, handleRegister, handleMe, handleStats } from './auth';
+import { handleTelegramWebhook, handleSetupWebhook } from './telegram';
+import type { Env } from './types';
 
 const CORS_HEADERS = {
   'Access-Control-Allow-Origin': '*',
@@ -26,7 +23,10 @@ export default {
     // API routes
     if (path === '/api/auth/register') return addCors(await handleRegister(request, env));
     if (path === '/api/auth/login')    return addCors(await handleLogin(request, env));
-    if (path === '/api/me')            return addCors(await handleMe(request, env));
+    if (path === '/api/me')                  return addCors(await handleMe(request, env));
+    if (path === '/api/stats')               return addCors(await handleStats(request, env));
+    if (path === '/api/telegram/webhook')    return handleTelegramWebhook(request, env);
+    if (path === '/api/telegram/setup')      return addCors(await handleSetupWebhook(request, env));
 
     // UI routes
     if (path === '/') {
@@ -1305,18 +1305,18 @@ const DASHBOARD_PAGE = `<!DOCTYPE html>
       </div>
       <div class="stat-card">
         <div class="stat-label">Leads Captured</div>
-        <div class="stat-value">0</div>
+        <div class="stat-value" id="stat-leads">—</div>
         <div class="stat-sub">Via Telegram bot</div>
       </div>
       <div class="stat-card">
         <div class="stat-label">AI Insights</div>
         <div class="stat-value">0</div>
-        <div class="stat-sub">Powered by Gemini</div>
+        <div class="stat-sub">Powered by Gemini — Phase 5</div>
       </div>
       <div class="stat-card">
-        <div class="stat-label">Account Status</div>
-        <div class="stat-value" style="font-size:1.2rem;padding-top:0.4rem;">Free</div>
-        <div class="stat-sub">Upgrade for unlimited access</div>
+        <div class="stat-label">Telegram Bot</div>
+        <div class="stat-value" id="stat-bot" style="font-size:1rem;padding-top:0.5rem;">—</div>
+        <div class="stat-sub">Connect via /api/telegram/setup</div>
       </div>
     </div>
     <div class="section-title">Recent Activity <span class="coming-soon">Phase 4</span></div>
@@ -1326,15 +1326,21 @@ const DASHBOARD_PAGE = `<!DOCTYPE html>
     </div>
   </main>
   <script>
-    (function() {
-      const token = localStorage.getItem('dagama_token');
-      if (!token) { window.location.href = '/login'; return; }
-      const user = JSON.parse(localStorage.getItem('dagama_user') || '{}');
-      if (user.name) {
-        document.getElementById('welcome-msg').textContent = 'Welcome back, ' + user.name.split(' ')[0];
-        document.getElementById('user-badge').textContent = user.email;
-      }
-    })();
+    const token = localStorage.getItem('dagama_token');
+    if (!token) { window.location.href = '/login'; }
+    const user = JSON.parse(localStorage.getItem('dagama_user') || '{}');
+    if (user.name) {
+      document.getElementById('welcome-msg').textContent = 'Welcome back, ' + user.name.split(' ')[0];
+      document.getElementById('user-badge').textContent = user.email;
+    }
+    fetch('/api/stats', { headers: { 'Authorization': 'Bearer ' + token } })
+      .then(r => r.json())
+      .then(data => {
+        document.getElementById('stat-leads').textContent = data.leads ?? 0;
+        document.getElementById('stat-bot').textContent = data.bot_connected ? 'Connected' : 'Not connected';
+        if (data.bot_connected) document.getElementById('stat-bot').style.color = '#4ade80';
+      })
+      .catch(() => {});
     function logout() {
       localStorage.removeItem('dagama_token');
       localStorage.removeItem('dagama_user');

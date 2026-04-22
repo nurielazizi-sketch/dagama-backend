@@ -1,11 +1,7 @@
 /// <reference types="@cloudflare/workers-types" />
 
 import { hashPassword, verifyPassword, signJwt, verifyJwt } from './crypto';
-
-interface Env {
-  DB: D1Database;
-  WEBHOOK_SECRET: string;
-}
+import type { Env } from './types';
 
 interface User {
   id: string;
@@ -90,6 +86,26 @@ export async function handleLogin(request: Request, env: Env): Promise<Response>
   );
 
   return jsonResponse({ token, user: { id: user.id, email: user.email, name: user.name } });
+}
+
+export async function handleStats(request: Request, env: Env): Promise<Response> {
+  if (request.method !== 'GET') return new Response('Method not allowed', { status: 405 });
+  const auth = await requireAuth(request, env);
+  if (auth instanceof Response) return auth;
+
+  const bot = await env.DB.prepare(
+    `SELECT chat_id FROM bot_users WHERE user_id = ?`
+  ).bind(auth.userId).first<{ chat_id: number }>();
+
+  let leadCount = 0;
+  if (bot) {
+    const row = await env.DB.prepare(
+      `SELECT COUNT(*) as count FROM leads WHERE chat_id = ?`
+    ).bind(bot.chat_id).first<{ count: number }>();
+    leadCount = row?.count ?? 0;
+  }
+
+  return jsonResponse({ leads: leadCount, bot_connected: !!bot });
 }
 
 export async function handleMe(request: Request, env: Env): Promise<Response> {
