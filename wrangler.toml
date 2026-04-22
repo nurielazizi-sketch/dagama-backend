@@ -40,6 +40,8 @@ database_id = "14f95bab-49ed-4821-868c-fa7afa8d2335"
 # - WEBHOOK_SECRET
 # - STRIPE_SECRET_KEY          (from Stripe dashboard → API keys)
 # - STRIPE_WEBHOOK_SECRET      (from Stripe dashboard → Webhooks → signing secret)
-# - STRIPE_PRICE_SINGLE_SHOW   (Stripe price ID for $49 one-time)
-# - STRIPE_PRICE_3_SHOW_PACK   (Stripe price ID for $129 one-time)
-# - STRIPE_PRICE_TEAM_PLAN     (Stripe price ID for $79/month recurring)
+# - STRIPE_PRICE_SINGLE_SHOW              (Stripe price ID for $49 one-time)
+# - STRIPE_PRICE_3_SHOW_PACK              (Stripe price ID for $129 one-time)
+# - STRIPE_PRICE_TEAM_PLAN                (Stripe price ID for $79/month recurring)
+# - GOOGLE_SERVICE_ACCOUNT_EMAIL          (service account email from GCP)
+# - GOOGLE_SERVICE_ACCOUNT_PRIVATE_KEY    (private key PEM from service account JSON, \n-escaped)

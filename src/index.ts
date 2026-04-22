@@ -3,6 +3,7 @@
 import { handleLogin, handleRegister, handleMe, handleStats, handleInsights } from './auth';
 import { handleTelegramWebhook, handleSetupWebhook } from './telegram';
 import { handleCreateCheckout, handleStripeWebhook, handleBillingPortal, handleSubscriptionStatus } from './stripe';
+import { getUserSheets } from './sheets';
 import type { Env } from './types';
 
 const CORS_HEADERS = {
@@ -33,6 +34,7 @@ export default {
     if (path === '/api/stripe/webhook')      return handleStripeWebhook(request, env);
     if (path === '/api/stripe/portal')       return addCors(await handleBillingPortal(request, env));
     if (path === '/api/stripe/status')       return addCors(await handleSubscriptionStatus(request, env));
+    if (path === '/api/google/sheets')       return addCors(await handleGetSheets(request, env));
 
     // UI routes
     if (path === '/') {
@@ -62,6 +64,15 @@ export default {
     return new Response('Not found', { status: 404 });
   }
 };
+
+async function handleGetSheets(request: Request, env: Env): Promise<Response> {
+  if (request.method !== 'GET') return new Response('Method not allowed', { status: 405 });
+  const { requireAuth } = await import('./auth');
+  const auth = await requireAuth(request, env);
+  if (auth instanceof Response) return auth;
+  const sheets = await getUserSheets(auth.userId, env);
+  return new Response(JSON.stringify({ sheets }), { headers: { 'Content-Type': 'application/json' } });
+}
 
 function addCors(response: Response): Response {
   const res = new Response(response.body, response);
@@ -1393,6 +1404,12 @@ const DASHBOARD_PAGE = `<!DOCTYPE html>
       <p>No insights yet.<br>Capture leads via the Telegram bot, then click below for AI analysis.</p>
     </div>
     <button id="insights-btn" class="action-btn" onclick="loadInsights()">✨ Generate AI Insights</button>
+
+    <div class="section-title" style="margin-top:3rem;">Google Sheets <span class="badge badge-green">Live</span></div>
+    <div id="sheets-box" class="empty-state">
+      <div class="icon">📊</div>
+      <p>No sheets yet.<br>Capture your first lead via the Telegram bot — a Google Sheet is created automatically and shared to your email.</p>
+    </div>
   </main>
 
   <div class="toast" id="toast"></div>
@@ -1535,6 +1552,26 @@ const DASHBOARD_PAGE = `<!DOCTYPE html>
         btn.textContent = '✨ Generate AI Insights'; btn.disabled = false;
       }
     }
+
+    // Load Google Sheets
+    fetch('/api/google/sheets', { headers: { Authorization: 'Bearer ' + token } })
+      .then(r => r.json())
+      .then(data => {
+        if (!data.sheets || !data.sheets.length) return;
+        const box = document.getElementById('sheets-box');
+        box.style.textAlign = 'left';
+        box.style.border = '1px solid rgba(74,222,128,0.2)';
+        box.innerHTML = data.sheets.map(s =>
+          '<div style="display:flex;align-items:center;justify-content:space-between;padding:0.75rem 0;border-bottom:1px solid rgba(255,255,255,0.05)">' +
+            '<div>' +
+              '<div style="font-weight:600;color:#F5F5F5">' + s.show_name + '</div>' +
+              '<div style="font-size:0.8rem;color:#94A3B8;margin-top:0.15rem">Created ' + new Date(s.created_at).toLocaleDateString() + '</div>' +
+            '</div>' +
+            '<a href="' + s.sheet_url + '" target="_blank" style="background:rgba(74,222,128,0.1);border:1px solid rgba(74,222,128,0.3);color:#4ade80;border-radius:8px;padding:0.4rem 1rem;font-size:0.85rem;text-decoration:none;font-family:\'Outfit\',sans-serif;font-weight:600">Open Sheet →</a>' +
+          '</div>'
+        ).join('');
+      })
+      .catch(() => {});
 
     function showToast(msg, type) {
       const t = document.getElementById('toast');

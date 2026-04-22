@@ -2,6 +2,7 @@
 
 import type { Env } from './types';
 import { ask, buildSummaryPrompt, buildFollowUpPrompt } from './gemini';
+import { getOrCreateSheet, appendLeadRow } from './sheets';
 
 // ── Telegram types ────────────────────────────────────────────────────────────
 
@@ -75,6 +76,7 @@ async function handleMessage(msg: TgMessage, env: Env): Promise<void> {
   if (text === '/leads')   { await cmdLeads(chatId, env); return; }
   if (text === '/summary') { await cmdSummary(chatId, env); return; }
   if (text === '/cancel')  { await setSession(chatId, { step: 'idle', lead: {} }, env); await send(chatId, '❌ Cancelled.', env); return; }
+  if (text === '/sheet')   { await cmdSheet(chatId, env); return; }
   if (text.startsWith('/followup')) { await cmdFollowup(chatId, text, env); return; }
 
   // Start a new lead capture
@@ -158,6 +160,7 @@ async function cmdStart(chatId: number, firstName: string, env: Env): Promise<vo
     `*Commands:*\n` +
     `• /newlead — Capture a new lead\n` +
     `• /leads — View your recent leads\n` +
+    `• /sheet — Get your Google Sheet link\n` +
     `• /summary — AI analysis of your leads\n` +
     `• /followup 1 — Draft a follow-up email for lead #1\n` +
     `• /help — Show this help\n` +
@@ -171,6 +174,7 @@ async function cmdHelp(chatId: number, env: Env): Promise<void> {
     `*DaGama Bot Commands*\n\n` +
     `• /newlead — Start capturing a new lead\n` +
     `• /leads — See your last 10 leads\n` +
+    `• /sheet — Get your Google Sheet link\n` +
     `• /summary — AI analysis of all your leads\n` +
     `• /followup 1 — AI follow-up email for lead #1\n` +
     `• /cancel — Cancel whatever you're doing\n` +
@@ -262,6 +266,29 @@ async function cmdLeads(chatId: number, env: Env): Promise<void> {
   await send(chatId, `📋 *Your recent leads:*\n\n${lines}`, env, true);
 }
 
+async function cmdSheet(chatId: number, env: Env): Promise<void> {
+  const botUser = await env.DB.prepare(
+    `SELECT user_id FROM bot_users WHERE chat_id = ?`
+  ).bind(chatId).first<{ user_id: string | null }>();
+
+  if (!botUser?.user_id) {
+    await send(chatId, '⚠️ Your Telegram is not linked to a DaGama account yet. Visit heydagama.com to sign up.', env);
+    return;
+  }
+
+  const sheets = await env.DB.prepare(
+    `SELECT show_name, sheet_url FROM google_sheets WHERE user_id = ? ORDER BY created_at DESC LIMIT 5`
+  ).bind(botUser.user_id).all<{ show_name: string; sheet_url: string }>();
+
+  if (!sheets.results.length) {
+    await send(chatId, '📊 No sheets yet. Use /newlead to capture your first lead — a Google Sheet will be created automatically.', env);
+    return;
+  }
+
+  const lines = sheets.results.map(s => `📊 *${s.show_name}*\n${s.sheet_url}`).join('\n\n');
+  await send(chatId, `*Your Google Sheets:*\n\n${lines}`, env, true);
+}
+
 // ── Subscription gate ─────────────────────────────────────────────────────────
 
 async function checkSubscription(chatId: number, env: Env): Promise<boolean> {
@@ -284,6 +311,32 @@ async function saveLead(chatId: number, lead: Lead, env: Env): Promise<void> {
   await env.DB.prepare(
     `INSERT INTO leads (chat_id, show_name, name, company, email, notes) VALUES (?, ?, ?, ?, ?, ?)`
   ).bind(chatId, lead.show_name, lead.name, lead.company || null, lead.email || null, lead.notes || null).run();
+
+  // Append to Google Sheet (best-effort — don't fail lead capture if Sheets is down)
+  try {
+    const botUser = await env.DB.prepare(
+      `SELECT user_id FROM bot_users WHERE chat_id = ?`
+    ).bind(chatId).first<{ user_id: string | null }>();
+
+    if (botUser?.user_id) {
+      const user = await env.DB.prepare(
+        `SELECT email FROM users WHERE id = ?`
+      ).bind(botUser.user_id).first<{ email: string }>();
+
+      if (user?.email && env.GOOGLE_SERVICE_ACCOUNT_EMAIL && env.GOOGLE_SERVICE_ACCOUNT_PRIVATE_KEY) {
+        const { sheetId } = await getOrCreateSheet(botUser.user_id, user.email, lead.show_name, env);
+        await appendLeadRow(sheetId, {
+          timestamp: new Date().toISOString(),
+          company: lead.company || '',
+          name: lead.name,
+          email: lead.email || '',
+          notes: lead.notes || '',
+        }, env);
+      }
+    }
+  } catch {
+    // Silent failure — lead is already saved in D1
+  }
 }
 
 async function getSession(chatId: number, env: Env): Promise<Session> {

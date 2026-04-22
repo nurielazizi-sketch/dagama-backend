@@ -54,3 +54,16 @@ CREATE TABLE IF NOT EXISTS subscriptions (
 
 CREATE INDEX IF NOT EXISTS idx_subscriptions_user_id ON subscriptions(user_id);
 CREATE INDEX IF NOT EXISTS idx_subscriptions_session_id ON subscriptions(stripe_session_id);
+
+-- Google Sheets created per user per show
+CREATE TABLE IF NOT EXISTS google_sheets (
+  id         TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),
+  user_id    TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  show_name  TEXT NOT NULL,
+  sheet_id   TEXT NOT NULL,
+  sheet_url  TEXT NOT NULL,
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  UNIQUE(user_id, show_name)
+);
+
+CREATE INDEX IF NOT EXISTS idx_google_sheets_user_id ON google_sheets(user_id);
