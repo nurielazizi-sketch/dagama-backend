@@ -1,8 +1,33 @@
+/// <reference types="@cloudflare/workers-types" />
+
+import { handleLogin, handleRegister } from './auth';
+
+interface Env {
+  DB: D1Database;
+  WEBHOOK_SECRET: string;
+}
+
+const CORS_HEADERS = {
+  'Access-Control-Allow-Origin': '*',
+  'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+  'Access-Control-Allow-Headers': 'Content-Type, Authorization',
+};
+
 export default {
-  async fetch(request: Request): Promise<Response> {
+  async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
     const path = url.pathname;
 
+    // CORS preflight
+    if (request.method === 'OPTIONS') {
+      return new Response(null, { status: 204, headers: CORS_HEADERS });
+    }
+
+    // API routes
+    if (path === '/api/auth/register') return addCors(await handleRegister(request, env));
+    if (path === '/api/auth/login')    return addCors(await handleLogin(request, env));
+
+    // UI routes
     if (path === '/') {
       return new Response(LANDING_PAGE, {
         headers: { 'Content-Type': 'text/html; charset=utf-8' }
@@ -24,6 +49,12 @@ export default {
     return new Response('Not found', { status: 404 });
   }
 };
+
+function addCors(response: Response): Response {
+  const res = new Response(response.body, response);
+  Object.entries(CORS_HEADERS).forEach(([k, v]) => res.headers.set(k, v));
+  return res;
+}
 
 const LANDING_PAGE = `<!DOCTYPE html>
 <html lang="en">

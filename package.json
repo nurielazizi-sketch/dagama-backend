@@ -4,7 +4,7 @@
   "description": "DaGama backend on Cloudflare Workers — Trade show intelligence platform",
   "main": "src/index.ts",
   "scripts": {
-    "dev": "wrangler dev --env development",
+    "dev": "wrangler dev",
     "deploy": "wrangler deploy --env production",
     "build": "tsc",
     "type-check": "tsc --noEmit",
