@@ -7,4 +7,9 @@ export interface Env {
   WEBHOOK_SECRET: string;
   ENVIRONMENT: string;
   ORIGIN: string;
+  STRIPE_SECRET_KEY: string;
+  STRIPE_WEBHOOK_SECRET: string;
+  STRIPE_PRICE_SINGLE_SHOW: string;
+  STRIPE_PRICE_3_SHOW_PACK: string;
+  STRIPE_PRICE_TEAM_PLAN: string;
 }

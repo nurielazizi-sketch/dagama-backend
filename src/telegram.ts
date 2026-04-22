@@ -79,6 +79,14 @@ async function handleMessage(msg: TgMessage, env: Env): Promise<void> {
 
   // Start a new lead capture
   if (text === '/newlead') {
+    const hasAccess = await checkSubscription(chatId, env);
+    if (!hasAccess) {
+      await send(chatId,
+        '🔒 *No active plan*\n\nYou need a DaGama plan to capture leads.\n\nVisit heydagama.com to get started — plans start at $49.',
+        env, true
+      );
+      return;
+    }
     await setSession(chatId, { step: 'await_show', lead: {} }, env);
     await send(chatId, '📋 *New Lead*\n\nWhat trade show or event is this lead from?\n\n_(Type the show name, e.g. "CES 2026")_', env, true);
     return;
@@ -252,6 +260,22 @@ async function cmdLeads(chatId: number, env: Env): Promise<void> {
   ).join('\n\n');
 
   await send(chatId, `📋 *Your recent leads:*\n\n${lines}`, env, true);
+}
+
+// ── Subscription gate ─────────────────────────────────────────────────────────
+
+async function checkSubscription(chatId: number, env: Env): Promise<boolean> {
+  const botUser = await env.DB.prepare(
+    `SELECT user_id FROM bot_users WHERE chat_id = ?`
+  ).bind(chatId).first<{ user_id: string | null }>();
+
+  if (!botUser?.user_id) return false;
+
+  const sub = await env.DB.prepare(
+    `SELECT id FROM subscriptions WHERE user_id = ? AND status = 'active' LIMIT 1`
+  ).bind(botUser.user_id).first();
+
+  return !!sub;
 }
 
 // ── DB helpers ────────────────────────────────────────────────────────────────

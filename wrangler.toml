@@ -37,7 +37,9 @@ database_id = "14f95bab-49ed-4821-868c-fa7afa8d2335"
 # Production secrets (set via CLI: wrangler secret put NAME --env production)
 # - TELEGRAM_BOT_TOKEN
 # - GEMINI_API_KEY
-# - GOOGLE_CLIENT_ID
-# - GOOGLE_CLIENT_SECRET
-# - STRIPE_SECRET_KEY
 # - WEBHOOK_SECRET
+# - STRIPE_SECRET_KEY          (from Stripe dashboard → API keys)
+# - STRIPE_WEBHOOK_SECRET      (from Stripe dashboard → Webhooks → signing secret)
+# - STRIPE_PRICE_SINGLE_SHOW   (Stripe price ID for $49 one-time)
+# - STRIPE_PRICE_3_SHOW_PACK   (Stripe price ID for $129 one-time)
+# - STRIPE_PRICE_TEAM_PLAN     (Stripe price ID for $79/month recurring)

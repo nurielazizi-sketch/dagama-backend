@@ -36,3 +36,21 @@ CREATE TABLE IF NOT EXISTS leads (
 
 CREATE INDEX IF NOT EXISTS idx_leads_chat_id ON leads(chat_id);
 CREATE INDEX IF NOT EXISTS idx_leads_created_at ON leads(created_at);
+
+-- Stripe subscriptions and one-time purchases
+CREATE TABLE IF NOT EXISTS subscriptions (
+  id                     TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),
+  user_id                TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  stripe_customer_id     TEXT,
+  stripe_subscription_id TEXT,
+  stripe_session_id      TEXT UNIQUE,
+  plan                   TEXT NOT NULL,   -- 'single_show' | '3_show_pack' | 'team_plan'
+  status                 TEXT NOT NULL DEFAULT 'pending',  -- 'pending' | 'active' | 'canceled'
+  shows_remaining        INTEGER,         -- NULL = unlimited (team_plan)
+  created_at             TEXT NOT NULL DEFAULT (datetime('now')),
+  activated_at           TEXT,
+  expires_at             TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_subscriptions_user_id ON subscriptions(user_id);
+CREATE INDEX IF NOT EXISTS idx_subscriptions_session_id ON subscriptions(stripe_session_id);

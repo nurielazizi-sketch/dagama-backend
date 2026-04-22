@@ -2,6 +2,7 @@
 
 import { handleLogin, handleRegister, handleMe, handleStats, handleInsights } from './auth';
 import { handleTelegramWebhook, handleSetupWebhook } from './telegram';
+import { handleCreateCheckout, handleStripeWebhook, handleBillingPortal, handleSubscriptionStatus } from './stripe';
 import type { Env } from './types';
 
 const CORS_HEADERS = {
@@ -28,6 +29,10 @@ export default {
     if (path === '/api/insights')            return addCors(await handleInsights(request, env));
     if (path === '/api/telegram/webhook')    return handleTelegramWebhook(request, env);
     if (path === '/api/telegram/setup')      return addCors(await handleSetupWebhook(request, env));
+    if (path === '/api/stripe/checkout')     return addCors(await handleCreateCheckout(request, env));
+    if (path === '/api/stripe/webhook')      return handleStripeWebhook(request, env);
+    if (path === '/api/stripe/portal')       return addCors(await handleBillingPortal(request, env));
+    if (path === '/api/stripe/status')       return addCors(await handleSubscriptionStatus(request, env));
 
     // UI routes
     if (path === '/') {
@@ -1280,7 +1285,64 @@ const DASHBOARD_PAGE = `<!DOCTYPE html>
     }
     .empty-state .icon { font-size: 2.5rem; margin-bottom: 1rem; }
     .empty-state p { font-size: 0.95rem; line-height: 1.6; }
-    .coming-soon { display: inline-block; background: rgba(212,175,55,0.1); border: 1px solid rgba(212,175,55,0.2); color: var(--gold); border-radius: 12px; padding: 0.25rem 0.75rem; font-size: 0.75rem; font-weight: 600; margin-left: 0.5rem; vertical-align: middle; }
+    .badge { display: inline-block; border-radius: 12px; padding: 0.25rem 0.75rem; font-size: 0.75rem; font-weight: 600; margin-left: 0.5rem; vertical-align: middle; }
+    .badge-gold { background: rgba(212,175,55,0.1); border: 1px solid rgba(212,175,55,0.2); color: var(--gold); }
+    .badge-green { background: rgba(74,222,128,0.1); border: 1px solid rgba(74,222,128,0.2); color: #4ade80; }
+    .badge-red { background: rgba(248,113,113,0.1); border: 1px solid rgba(248,113,113,0.2); color: #f87171; }
+    /* Upgrade section */
+    .upgrade-section {
+      background: linear-gradient(135deg, rgba(212,175,55,0.08), rgba(212,175,55,0.03));
+      border: 1px solid rgba(212,175,55,0.25); border-radius: 16px; padding: 2rem; margin-bottom: 3rem;
+    }
+    .upgrade-section h2 { font-family: 'Playfair Display', serif; font-size: 1.5rem; margin-bottom: 0.5rem; }
+    .upgrade-section p { color: var(--slate-400); margin-bottom: 1.5rem; font-size: 0.95rem; }
+    .plan-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 1rem; }
+    .plan-card {
+      background: rgba(30,41,59,0.8); border: 1px solid rgba(212,175,55,0.15); border-radius: 12px;
+      padding: 1.5rem; text-align: center; transition: all 0.3s;
+    }
+    .plan-card:hover { border-color: rgba(212,175,55,0.4); transform: translateY(-4px); }
+    .plan-name { font-weight: 600; margin-bottom: 0.3rem; }
+    .plan-price { font-size: 1.8rem; font-weight: 700; color: var(--gold); margin-bottom: 0.3rem; }
+    .plan-desc { font-size: 0.8rem; color: var(--slate-400); margin-bottom: 1rem; }
+    .plan-btn {
+      width: 100%; padding: 0.65rem; background: linear-gradient(135deg, #D4AF37, #E8C547);
+      color: #0F1419; border: none; border-radius: 8px; font-family: 'Outfit', sans-serif;
+      font-weight: 600; cursor: pointer; transition: all 0.2s; font-size: 0.9rem;
+    }
+    .plan-btn:hover { transform: translateY(-2px); box-shadow: 0 6px 20px rgba(212,175,55,0.3); }
+    .plan-btn:disabled { opacity: 0.5; cursor: not-allowed; transform: none; }
+    /* Active plan banner */
+    .plan-banner {
+      background: linear-gradient(135deg, rgba(74,222,128,0.08), rgba(74,222,128,0.03));
+      border: 1px solid rgba(74,222,128,0.2); border-radius: 12px; padding: 1rem 1.5rem;
+      display: flex; align-items: center; justify-content: space-between; margin-bottom: 3rem; flex-wrap: gap;
+    }
+    .plan-banner-info { display: flex; align-items: center; gap: 1rem; }
+    .plan-banner-label { font-weight: 600; color: #4ade80; }
+    .plan-banner-sub { font-size: 0.85rem; color: var(--slate-400); }
+    .portal-btn {
+      background: transparent; border: 1px solid rgba(74,222,128,0.3); color: #4ade80;
+      border-radius: 8px; padding: 0.5rem 1rem; font-family: 'Outfit', sans-serif;
+      font-size: 0.85rem; cursor: pointer; transition: all 0.2s;
+    }
+    .portal-btn:hover { background: rgba(74,222,128,0.1); }
+    .action-btn {
+      background: linear-gradient(135deg, #D4AF37, #E8C547); color: #0F1419; border: none;
+      border-radius: 8px; padding: 0.75rem 1.5rem; font-family: 'Outfit', sans-serif;
+      font-weight: 600; cursor: pointer; transition: all 0.2s; margin-top: 1rem;
+    }
+    .action-btn:hover { transform: translateY(-2px); box-shadow: 0 6px 20px rgba(212,175,55,0.3); }
+    .action-btn:disabled { opacity: 0.5; cursor: not-allowed; transform: none; }
+    /* Toast */
+    .toast {
+      position: fixed; bottom: 2rem; right: 2rem; padding: 1rem 1.5rem;
+      border-radius: 10px; font-size: 0.9rem; font-weight: 500; z-index: 999;
+      animation: slideIn 0.3s ease; display: none;
+    }
+    .toast.success { background: rgba(74,222,128,0.15); border: 1px solid rgba(74,222,128,0.3); color: #4ade80; }
+    .toast.error { background: rgba(248,113,113,0.15); border: 1px solid rgba(248,113,113,0.3); color: #f87171; }
+    @keyframes slideIn { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: translateY(0); } }
     @keyframes fadeIn { from { opacity: 0; transform: translateY(20px); } to { opacity: 1; transform: translateY(0); } }
     main { animation: fadeIn 0.6s ease-out; }
   </style>
@@ -1298,11 +1360,15 @@ const DASHBOARD_PAGE = `<!DOCTYPE html>
       <h1 id="welcome-msg">Welcome back</h1>
       <p>Your trade show intelligence hub</p>
     </div>
+
+    <!-- Subscription status (injected by JS) -->
+    <div id="sub-section"></div>
+
     <div class="stats">
       <div class="stat-card">
-        <div class="stat-label">Trade Shows Tracked</div>
-        <div class="stat-value">0</div>
-        <div class="stat-sub">Connect your first show to get started</div>
+        <div class="stat-label">Plan</div>
+        <div class="stat-value" id="stat-plan" style="font-size:1.1rem;padding-top:0.4rem;">—</div>
+        <div class="stat-sub" id="stat-plan-sub">Loading…</div>
       </div>
       <div class="stat-card">
         <div class="stat-label">Leads Captured</div>
@@ -1320,13 +1386,17 @@ const DASHBOARD_PAGE = `<!DOCTYPE html>
         <div class="stat-sub">Connect via /api/telegram/setup</div>
       </div>
     </div>
-    <div class="section-title">AI Insights <span class="coming-soon">Gemini</span></div>
+
+    <div class="section-title">AI Insights <span class="badge badge-gold">Gemini</span></div>
     <div id="insights-box" class="empty-state">
       <div class="icon">🤖</div>
       <p>No insights yet.<br>Capture leads via the Telegram bot, then click below for AI analysis.</p>
     </div>
-    <button id="insights-btn" onclick="loadInsights()" style="margin-top:1rem;background:linear-gradient(135deg,#D4AF37,#E8C547);color:#0F1419;border:none;border-radius:8px;padding:0.75rem 1.5rem;font-family:'Outfit',sans-serif;font-weight:600;cursor:pointer;transition:all 0.2s;">✨ Generate AI Insights</button>
+    <button id="insights-btn" class="action-btn" onclick="loadInsights()">✨ Generate AI Insights</button>
   </main>
+
+  <div class="toast" id="toast"></div>
+
   <script>
     const token = localStorage.getItem('dagama_token');
     if (!token) { window.location.href = '/login'; }
@@ -1335,20 +1405,121 @@ const DASHBOARD_PAGE = `<!DOCTYPE html>
       document.getElementById('welcome-msg').textContent = 'Welcome back, ' + user.name.split(' ')[0];
       document.getElementById('user-badge').textContent = user.email;
     }
-    fetch('/api/stats', { headers: { 'Authorization': 'Bearer ' + token } })
-      .then(r => r.json())
-      .then(data => {
-        document.getElementById('stat-leads').textContent = data.leads ?? 0;
-        document.getElementById('stat-bot').textContent = data.bot_connected ? 'Connected' : 'Not connected';
-        if (data.bot_connected) document.getElementById('stat-bot').style.color = '#4ade80';
-      })
-      .catch(() => {});
+
+    // Check for payment return
+    const params = new URLSearchParams(location.search);
+    if (params.get('payment') === 'success') {
+      showToast('Payment successful! Your plan is now active.', 'success');
+      history.replaceState({}, '', '/dashboard');
+    }
+    if (params.get('payment') === 'canceled') {
+      showToast('Payment canceled.', 'error');
+      history.replaceState({}, '', '/dashboard');
+    }
+
+    // Load stats + subscription in parallel
+    Promise.all([
+      fetch('/api/stats', { headers: { Authorization: 'Bearer ' + token } }).then(r => r.json()),
+      fetch('/api/stripe/status', { headers: { Authorization: 'Bearer ' + token } }).then(r => r.json()),
+    ]).then(([stats, sub]) => {
+      // Stats
+      document.getElementById('stat-leads').textContent = stats.leads ?? 0;
+      document.getElementById('stat-bot').textContent = stats.bot_connected ? 'Connected' : 'Not connected';
+      if (stats.bot_connected) document.getElementById('stat-bot').style.color = '#4ade80';
+
+      // Subscription
+      if (sub.active) {
+        const remaining = sub.shows_remaining != null ? sub.shows_remaining + ' shows left' : 'Unlimited shows';
+        document.getElementById('stat-plan').textContent = sub.label;
+        document.getElementById('stat-plan').style.color = '#4ade80';
+        document.getElementById('stat-plan-sub').textContent = remaining;
+
+        document.getElementById('sub-section').innerHTML =
+          '<div class="plan-banner">' +
+            '<div class="plan-banner-info">' +
+              '<span style="font-size:1.5rem">✅</span>' +
+              '<div><div class="plan-banner-label">' + sub.label + ' — Active</div>' +
+              '<div class="plan-banner-sub">' + remaining + '</div></div>' +
+            '</div>' +
+            '<button class="portal-btn" onclick="openPortal()">Manage Billing →</button>' +
+          '</div>';
+      } else {
+        document.getElementById('stat-plan').textContent = 'No plan';
+        document.getElementById('stat-plan-sub').textContent = 'Upgrade to start capturing leads';
+        renderUpgradeSection();
+      }
+    }).catch(() => {
+      renderUpgradeSection();
+    });
+
+    function renderUpgradeSection() {
+      document.getElementById('sub-section').innerHTML =
+        '<div class="upgrade-section">' +
+          '<h2>Choose Your Plan</h2>' +
+          '<p>Select a plan to activate your Telegram bot and start capturing leads.</p>' +
+          '<div class="plan-grid">' +
+            '<div class="plan-card">' +
+              '<div class="plan-name">Single Show</div>' +
+              '<div class="plan-price">$49</div>' +
+              '<div class="plan-desc">One-time · 1 show</div>' +
+              '<button class="plan-btn" onclick="checkout(this, \'single_show\')">Get Started</button>' +
+            '</div>' +
+            '<div class="plan-card" style="border-color:rgba(212,175,55,0.35)">' +
+              '<div class="plan-name">3-Show Pack</div>' +
+              '<div class="plan-price">$129</div>' +
+              '<div class="plan-desc">One-time · Save $18</div>' +
+              '<button class="plan-btn" onclick="checkout(this, \'3_show_pack\')">Get Started</button>' +
+            '</div>' +
+            '<div class="plan-card">' +
+              '<div class="plan-name">Team Plan</div>' +
+              '<div class="plan-price">$79</div>' +
+              '<div class="plan-desc">Per month · Unlimited</div>' +
+              '<button class="plan-btn" onclick="checkout(this, \'team_plan\')">Get Started</button>' +
+            '</div>' +
+          '</div>' +
+        '</div>';
+    }
+
+    async function checkout(btn, plan) {
+      btn.disabled = true;
+      btn.textContent = 'Loading…';
+      try {
+        const res = await fetch('/api/stripe/checkout', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + token },
+          body: JSON.stringify({ plan }),
+        });
+        const data = await res.json();
+        if (!res.ok) { showToast(data.error || 'Failed to start checkout', 'error'); return; }
+        window.location.href = data.url;
+      } catch (e) {
+        showToast('Network error. Please try again.', 'error');
+      } finally {
+        btn.disabled = false;
+        btn.textContent = 'Get Started';
+      }
+    }
+
+    async function openPortal() {
+      try {
+        const res = await fetch('/api/stripe/portal', {
+          method: 'POST',
+          headers: { Authorization: 'Bearer ' + token },
+        });
+        const data = await res.json();
+        if (!res.ok) { showToast(data.error || 'Failed to open portal', 'error'); return; }
+        window.location.href = data.url;
+      } catch (e) {
+        showToast('Network error.', 'error');
+      }
+    }
+
     async function loadInsights() {
       const btn = document.getElementById('insights-btn');
       const box = document.getElementById('insights-box');
       btn.textContent = '🤖 Analyzing…'; btn.disabled = true;
       try {
-        const res = await fetch('/api/insights', { headers: { 'Authorization': 'Bearer ' + token } });
+        const res = await fetch('/api/insights', { headers: { Authorization: 'Bearer ' + token } });
         const data = await res.json();
         if (!res.ok) {
           box.innerHTML = '<div class="icon">⚠️</div><p>' + (data.error || 'Could not load insights.') + '</p>';
@@ -1364,6 +1535,15 @@ const DASHBOARD_PAGE = `<!DOCTYPE html>
         btn.textContent = '✨ Generate AI Insights'; btn.disabled = false;
       }
     }
+
+    function showToast(msg, type) {
+      const t = document.getElementById('toast');
+      t.textContent = msg;
+      t.className = 'toast ' + type;
+      t.style.display = 'block';
+      setTimeout(() => { t.style.display = 'none'; }, 4000);
+    }
+
     function logout() {
       localStorage.removeItem('dagama_token');
       localStorage.removeItem('dagama_user');
