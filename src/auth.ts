@@ -1,6 +1,7 @@
 /// <reference types="@cloudflare/workers-types" />
 
 import { hashPassword, verifyPassword, signJwt, verifyJwt } from './crypto';
+import { ask, buildSummaryPrompt } from './gemini';
 import type { Env } from './types';
 
 interface User {
@@ -86,6 +87,38 @@ export async function handleLogin(request: Request, env: Env): Promise<Response>
   );
 
   return jsonResponse({ token, user: { id: user.id, email: user.email, name: user.name } });
+}
+
+export async function handleInsights(request: Request, env: Env): Promise<Response> {
+  if (request.method !== 'GET') return new Response('Method not allowed', { status: 405 });
+  const auth = await requireAuth(request, env);
+  if (auth instanceof Response) return auth;
+
+  if (!env.GEMINI_API_KEY || env.GEMINI_API_KEY.startsWith('your_')) {
+    return jsonResponse({ error: 'Gemini API key not configured' }, 503);
+  }
+
+  const bot = await env.DB.prepare(
+    `SELECT chat_id FROM bot_users WHERE user_id = ?`
+  ).bind(auth.userId).first<{ chat_id: number }>();
+
+  if (!bot) return jsonResponse({ error: 'No Telegram bot connected' }, 404);
+
+  const rows = await env.DB.prepare(
+    `SELECT name, company, email, notes, show_name, created_at FROM leads WHERE chat_id = ? ORDER BY created_at DESC LIMIT 50`
+  ).bind(bot.chat_id).all<{ name: string; company: string | null; email: string | null; notes: string | null; show_name: string; created_at: string }>();
+
+  if (!rows.results.length) return jsonResponse({ error: 'No leads to analyze' }, 404);
+
+  const showName = rows.results[0].show_name;
+  const showLeads = rows.results.filter(l => l.show_name === showName);
+
+  try {
+    const analysis = await ask(buildSummaryPrompt(showName, showLeads), env.GEMINI_API_KEY);
+    return jsonResponse({ show: showName, lead_count: showLeads.length, analysis });
+  } catch (e) {
+    return jsonResponse({ error: 'AI analysis failed' }, 502);
+  }
 }
 
 export async function handleStats(request: Request, env: Env): Promise<Response> {

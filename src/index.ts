@@ -1,6 +1,6 @@
 /// <reference types="@cloudflare/workers-types" />
 
-import { handleLogin, handleRegister, handleMe, handleStats } from './auth';
+import { handleLogin, handleRegister, handleMe, handleStats, handleInsights } from './auth';
 import { handleTelegramWebhook, handleSetupWebhook } from './telegram';
 import type { Env } from './types';
 
@@ -25,6 +25,7 @@ export default {
     if (path === '/api/auth/login')    return addCors(await handleLogin(request, env));
     if (path === '/api/me')                  return addCors(await handleMe(request, env));
     if (path === '/api/stats')               return addCors(await handleStats(request, env));
+    if (path === '/api/insights')            return addCors(await handleInsights(request, env));
     if (path === '/api/telegram/webhook')    return handleTelegramWebhook(request, env);
     if (path === '/api/telegram/setup')      return addCors(await handleSetupWebhook(request, env));
 
@@ -1310,8 +1311,8 @@ const DASHBOARD_PAGE = `<!DOCTYPE html>
       </div>
       <div class="stat-card">
         <div class="stat-label">AI Insights</div>
-        <div class="stat-value">0</div>
-        <div class="stat-sub">Powered by Gemini — Phase 5</div>
+        <div class="stat-value" id="stat-ai">0</div>
+        <div class="stat-sub">Powered by Gemini</div>
       </div>
       <div class="stat-card">
         <div class="stat-label">Telegram Bot</div>
@@ -1319,11 +1320,12 @@ const DASHBOARD_PAGE = `<!DOCTYPE html>
         <div class="stat-sub">Connect via /api/telegram/setup</div>
       </div>
     </div>
-    <div class="section-title">Recent Activity <span class="coming-soon">Phase 4</span></div>
-    <div class="empty-state">
-      <div class="icon">🗺️</div>
-      <p>No activity yet.<br>Connect your Telegram bot to start capturing leads at trade shows.</p>
+    <div class="section-title">AI Insights <span class="coming-soon">Gemini</span></div>
+    <div id="insights-box" class="empty-state">
+      <div class="icon">🤖</div>
+      <p>No insights yet.<br>Capture leads via the Telegram bot, then click below for AI analysis.</p>
     </div>
+    <button id="insights-btn" onclick="loadInsights()" style="margin-top:1rem;background:linear-gradient(135deg,#D4AF37,#E8C547);color:#0F1419;border:none;border-radius:8px;padding:0.75rem 1.5rem;font-family:'Outfit',sans-serif;font-weight:600;cursor:pointer;transition:all 0.2s;">✨ Generate AI Insights</button>
   </main>
   <script>
     const token = localStorage.getItem('dagama_token');
@@ -1341,6 +1343,27 @@ const DASHBOARD_PAGE = `<!DOCTYPE html>
         if (data.bot_connected) document.getElementById('stat-bot').style.color = '#4ade80';
       })
       .catch(() => {});
+    async function loadInsights() {
+      const btn = document.getElementById('insights-btn');
+      const box = document.getElementById('insights-box');
+      btn.textContent = '🤖 Analyzing…'; btn.disabled = true;
+      try {
+        const res = await fetch('/api/insights', { headers: { 'Authorization': 'Bearer ' + token } });
+        const data = await res.json();
+        if (!res.ok) {
+          box.innerHTML = '<div class="icon">⚠️</div><p>' + (data.error || 'Could not load insights.') + '</p>';
+        } else {
+          box.style.textAlign = 'left';
+          box.innerHTML = '<div style="font-size:0.8rem;text-transform:uppercase;letter-spacing:0.1em;color:#94A3B8;margin-bottom:0.75rem;">📊 ' + data.show + ' — ' + data.lead_count + ' leads</div>' +
+            '<p style="color:#F5F5F5;line-height:1.7;white-space:pre-wrap;">' + data.analysis + '</p>';
+          document.getElementById('stat-ai').textContent = '1';
+        }
+      } catch (e) {
+        box.innerHTML = '<div class="icon">❌</div><p>Network error. Please try again.</p>';
+      } finally {
+        btn.textContent = '✨ Generate AI Insights'; btn.disabled = false;
+      }
+    }
     function logout() {
       localStorage.removeItem('dagama_token');
       localStorage.removeItem('dagama_user');

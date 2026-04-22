@@ -1,6 +1,7 @@
 /// <reference types="@cloudflare/workers-types" />
 
 import type { Env } from './types';
+import { ask, buildSummaryPrompt, buildFollowUpPrompt } from './gemini';
 
 // ── Telegram types ────────────────────────────────────────────────────────────
 
@@ -69,10 +70,12 @@ async function handleMessage(msg: TgMessage, env: Env): Promise<void> {
   const session = await getSession(chatId, env);
 
   // Global commands always take priority
-  if (text === '/start') { await cmdStart(chatId, msg.from?.first_name ?? 'there', env); return; }
-  if (text === '/help')  { await cmdHelp(chatId, env); return; }
-  if (text === '/leads') { await cmdLeads(chatId, env); return; }
-  if (text === '/cancel') { await setSession(chatId, { step: 'idle', lead: {} }, env); await send(chatId, '❌ Cancelled.', env); return; }
+  if (text === '/start')   { await cmdStart(chatId, msg.from?.first_name ?? 'there', env); return; }
+  if (text === '/help')    { await cmdHelp(chatId, env); return; }
+  if (text === '/leads')   { await cmdLeads(chatId, env); return; }
+  if (text === '/summary') { await cmdSummary(chatId, env); return; }
+  if (text === '/cancel')  { await setSession(chatId, { step: 'idle', lead: {} }, env); await send(chatId, '❌ Cancelled.', env); return; }
+  if (text.startsWith('/followup')) { await cmdFollowup(chatId, text, env); return; }
 
   // Start a new lead capture
   if (text === '/newlead') {
@@ -130,7 +133,7 @@ async function handleLeadFlow(chatId: number, text: string, session: Session, en
         `📧 *Email:* ${lead.email || '—'}\n` +
         `🎪 *Show:* ${lead.show_name}\n` +
         `📝 *Notes:* ${lead.notes || '—'}\n\n` +
-        `Use /newlead to add another, or /leads to see all.`,
+        `Use /newlead to add another, /leads to see all, or /followup 1 to draft a follow-up email with AI.`,
         env, true
       );
       break;
@@ -147,6 +150,8 @@ async function cmdStart(chatId: number, firstName: string, env: Env): Promise<vo
     `*Commands:*\n` +
     `• /newlead — Capture a new lead\n` +
     `• /leads — View your recent leads\n` +
+    `• /summary — AI analysis of your leads\n` +
+    `• /followup 1 — Draft a follow-up email for lead #1\n` +
     `• /help — Show this help\n` +
     `• /cancel — Cancel current action`,
     env, true
@@ -158,10 +163,77 @@ async function cmdHelp(chatId: number, env: Env): Promise<void> {
     `*DaGama Bot Commands*\n\n` +
     `• /newlead — Start capturing a new lead\n` +
     `• /leads — See your last 10 leads\n` +
+    `• /summary — AI analysis of all your leads\n` +
+    `• /followup 1 — AI follow-up email for lead #1\n` +
     `• /cancel — Cancel whatever you're doing\n` +
     `• /help — Show this message`,
     env, true
   );
+}
+
+async function cmdSummary(chatId: number, env: Env): Promise<void> {
+  const rows = await env.DB.prepare(
+    `SELECT name, company, email, notes, show_name, created_at FROM leads WHERE chat_id = ? ORDER BY created_at DESC LIMIT 50`
+  ).bind(chatId).all<{ name: string; company: string; email: string; notes: string; show_name: string; created_at: string }>();
+
+  if (!rows.results.length) {
+    await send(chatId, 'No leads yet. Use /newlead to capture your first one!', env);
+    return;
+  }
+
+  if (!env.GEMINI_API_KEY || env.GEMINI_API_KEY.startsWith('your_')) {
+    await send(chatId, '⚠️ Gemini API key not configured. Add GEMINI_API_KEY to your environment.', env);
+    return;
+  }
+
+  await send(chatId, '🤖 Analyzing your leads…', env);
+
+  // Group by most recent show
+  const showName = rows.results[0].show_name;
+  const showLeads = rows.results.filter(l => l.show_name === showName);
+
+  try {
+    const prompt = buildSummaryPrompt(showName, showLeads);
+    const analysis = await ask(prompt, env.GEMINI_API_KEY);
+    await send(chatId, `📊 *AI Analysis — ${showName}*\n\n${analysis}`, env, true);
+  } catch (e) {
+    await send(chatId, '❌ AI analysis failed. Please try again later.', env);
+  }
+}
+
+async function cmdFollowup(chatId: number, text: string, env: Env): Promise<void> {
+  const parts = text.split(/\s+/);
+  const n = parseInt(parts[1] ?? '1', 10);
+
+  if (isNaN(n) || n < 1) {
+    await send(chatId, 'Usage: /followup 1  (use the lead number from /leads)', env);
+    return;
+  }
+
+  const rows = await env.DB.prepare(
+    `SELECT name, company, email, notes, show_name, created_at FROM leads WHERE chat_id = ? ORDER BY created_at DESC LIMIT 10`
+  ).bind(chatId).all<{ name: string; company: string; email: string; notes: string; show_name: string; created_at: string }>();
+
+  const lead = rows.results[n - 1];
+  if (!lead) {
+    await send(chatId, `No lead #${n} found. Use /leads to see your leads.`, env);
+    return;
+  }
+
+  if (!env.GEMINI_API_KEY || env.GEMINI_API_KEY.startsWith('your_')) {
+    await send(chatId, '⚠️ Gemini API key not configured. Add GEMINI_API_KEY to your environment.', env);
+    return;
+  }
+
+  await send(chatId, `✍️ Drafting follow-up email for *${lead.name}*…`, env, true);
+
+  try {
+    const prompt = buildFollowUpPrompt(lead, lead.show_name);
+    const email = await ask(prompt, env.GEMINI_API_KEY);
+    await send(chatId, `📧 *Follow-up for ${lead.name}:*\n\n${email}`, env, true);
+  } catch (e) {
+    await send(chatId, '❌ Failed to generate email. Please try again later.', env);
+  }
 }
 
 async function cmdLeads(chatId: number, env: Env): Promise<void> {
