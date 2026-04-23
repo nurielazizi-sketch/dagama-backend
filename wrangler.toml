@@ -18,8 +18,8 @@ ORIGIN = "http://localhost:8788"
 [env.production]
 name = "dagama-backend-prod"
 routes = [
-  { pattern = "api.heydagama.com/*", zone_id = "e72d0f50297322c0c374ee0004121555" },
-  { pattern = "heydagama.com/api/*", zone_id = "e72d0f50297322c0c374ee0004121555" }
+  { pattern = "api.heydagama.com/*", zone_id = "54cb75cb8e08b43408c8fed31e8d1c21" },
+  { pattern = "heydagama.com/api/*", zone_id = "54cb75cb8e08b43408c8fed31e8d1c21" }
 ]
 
 [env.production.vars]
