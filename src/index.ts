@@ -720,7 +720,7 @@ const LANDING_PAGE = `<!DOCTYPE html>
           <li>Auto follow-up emails</li>
           <li>Your data in Google Sheets</li>
         </ul>
-        <button class="btn-choose">Choose ShowBot →</button>
+        <button class="btn-choose">Choose BoothBot →</button>
       </div>
     </div>
 
@@ -743,7 +743,7 @@ const LANDING_PAGE = `<!DOCTYPE html>
 
   <!-- EXHIBITOR CONTENT -->
   <div class="exhibitor-content" id="exhibitorContent">
-    <h2 class="section-title">ShowBot: Never Lose a Buyer</h2>
+    <h2 class="section-title">BoothBot: Never Lose a Buyer</h2>
     <div class="features-grid">
       <div class="feature">
         <div class="feature-icon">📸</div>
@@ -777,7 +777,7 @@ const LANDING_PAGE = `<!DOCTYPE html>
       </div>
     </div>
 
-    <h2 class="section-title" style="margin-top: 6rem;">ShowBot Pricing</h2>
+    <h2 class="section-title" style="margin-top: 6rem;">BoothBot Pricing</h2>
     <div class="pricing-section exhibitor-pricing active">
       <div class="pricing-grid">
         <div class="pricing-card">

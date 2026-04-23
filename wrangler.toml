@@ -12,9 +12,6 @@ database_id = "14f95bab-49ed-4821-868c-fa7afa8d2335"
 ENVIRONMENT = "development"
 ORIGIN = "http://localhost:8788"
 
-[limits]
-cpu_ms = 50000
-
 # ==========================================
 # PRODUCTION ENVIRONMENT
 # ==========================================
