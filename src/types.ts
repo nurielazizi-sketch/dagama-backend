@@ -14,4 +14,6 @@ export interface Env {
   STRIPE_PRICE_TEAM_PLAN: string;
   GOOGLE_SERVICE_ACCOUNT_EMAIL: string;
   GOOGLE_SERVICE_ACCOUNT_PRIVATE_KEY: string;
+  GMAIL_CLIENT_ID: string;
+  GMAIL_CLIENT_SECRET: string;
 }

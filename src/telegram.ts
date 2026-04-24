@@ -2,7 +2,8 @@
 
 import type { Env } from './types';
 import { ask, buildSummaryPrompt, buildFollowUpPrompt } from './gemini';
-import { getOrCreateSheet, appendLeadRow } from './sheets';
+import { getOrCreateSheet, appendLeadRow, updateLeadEmailStatus } from './sheets';
+import { buildGmailAuthUrl, getGmailToken, sendGmailEmail } from './gmail';
 
 // ── Telegram types ────────────────────────────────────────────────────────────
 
@@ -77,7 +78,9 @@ async function handleMessage(msg: TgMessage, env: Env): Promise<void> {
   if (text === '/summary') { await cmdSummary(chatId, env); return; }
   if (text === '/cancel')  { await setSession(chatId, { step: 'idle', lead: {} }, env); await send(chatId, '❌ Cancelled.', env); return; }
   if (text === '/sheet')   { await cmdSheet(chatId, env); return; }
-  if (text.startsWith('/followup')) { await cmdFollowup(chatId, text, env); return; }
+  if (text.startsWith('/followup'))   { await cmdFollowup(chatId, text, env); return; }
+  if (text === '/connectgmail')        { await cmdConnectGmail(chatId, env); return; }
+  if (text.startsWith('/sendemail'))   { await cmdSendEmail(chatId, text, env); return; }
 
   // Start a new lead capture
   if (text === '/newlead') {
@@ -143,7 +146,7 @@ async function handleLeadFlow(chatId: number, text: string, session: Session, en
         `📧 *Email:* ${lead.email || '—'}\n` +
         `🎪 *Show:* ${lead.show_name}\n` +
         `📝 *Notes:* ${lead.notes || '—'}\n\n` +
-        `Use /newlead to add another, /leads to see all, or /followup 1 to draft a follow-up email with AI.`,
+        `Use /newlead to add another, /leads to see all, /followup 1 to draft an email, or /sendemail 1 to send it directly from your Gmail.`,
         env, true
       );
       break;
@@ -163,6 +166,8 @@ async function cmdStart(chatId: number, firstName: string, env: Env): Promise<vo
     `• /sheet — Get your Google Sheet link\n` +
     `• /summary — AI analysis of your leads\n` +
     `• /followup 1 — Draft a follow-up email for lead #1\n` +
+    `• /connectgmail — Link your Gmail to send emails\n` +
+    `• /sendemail 1 — Send follow-up email for lead #1\n` +
     `• /help — Show this help\n` +
     `• /cancel — Cancel current action`,
     env, true
@@ -176,7 +181,9 @@ async function cmdHelp(chatId: number, env: Env): Promise<void> {
     `• /leads — See your last 10 leads\n` +
     `• /sheet — Get your Google Sheet link\n` +
     `• /summary — AI analysis of all your leads\n` +
-    `• /followup 1 — AI follow-up email for lead #1\n` +
+    `• /followup 1 — AI draft follow-up email for lead #1\n` +
+    `• /connectgmail — Link your Gmail account\n` +
+    `• /sendemail 1 — Send follow-up email for lead #1\n` +
     `• /cancel — Cancel whatever you're doing\n` +
     `• /help — Show this message`,
     env, true
@@ -289,6 +296,101 @@ async function cmdSheet(chatId: number, env: Env): Promise<void> {
   await send(chatId, `*Your Google Sheets:*\n\n${lines}`, env, true);
 }
 
+async function cmdConnectGmail(chatId: number, env: Env): Promise<void> {
+  const existing = await getGmailToken(chatId, env);
+  if (existing) {
+    await send(chatId, `✅ Gmail already connected as *${existing.gmail_address}*.\n\nUse /sendemail N to send follow-up emails.`, env, true);
+    return;
+  }
+  const url = buildGmailAuthUrl(chatId, env);
+  await send(chatId,
+    `📧 *Connect your Gmail*\n\nTo send follow-up emails directly from your Gmail, authorize DaGama here:\n\n${url}\n\n_This is a one-time setup. Your emails will be sent from your own Gmail account._`,
+    env, true
+  );
+}
+
+async function cmdSendEmail(chatId: number, text: string, env: Env): Promise<void> {
+  const parts = text.split(/\s+/);
+  const n = parseInt(parts[1] ?? '1', 10);
+
+  if (isNaN(n) || n < 1) {
+    await send(chatId, 'Usage: /sendemail 1  (use the lead number from /leads)', env);
+    return;
+  }
+
+  const gmailToken = await getGmailToken(chatId, env);
+  if (!gmailToken) {
+    await send(chatId, '📧 Gmail not connected. Run /connectgmail first to link your Gmail account.', env);
+    return;
+  }
+
+  const rows = await env.DB.prepare(
+    `SELECT id, name, company, email, notes, show_name, sheet_row, created_at FROM leads WHERE chat_id = ? ORDER BY created_at DESC LIMIT 10`
+  ).bind(chatId).all<{ id: string; name: string; company: string; email: string; notes: string; show_name: string; sheet_row: number | null; created_at: string }>();
+
+  const lead = rows.results[n - 1];
+  if (!lead) {
+    await send(chatId, `No lead #${n} found. Use /leads to see your leads.`, env);
+    return;
+  }
+
+  if (!lead.email) {
+    await send(chatId, `❌ Lead #${n} (${lead.name}) has no email address stored. Capture their email first.`, env);
+    return;
+  }
+
+  if (!env.GEMINI_API_KEY || env.GEMINI_API_KEY.startsWith('your_')) {
+    await send(chatId, '⚠️ Gemini API key not configured.', env);
+    return;
+  }
+
+  await send(chatId, `✍️ Generating and sending email to *${lead.name}*…`, env, true);
+
+  try {
+    const prompt = buildFollowUpPrompt(lead, lead.show_name);
+    const emailText = await ask(prompt, env.GEMINI_API_KEY);
+    const result = await sendGmailEmail(chatId, lead.email, emailText, env);
+
+    await send(chatId,
+      `✅ *Email sent to ${lead.email}!*\n\n📧 *Subject:* ${result.subject}\n🕐 *Sent at:* ${result.sentAt}`,
+      env, true
+    );
+
+    // Best-effort: update Google Sheet email status columns
+    try {
+      if (lead.sheet_row) {
+        const botUser = await env.DB.prepare(
+          `SELECT user_id FROM bot_users WHERE chat_id = ?`
+        ).bind(chatId).first<{ user_id: string | null }>();
+
+        if (botUser?.user_id) {
+          const sheet = await env.DB.prepare(
+            `SELECT sheet_id FROM google_sheets WHERE user_id = ? AND show_name = ?`
+          ).bind(botUser.user_id, lead.show_name).first<{ sheet_id: string }>();
+
+          if (sheet?.sheet_id) {
+            await updateLeadEmailStatus(sheet.sheet_id, lead.sheet_row, {
+              emailSent: 'Yes',
+              emailSentAt: result.sentAt,
+              emailSubject: result.subject,
+              emailStatus: 'Sent',
+            }, env);
+          }
+        }
+      }
+    } catch {
+      // Silent failure — email was sent, Sheet update is best-effort
+    }
+  } catch (e: unknown) {
+    const msg = e instanceof Error ? e.message : String(e);
+    if (msg === 'GMAIL_NOT_CONNECTED') {
+      await send(chatId, '📧 Gmail not connected. Run /connectgmail first.', env);
+    } else {
+      await send(chatId, `❌ Failed to send email. Please try again.\n\n${msg}`, env);
+    }
+  }
+}
+
 // ── Subscription gate ─────────────────────────────────────────────────────────
 
 async function checkSubscription(chatId: number, env: Env): Promise<boolean> {
@@ -325,13 +427,16 @@ async function saveLead(chatId: number, lead: Lead, env: Env): Promise<void> {
 
       if (user?.email && env.GOOGLE_SERVICE_ACCOUNT_EMAIL && env.GOOGLE_SERVICE_ACCOUNT_PRIVATE_KEY) {
         const { sheetId } = await getOrCreateSheet(botUser.user_id, user.email, lead.show_name, env);
-        await appendLeadRow(sheetId, {
+        const { rowIndex } = await appendLeadRow(sheetId, {
           timestamp: new Date().toISOString(),
           company: lead.company || '',
           name: lead.name,
           email: lead.email || '',
           notes: lead.notes || '',
         }, env);
+        await env.DB.prepare(
+          `UPDATE leads SET sheet_row = ? WHERE chat_id = ? AND name = ? ORDER BY created_at DESC LIMIT 1`
+        ).bind(rowIndex, chatId, lead.name).run();
       }
     }
   } catch {

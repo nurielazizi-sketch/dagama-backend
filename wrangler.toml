@@ -19,7 +19,7 @@ ORIGIN = "http://localhost:8788"
 name = "dagama-backend-prod"
 routes = [
   { pattern = "api.heydagama.com/*", zone_id = "54cb75cb8e08b43408c8fed31e8d1c21" },
-  { pattern = "heydagama.com/api/*", zone_id = "54cb75cb8e08b43408c8fed31e8d1c21" }
+  { pattern = "heydagama.com/*", zone_id = "54cb75cb8e08b43408c8fed31e8d1c21" }
 ]
 
 [env.production.vars]
@@ -42,3 +42,5 @@ database_id = "14f95bab-49ed-4821-868c-fa7afa8d2335"
 # - STRIPE_PRICE_TEAM_PLAN                (Stripe price ID for $79/month recurring)
 # - GOOGLE_SERVICE_ACCOUNT_EMAIL          (service account email from GCP)
 # - GOOGLE_SERVICE_ACCOUNT_PRIVATE_KEY    (private key PEM from service account JSON, \n-escaped)
+# - GMAIL_CLIENT_ID                       (GCP OAuth 2.0 Client → Web Application)
+# - GMAIL_CLIENT_SECRET                   (GCP OAuth 2.0 Client)

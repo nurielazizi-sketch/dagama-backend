@@ -64,7 +64,7 @@ export async function appendLeadRow(
   sheetId: string,
   lead: LeadRow,
   env: Env
-): Promise<void> {
+): Promise<{ rowIndex: number }> {
   const token = await getServiceAccountToken(env);
 
   const row = [
@@ -109,6 +109,49 @@ export async function appendLeadRow(
         'Content-Type': 'application/json',
       },
       body: JSON.stringify({ values: [row] }),
+    }
+  );
+
+  // Fetch current row count to determine which row was just written
+  const metaRes = await fetch(
+    `${SHEETS_API}/${sheetId}?fields=sheets.properties.gridProperties`,
+    { headers: { Authorization: `Bearer ${token}` } }
+  );
+  const meta = await metaRes.json() as {
+    sheets?: Array<{ properties?: { gridProperties?: { rowCount?: number } } }>;
+  };
+  const rowCount = meta.sheets?.[0]?.properties?.gridProperties?.rowCount ?? 2;
+  return { rowIndex: rowCount };
+}
+
+export interface EmailStatus {
+  emailSent: 'Yes' | 'No';
+  emailSentAt: string;
+  emailSubject: string;
+  emailStatus: string;
+}
+
+export async function updateLeadEmailStatus(
+  sheetId: string,
+  rowIndex: number,
+  status: EmailStatus,
+  env: Env
+): Promise<void> {
+  const token = await getServiceAccountToken(env);
+  // Columns V:Y = Email Sent (22), Email Sent At (23), Email Subject (24), Email Status (25)
+  const range = `V${rowIndex}:Y${rowIndex}`;
+  await fetch(
+    `${SHEETS_API}/${sheetId}/values/${range}?valueInputOption=USER_ENTERED`,
+    {
+      method: 'PUT',
+      headers: {
+        Authorization: `Bearer ${token}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        range,
+        values: [[status.emailSent, status.emailSentAt, status.emailSubject, status.emailStatus]],
+      }),
     }
   );
 }

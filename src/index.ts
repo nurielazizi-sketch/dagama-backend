@@ -2,6 +2,7 @@
 
 import { handleLogin, handleRegister, handleMe, handleStats, handleInsights } from './auth';
 import { handleTelegramWebhook, handleSetupWebhook } from './telegram';
+import { handleGmailCallback } from './gmail';
 import { handleCreateCheckout, handleStripeWebhook, handleBillingPortal, handleSubscriptionStatus } from './stripe';
 import { getUserSheets } from './sheets';
 import type { Env } from './types';
@@ -35,6 +36,7 @@ export default {
     if (path === '/api/stripe/portal')       return addCors(await handleBillingPortal(request, env));
     if (path === '/api/stripe/status')       return addCors(await handleSubscriptionStatus(request, env));
     if (path === '/api/google/sheets')       return addCors(await handleGetSheets(request, env));
+    if (path === '/api/gmail/callback')      return handleGmailCallback(request, env);
 
     // UI routes
     if (path === '/') {
