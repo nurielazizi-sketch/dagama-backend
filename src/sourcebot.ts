@@ -157,6 +157,12 @@ async function handleMessage(msg: TgMessage, env: Env): Promise<void> {
   if (text === '/pdfshow')                                 { await cmdPdfShow(chatId, buyer, env); return; }
   if (text === '/blast')                                   { await cmdBlast(chatId, buyer, env); return; }
   if (text === '/clear')                                   { await cmdClear(chatId, env); return; }
+  if (text === '/tutorial')                                { await cmdTutorial(chatId, env); return; }
+  if (text === '/language' || text.startsWith('/language ')) {
+    await cmdLanguage(chatId, text.slice('/language'.length).trim(), buyer, env);
+    return;
+  }
+  if (text === '/share')                                   { await cmdShare(chatId, buyer, env); return; }
 
   // ── Reply-to-message corrections ──
   // If the user is replying to a confirmation message we previously sent, look
@@ -483,7 +489,10 @@ async function cmdHelp(chatId: number, env: Env): Promise<void> {
     `/shows — list your shows · /switch <name> — change active show\n` +
     `/newshow <name> [days] — register another show\n` +
     `/allshows — cross-show summary\n` +
-    `/upgrade — unlock unlimited scans (Stripe)\n` +
+    `/upgrade — unlock unlimited scans (Stripe)\n\n` +
+    `*Account*\n` +
+    `/share — your referral link · /tutorial — quick walkthrough\n` +
+    `/language [code] — set your language preference\n` +
     `/done · /cancel · /clear — exit current step`,
     env, true);
 }
@@ -1347,6 +1356,56 @@ async function cmdBlast(chatId: number, buyer: { buyerId: string }, env: Env): P
 async function cmdClear(chatId: number, env: Env): Promise<void> {
   await setSession(chatId, { step: 'idle' }, env);
   await send(chatId, `✅ Cleared current state. Send a card photo to start.`, env);
+}
+
+async function cmdTutorial(chatId: number, env: Env): Promise<void> {
+  await send(chatId,
+    `🎓 *DaGama SourceBot in 60 seconds*\n\n` +
+    `*1.* Snap a supplier's business card → I'll OCR it and save them to your sheet.\n\n` +
+    `*2.* Snap product photos one after another → each becomes a row on the *Products* tab with the photo embedded.\n\n` +
+    `*3.* *Reply* (text or voice 🎤) to any product photo → I extract price, MOQ, lead time, colors, materials.\n\n` +
+    `*4.* *Reply* to a supplier confirmation if I got something wrong (e.g. "name: Uriel Aziz") → I fix the row.\n\n` +
+    `*5.* End of day, you'll get an email digest. Next morning, a recap. Three days later, a follow-up summary.\n\n` +
+    `*6.* When you want to email a supplier: \`/email <name>\`. Or \`/blast\` to send to everyone uncontacted.\n\n` +
+    `Other shortcuts: \`/supplier\`, \`/products\`, \`/pending\`, \`/pdf <name>\`, \`/pdfshow\`, \`/share\`.\n\n` +
+    `Type /help for the full command list.`,
+    env, true);
+}
+
+async function cmdLanguage(chatId: number, code: string, buyer: { buyerId: string }, env: Env): Promise<void> {
+  const supported: Record<string, string> = {
+    en: 'English', es: 'Español', zh: '中文', fr: 'Français', de: 'Deutsch',
+    pt: 'Português', it: 'Italiano', ar: 'العربية', he: 'עברית', ja: '日本語',
+  };
+  if (!code) {
+    const lines = Object.entries(supported).map(([k, v]) => `\`/language ${k}\` — ${v}`).join('\n');
+    await send(chatId, `🌐 *Pick a language:*\n\n${lines}\n\n_Bot interface is currently English; this preference is stored for upcoming localization._`, env, true);
+    return;
+  }
+  if (!supported[code]) {
+    await send(chatId, `Unknown code "${code}". Use /language to see options.`, env);
+    return;
+  }
+  await env.DB.prepare(`UPDATE sb_buyers SET language = ? WHERE id = ?`).bind(code, buyer.buyerId).run();
+  await send(chatId, `✅ Language preference set to *${supported[code]}*.`, env, true);
+}
+
+async function cmdShare(chatId: number, buyer: { buyerId: string }, env: Env): Promise<void> {
+  const row = await env.DB.prepare(`SELECT referral_code, name FROM sb_buyers WHERE id = ?`).bind(buyer.buyerId).first<{ referral_code: string | null; name: string }>();
+  if (!row?.referral_code) {
+    // Backfill if missing
+    const code = (crypto.randomUUID() as string).split('-')[0];
+    await env.DB.prepare(`UPDATE sb_buyers SET referral_code = ? WHERE id = ?`).bind(code, buyer.buyerId).run();
+    if (row) row.referral_code = code;
+  }
+  const code = row?.referral_code ?? '';
+  const link = `${env.ORIGIN}/?ref=${code}`;
+  await send(chatId,
+    `🎁 *Refer a friend, both get rewarded*\n\n` +
+    `Share this link with a buyer headed to a trade show:\n${link}\n\n` +
+    `When they sign up and capture their first show, you both get a free show pass.`,
+    env, true);
+  await trackEvent(env, { buyerId: buyer.buyerId, eventName: 'referral_link_viewed' });
 }
 
 // ── /summary ─────────────────────────────────────────────────────────────────

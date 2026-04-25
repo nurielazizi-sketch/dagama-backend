@@ -12,12 +12,13 @@ const GRACE_PERIOD_SEC       = 2  * 3600;
 const ONBOARDING_TOKEN_TTL_SEC = 24 * 3600;
 
 interface OnboardRequest {
-  email:      string;
-  name:       string;
-  role:       'sourcebot' | 'boothbot';
-  show_name?: string;
-  password?:  string;       // For email/password signup; omit if Google OAuth already created the user
-  user_id?:   string;       // If Google OAuth created the user, pass the id here
+  email:          string;
+  name:           string;
+  role:           'sourcebot' | 'boothbot';
+  show_name?:     string;
+  password?:      string;   // For email/password signup; omit if Google OAuth already created the user
+  user_id?:       string;   // If Google OAuth created the user, pass the id here
+  referrer_code?: string;   // Optional: ?ref=<code> from the website signup URL
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -100,13 +101,30 @@ export async function handleOnboard(request: Request, env: Env): Promise<Respons
   const gracePeriodEnd = passExpiresAt + GRACE_PERIOD_SEC;
 
   if (body.role === 'sourcebot') {
+    // Resolve referrer (if any) BEFORE inserting the buyer so we can stamp referred_by atomically.
+    let referrerBuyerId: string | null = null;
+    if (body.referrer_code) {
+      const ref = await env.DB.prepare(`SELECT id FROM sb_buyers WHERE referral_code = ?`).bind(body.referrer_code).first<{ id: string }>();
+      referrerBuyerId = ref?.id ?? null;
+    }
+
+    const newReferralCode = (crypto.randomUUID() as string).split('-')[0];
     const buyer = await env.DB.prepare(
-      `INSERT INTO sb_buyers (user_id, email, name) VALUES (?, ?, ?)
+      `INSERT INTO sb_buyers (user_id, email, name, referral_code, referred_by) VALUES (?, ?, ?, ?, ?)
        ON CONFLICT(user_id) DO UPDATE SET email = excluded.email, name = excluded.name, updated_at = datetime('now')
        RETURNING id`
-    ).bind(userId, body.email, body.name).first<{ id: string }>();
+    ).bind(userId, body.email, body.name, newReferralCode, body.referrer_code ?? null).first<{ id: string }>();
     const buyerId = buyer?.id;
     if (!buyerId) return jsonError(500, 'sb_buyers insert failed');
+
+    // Log the referral relationship (idempotent — only inserts on first signup)
+    if (referrerBuyerId) {
+      await env.DB.prepare(
+        `INSERT INTO referrals (referrer_buyer_id, referred_buyer_id, referred_email, status)
+         SELECT ?, ?, ?, 'signed_up'
+          WHERE NOT EXISTS (SELECT 1 FROM referrals WHERE referred_buyer_id = ?)`
+      ).bind(referrerBuyerId, buyerId, body.email, buyerId).run();
+    }
 
     await env.DB.prepare(
       `INSERT INTO sb_buyer_shows
