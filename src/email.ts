@@ -131,6 +131,33 @@ interface GmailSendArgs {
   env:          Env;
 }
 
+// Public wrapper used by the funnel scheduler so it can send any rendered email
+// via the central transactional Gmail account (DAGAMA_NOREPLY_REFRESH_TOKEN).
+// Returns false if the central account isn't configured (caller should log).
+export async function sendTransactionalEmail(
+  args: { to: string; toName: string; subject: string; html: string; text: string },
+  env: Env,
+): Promise<boolean> {
+  const refreshToken = env.DAGAMA_NOREPLY_REFRESH_TOKEN;
+  const fromEmail    = env.DAGAMA_NOREPLY_FROM_EMAIL;
+  if (!refreshToken || !fromEmail) {
+    console.log(`[email] (no DAGAMA_NOREPLY config) would send to=${args.to} subject="${args.subject}"`);
+    return false;
+  }
+  await sendViaGmail({
+    to:       args.to,
+    toName:   args.toName,
+    from:     fromEmail,
+    fromName: 'DaGama',
+    subject:  args.subject,
+    html:     args.html,
+    text:     args.text,
+    refreshToken,
+    env,
+  });
+  return true;
+}
+
 async function sendViaGmail(args: GmailSendArgs): Promise<void> {
   // Refresh access token
   const params = new URLSearchParams({

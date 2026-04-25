@@ -172,12 +172,19 @@ async function handleCheckoutCompleted(session: Record<string, unknown>, env: En
   // upgrade keyed by sb_buyer_shows.id, not a user-level subscription.
   if (metadata?.['bot'] === 'sourcebot') {
     const showId = metadata['show_id'];
+    const buyerId = metadata['buyer_id'] ?? null;
     const planTier = metadata['plan'] ?? 'event_49';
     if (!showId) return;
     const now = Math.floor(Date.now() / 1000);
     await env.DB.prepare(
       `UPDATE sb_buyer_shows SET paid_plan = ?, paid_at = ? WHERE id = ?`
     ).bind(planTier, now, showId).run();
+    // Best-effort event log
+    try {
+      await env.DB.prepare(
+        `INSERT INTO events (buyer_id, show_id, event_name, properties_json) VALUES (?, ?, 'upgrade_completed', ?)`
+      ).bind(buyerId, showId, JSON.stringify({ plan: planTier })).run();
+    } catch { /* events table may not exist yet */ }
     return;
   }
 

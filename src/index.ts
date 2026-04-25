@@ -10,6 +10,7 @@ import { handleShowPassCron } from './telegram';
 import { handleOnboard, handleOnboardingStatus } from './onboarding';
 import { handleGoogleAuthStart, handleGoogleAuthCallback } from './google_auth';
 import { handleSourceBotWebhook, handleSourceBotSetupWebhook, handleSourceBotShowPassCron } from './sourcebot';
+import { processFunnelQueue } from './funnel';
 import type { Env } from './types';
 
 const CORS_HEADERS = {
@@ -22,6 +23,12 @@ export default {
   async scheduled(_event: ScheduledEvent, env: Env): Promise<void> {
     await handleShowPassCron(env);
     await handleSourceBotShowPassCron(env);
+    try {
+      const result = await processFunnelQueue(env);
+      if (result.sent || result.failed || result.skipped) {
+        console.log(`[funnel] sent=${result.sent} failed=${result.failed} skipped=${result.skipped}`);
+      }
+    } catch (e) { console.error('[funnel] cron failed:', e); }
   },
 
   async queue(batch: MessageBatch<ProcessCardJob>, env: Env): Promise<void> {

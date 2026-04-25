@@ -3,6 +3,7 @@
 import type { Env } from './types';
 import { consumeOnboardingToken } from './onboarding';
 import { getServiceAccountToken, createDriveFolder } from './google';
+import { scheduleFunnelOnFirstScan, trackEvent } from './funnel';
 import { appendSupplierRow, updateSupplierProducts, updateSupplierVoiceNote, updateSupplierEmailStatus, appendProductRow, updateProductRow, ensureProductsTab, updateSupplierCardBack, updateSupplierPerson } from './sb_sheets';
 import { buildGmailAuthUrl, getGmailToken, getValidAccessToken, sendGmailEmail } from './gmail';
 import { ocrThenExtract } from './extract';
@@ -407,7 +408,12 @@ async function cmdHelp(chatId: number, env: Env): Promise<void> {
     `/pending — products missing price or MOQ\n` +
     `/followups — suppliers with email but no follow-up sent\n` +
     `/email <supplier> — draft + send a follow-up email\n` +
-    `/connectgmail — connect your Gmail (sends from your address)\n` +
+    `/connectgmail — connect your Gmail (sends from your address)\n\n` +
+    `*Shows + billing*\n` +
+    `/shows — list your shows · /switch <name> — change active show\n` +
+    `/newshow <name> [days] — register another show\n` +
+    `/allshows — cross-show summary\n` +
+    `/upgrade — unlock unlimited scans (Stripe)\n` +
     `/done · /cancel — exit current step`,
     env, true);
 }
@@ -1077,6 +1083,7 @@ async function cmdUpgrade(chatId: number, buyer: { buyerId: string }, env: Env):
   await send(chatId,
     `💳 *Upgrade ${pass.show_name} — $49*\n\nUnlimited scans for this show + post-show retargeting.\n\n[Pay securely with Stripe](${d.url})`,
     env, true);
+  await trackEvent(env, { buyerId: buyer.buyerId, showId: pass.id, eventName: 'upgrade_clicked', properties: { plan: 'event_49' } });
 }
 
 // Look up the buyer's active show, honoring an explicit /switch override.
@@ -1131,7 +1138,7 @@ async function checkAndConsumeScan(pass: ActivePass, env: Env): Promise<ScanChec
     return { allowed: true };
   }
 
-  // First scan — set the free window
+  // First scan — set the free window AND schedule the funnel emails.
   if (!pass.first_scan_at) {
     const isShortShow = pass.duration_days === 2;
     const windowEnd = isShortShow ? null : now + 24 * 3600;
@@ -1142,6 +1149,18 @@ async function checkAndConsumeScan(pass: ActivePass, env: Env): Promise<ScanChec
               free_scans_used = 1, total_captures = total_captures + 1, last_capture_at = ?
         WHERE id = ?`
     ).bind(now, windowEnd, limit, now, pass.id).run();
+
+    // Pull buyer for funnel scheduling
+    const buyerRow = await env.DB.prepare(`SELECT b.id AS buyer_id FROM sb_buyers b JOIN sb_buyer_shows s ON s.buyer_id = b.id WHERE s.id = ?`).bind(pass.id).first<{ buyer_id: string }>();
+    if (buyerRow) {
+      await scheduleFunnelOnFirstScan({
+        buyerId:      buyerRow.buyer_id,
+        showId:       pass.id,
+        firstScanAt:  now,
+        durationDays: pass.duration_days,
+      }, env);
+      await trackEvent(env, { buyerId: buyerRow.buyer_id, showId: pass.id, eventName: 'show_first_scan', properties: { duration_days: pass.duration_days } });
+    }
     return { allowed: true };
   }
 
@@ -1428,6 +1447,8 @@ async function handleSupplierCard(
         WHERE id = (SELECT id FROM sb_contacts WHERE company_id = ? ORDER BY created_at DESC LIMIT 1)`
     ).bind(messageId, companyId).run();
   }
+
+  await trackEvent(env, { buyerId: buyer.buyerId, eventName: 'supplier_captured', properties: { company: companyName, has_email: !!extracted.email } });
 }
 
 // ── Reply-to-confirmation correction handler ───────────────────────────────
@@ -1937,6 +1958,8 @@ async function handleProductPhoto(
   if (messageId) {
     await env.DB.prepare(`UPDATE sb_products SET confirmation_message_id = ? WHERE id = ?`).bind(messageId, product.id).run();
   }
+
+  await trackEvent(env, { buyerId: buyer.buyerId, eventName: 'product_captured', properties: { product: productName, show: company.show_name } });
 }
 
 async function handleProductPrice(chatId: number, text: string, session: SourceBotSession, buyer: { buyerId: string }, env: Env): Promise<void> {
