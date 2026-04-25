@@ -1,12 +1,32 @@
 name = "dagama-backend"
 main = "src/index.ts"
 compatibility_date = "2024-04-15"
+compatibility_flags = ["nodejs_compat"]
+account_id = "c5147f5e370c8de027f86fcd4f5789c1"
 
 # D1 binding available in all environments (including local dev)
 [[d1_databases]]
 binding = "DB"
 database_name = "dagama"
 database_id = "14f95bab-49ed-4821-868c-fa7afa8d2335"
+
+[[r2_buckets]]
+binding = "R2_BUCKET"
+bucket_name = "dagama-cards"
+
+[[queues.consumers]]
+queue = "dagama-card-queue"
+max_batch_size = 10
+max_batch_timeout = 30
+max_retries = 3
+dead_letter_queue = "dagama-card-dlq"
+
+[[queues.producers]]
+queue = "dagama-card-queue"
+binding = "CARD_QUEUE"
+
+[triggers]
+crons = ["0 * * * *"]
 
 [vars]
 ENVIRONMENT = "development"
@@ -22,6 +42,9 @@ routes = [
   { pattern = "heydagama.com/*", zone_id = "54cb75cb8e08b43408c8fed31e8d1c21" }
 ]
 
+[env.production.triggers]
+crons = ["0 * * * *"]
+
 [env.production.vars]
 ENVIRONMENT = "production"
 ORIGIN = "https://heydagama.com"
@@ -31,9 +54,25 @@ binding = "DB"
 database_name = "dagama"
 database_id = "14f95bab-49ed-4821-868c-fa7afa8d2335"
 
+[[env.production.r2_buckets]]
+binding = "R2_BUCKET"
+bucket_name = "dagama-cards"
+
+[[env.production.queues.consumers]]
+queue = "dagama-card-queue"
+max_batch_size = 10
+max_batch_timeout = 30
+max_retries = 3
+dead_letter_queue = "dagama-card-dlq"
+
+[[env.production.queues.producers]]
+queue = "dagama-card-queue"
+binding = "CARD_QUEUE"
+
 # Production secrets (set via CLI: wrangler secret put NAME --env production)
 # - TELEGRAM_BOT_TOKEN
 # - GEMINI_API_KEY
+# - GCV_API_KEY                          (Google Cloud Vision API key for DOCUMENT_TEXT_DETECTION OCR)
 # - WEBHOOK_SECRET
 # - STRIPE_SECRET_KEY          (from Stripe dashboard → API keys)
 # - STRIPE_WEBHOOK_SECRET      (from Stripe dashboard → Webhooks → signing secret)
@@ -44,3 +83,4 @@ database_id = "14f95bab-49ed-4821-868c-fa7afa8d2335"
 # - GOOGLE_SERVICE_ACCOUNT_PRIVATE_KEY    (private key PEM from service account JSON, \n-escaped)
 # - GMAIL_CLIENT_ID                       (GCP OAuth 2.0 Client → Web Application)
 # - GMAIL_CLIENT_SECRET                   (GCP OAuth 2.0 Client)
+# - GOOGLE_SERVICE_ACCOUNT_TOKEN          (pre-refreshed OAuth2 Bearer token for Drive/Sheets)

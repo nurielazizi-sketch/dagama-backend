@@ -4,41 +4,37 @@ import type { Env } from './types';
 
 const SHEETS_API = 'https://sheets.googleapis.com/v4/spreadsheets';
 const DRIVE_API  = 'https://www.googleapis.com/drive/v3/files';
-const TOKEN_URL  = 'https://oauth2.googleapis.com/token';
 
-const SCOPES = [
-  'https://www.googleapis.com/auth/spreadsheets',
-  'https://www.googleapis.com/auth/drive.file',
-].join(' ');
-
-// 30-column header per DaGama master spec
 const SHEET_HEADERS = [
-  'Timestamp', 'Company', 'Contact Name', 'Title', 'Email',
-  'Phone', 'Phone Country', 'Website', 'LinkedIn', 'Industry',
-  'Company Size', 'Certifications', 'Geographic Presence',
-  'Card Front Photo', 'Card Back Photo', 'Products', 'Price Range',
-  'Avg Lead Time', 'Interest Level', 'Notes', 'Voice Note',
+  'Timestamp', 'Show / Event', 'Company', 'Contact Name', 'Title',
+  'Email', 'Phone', 'Country', 'Website', 'LinkedIn',
+  'Address', 'Notes',
   'Email Sent', 'Email Sent At', 'Email Subject', 'Email Status',
-  'Reply Received', 'Reply Content', 'Person Photo', 'Person Description',
-  'Last Updated',
+  'Last Updated', 'Card Photo', 'Card Image',
 ];
 
 export interface LeadRow {
   timestamp: string;
-  company: string;
+  showName: string;
   name: string;
   title?: string;
+  company?: string;
   email?: string;
   phone?: string;
+  country?: string;
+  website?: string;
+  linkedin?: string;
+  address?: string;
   notes?: string;
+  cardPhotoUrl?: string;
 }
 
 // ── Public API ────────────────────────────────────────────────────────────────
 
 export async function getOrCreateSheet(
   userId: string,
-  userEmail: string,
   showName: string,
+  token: string,
   env: Env
 ): Promise<{ sheetId: string; sheetUrl: string }> {
   // Check D1 first
@@ -48,9 +44,7 @@ export async function getOrCreateSheet(
 
   if (existing) return { sheetId: existing.sheet_id, sheetUrl: existing.sheet_url };
 
-  const token = await getServiceAccountToken(env);
   const { sheetId, sheetUrl } = await createSheet(showName, token);
-  await shareSheet(sheetId, userEmail, token);
 
   await env.DB.prepare(
     `INSERT OR IGNORE INTO google_sheets (user_id, show_name, sheet_id, sheet_url)
@@ -63,45 +57,34 @@ export async function getOrCreateSheet(
 export async function appendLeadRow(
   sheetId: string,
   lead: LeadRow,
+  token: string,
   env: Env
 ): Promise<{ rowIndex: number }> {
-  const token = await getServiceAccountToken(env);
 
   const row = [
     lead.timestamp,
+    lead.showName || '',
     lead.company || '',
     lead.name || '',
     lead.title || '',
     lead.email || '',
     lead.phone || '',
-    '', // Phone Country
-    '', // Website
-    '', // LinkedIn
-    '', // Industry
-    '', // Company Size
-    '', // Certifications
-    '', // Geographic Presence
-    '', // Card Front Photo
-    '', // Card Back Photo
-    '', // Products
-    '', // Price Range
-    '', // Avg Lead Time
-    '', // Interest Level
+    lead.country || '',
+    lead.website || '',
+    lead.linkedin || '',
+    lead.address || '',
     lead.notes || '',
-    '', // Voice Note
     '', // Email Sent
     '', // Email Sent At
     '', // Email Subject
     '', // Email Status
-    '', // Reply Received
-    '', // Reply Content
-    '', // Person Photo
-    '', // Person Description
     new Date().toISOString(),
+    lead.cardPhotoUrl || '', // Card Photo (R)
+    '',                      // Card Image formula (S) — written separately
   ];
 
-  await fetch(
-    `${SHEETS_API}/${sheetId}/values/A1:append?valueInputOption=USER_ENTERED&insertDataOption=INSERT_ROWS`,
+  const appendRes = await fetch(
+    `${SHEETS_API}/${sheetId}/values/A1:append?valueInputOption=RAW&insertDataOption=INSERT_ROWS`,
     {
       method: 'POST',
       headers: {
@@ -112,16 +95,29 @@ export async function appendLeadRow(
     }
   );
 
-  // Fetch current row count to determine which row was just written
-  const metaRes = await fetch(
-    `${SHEETS_API}/${sheetId}?fields=sheets.properties.gridProperties`,
-    { headers: { Authorization: `Bearer ${token}` } }
-  );
-  const meta = await metaRes.json() as {
-    sheets?: Array<{ properties?: { gridProperties?: { rowCount?: number } } }>;
-  };
-  const rowCount = meta.sheets?.[0]?.properties?.gridProperties?.rowCount ?? 2;
-  return { rowIndex: rowCount };
+  // The append response tells us exactly where the row landed
+  // (gridProperties.rowCount is the whole sheet's row dimension, not the data row — don't use it)
+  const appendData = await appendRes.json() as { updates?: { updatedRange?: string } };
+  const updatedRange = appendData.updates?.updatedRange ?? '';
+  const rowMatch = updatedRange.match(/![A-Z]+(\d+):/);
+  const rowIndex = rowMatch ? parseInt(rowMatch[1], 10) : 2;
+
+  // Write IMAGE formula with USER_ENTERED so Sheets evaluates it.
+  // R column holds a direct image URL (lh3.googleusercontent.com/d/{fileId}),
+  // which =IMAGE() can consume directly.
+  if (lead.cardPhotoUrl) {
+    const formula = `=IMAGE(R${rowIndex})`;
+    await fetch(
+      `${SHEETS_API}/${sheetId}/values/S${rowIndex}?valueInputOption=USER_ENTERED`,
+      {
+        method: 'PUT',
+        headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ range: `S${rowIndex}`, values: [[formula]] }),
+      }
+    );
+  }
+
+  return { rowIndex };
 }
 
 export interface EmailStatus {
@@ -135,11 +131,11 @@ export async function updateLeadEmailStatus(
   sheetId: string,
   rowIndex: number,
   status: EmailStatus,
+  token: string,
   env: Env
 ): Promise<void> {
-  const token = await getServiceAccountToken(env);
-  // Columns V:Y = Email Sent (22), Email Sent At (23), Email Subject (24), Email Status (25)
-  const range = `V${rowIndex}:Y${rowIndex}`;
+  // Columns M:P = Email Sent (13), Email Sent At (14), Email Subject (15), Email Status (16)
+  const range = `M${rowIndex}:P${rowIndex}`;
   await fetch(
     `${SHEETS_API}/${sheetId}/values/${range}?valueInputOption=USER_ENTERED`,
     {
@@ -153,6 +149,43 @@ export async function updateLeadEmailStatus(
         values: [[status.emailSent, status.emailSentAt, status.emailSubject, status.emailStatus]],
       }),
     }
+  );
+}
+
+export async function updateLeadLinkedIn(
+  sheetId: string,
+  rowIndex: number,
+  linkedinUrl: string,
+  token: string,
+): Promise<void> {
+  // Column J = LinkedIn (0-indexed 9 in SHEET_HEADERS)
+  await fetch(
+    `${SHEETS_API}/${sheetId}/values/J${rowIndex}?valueInputOption=USER_ENTERED`,
+    {
+      method: 'PUT',
+      headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ range: `J${rowIndex}`, values: [[linkedinUrl]] }),
+    },
+  );
+}
+
+export async function patchLeadNotes(
+  sheetId: string,
+  rowIndex: number,
+  notes: string,
+  token: string,
+): Promise<void> {
+  // Column L = Notes (index 11), Column Q = Last Updated (index 16)
+  await fetch(
+    `${SHEETS_API}/${sheetId}/values/L${rowIndex}:Q${rowIndex}?valueInputOption=USER_ENTERED`,
+    {
+      method: 'PUT',
+      headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        range: `L${rowIndex}:Q${rowIndex}`,
+        values: [[notes, '', '', '', '', new Date().toISOString()]],
+      }),
+    },
   );
 }
 
@@ -170,45 +203,51 @@ export async function getUserSheets(
 
 // ── Sheet creation ────────────────────────────────────────────────────────────
 
-async function createSheet(showName: string, token: string): Promise<{ sheetId: string; sheetUrl: string }> {
-  const title = `DaGama — ${showName}`;
+// Service-account-friendly variant: place the sheet inside an existing Drive folder.
+// Used by /api/onboard so the sheet lives in a buyer-specific folder we can share.
+export async function createBoothBotSheetInFolder(
+  showName: string,
+  parentFolderId: string,
+  token: string,
+): Promise<{ sheetId: string; sheetUrl: string }> {
+  return createSheet(showName, token, parentFolderId);
+}
 
-  const res = await fetch(SHEETS_API, {
+async function createSheet(showName: string, token: string, parentFolderId?: string): Promise<{ sheetId: string; sheetUrl: string }> {
+  const title = `DaGama — ${showName} Lead list`;
+
+  // Create spreadsheet via Drive API (more permissive than Sheets POST)
+  const driveBody: Record<string, unknown> = {
+    name: title,
+    mimeType: 'application/vnd.google-apps.spreadsheet',
+  };
+  if (parentFolderId) driveBody.parents = [parentFolderId];
+
+  const driveRes = await fetch(`${DRIVE_API}?fields=id`, {
     method: 'POST',
     headers: {
       Authorization: `Bearer ${token}`,
       'Content-Type': 'application/json',
     },
-    body: JSON.stringify({
-      properties: { title },
-      sheets: [{
-        properties: { title: showName, sheetId: 0 },
-        data: [{
-          startRow: 0,
-          startColumn: 0,
-          rowData: [{
-            values: SHEET_HEADERS.map(h => ({
-              userEnteredValue: { stringValue: h },
-              userEnteredFormat: {
-                backgroundColor: { red: 0.106, green: 0.188, blue: 0.314 }, // Ink Navy #1B3050
-                textFormat: {
-                  foregroundColor: { red: 1, green: 1, blue: 1 },
-                  bold: true,
-                  fontSize: 10,
-                },
-              },
-            })),
-          }],
-        }],
-      }],
-    }),
+    body: JSON.stringify(driveBody),
+  });
+  const driveData = await driveRes.json() as { id?: string; error?: { code?: number; message?: string } };
+  if (!driveData.id) throw new Error(`Failed to create sheet via Drive: HTTP ${driveRes.status} | ${JSON.stringify(driveData.error ?? driveData)}`);
+
+  const spreadsheetId = driveData.id;
+
+  // Add headers via Sheets API
+  const res = await fetch(`${SHEETS_API}/${spreadsheetId}/values/A1?valueInputOption=USER_ENTERED`, {
+    method: 'PUT',
+    headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ values: [SHEET_HEADERS] }),
   });
 
-  const data = await res.json() as { spreadsheetId?: string; spreadsheetUrl?: string };
-  if (!data.spreadsheetId) throw new Error('Failed to create Google Sheet');
+  const data = await res.json() as { spreadsheetId?: string; error?: { code?: number; message?: string; status?: string } };
+  if (!res.ok) throw new Error(`Failed to write headers: HTTP ${res.status} | ${JSON.stringify(data.error ?? data)}`);
 
   // Freeze header row and auto-resize columns
-  await fetch(`${SHEETS_API}/${data.spreadsheetId}:batchUpdate`, {
+  await fetch(`${SHEETS_API}/${spreadsheetId}:batchUpdate`, {
     method: 'POST',
     headers: {
       Authorization: `Bearer ${token}`,
@@ -217,97 +256,94 @@ async function createSheet(showName: string, token: string): Promise<{ sheetId: 
     body: JSON.stringify({
       requests: [
         { updateSheetProperties: { properties: { sheetId: 0, gridProperties: { frozenRowCount: 1 } }, fields: 'gridProperties.frozenRowCount' } },
-        { autoResizeDimensions: { dimensions: { sheetId: 0, dimension: 'COLUMNS', startIndex: 0, endIndex: 30 } } },
+        { autoResizeDimensions: { dimensions: { sheetId: 0, dimension: 'COLUMNS', startIndex: 0, endIndex: 19 } } },
       ],
     }),
   });
 
   return {
-    sheetId: data.spreadsheetId,
-    sheetUrl: `https://docs.google.com/spreadsheets/d/${data.spreadsheetId}`,
+    sheetId: spreadsheetId,
+    sheetUrl: `https://docs.google.com/spreadsheets/d/${spreadsheetId}`,
   };
 }
 
-async function shareSheet(sheetId: string, email: string, token: string): Promise<void> {
-  await fetch(`${DRIVE_API}/${sheetId}/permissions`, {
-    method: 'POST',
-    headers: {
-      Authorization: `Bearer ${token}`,
-      'Content-Type': 'application/json',
+// ── Drive photo upload ─────────────────────────────────────────────────────────
+
+export async function uploadCardPhotoToDrive(
+  fileName: string,
+  imageBuffer: ArrayBuffer,
+  mimeType: string,
+  token: string,
+  showName?: string,
+): Promise<string> {
+  const parentFolderId = showName ? await getOrCreateShowFolder(showName, token) : undefined;
+
+  const boundary = '--------dagama_boundary';
+  const metadata = JSON.stringify({
+    name: fileName,
+    mimeType,
+    ...(parentFolderId ? { parents: [parentFolderId] } : {}),
+  });
+
+  const encoder = new TextEncoder();
+  const preamble = encoder.encode(
+    `--${boundary}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n${metadata}\r\n` +
+    `--${boundary}\r\nContent-Type: ${mimeType}\r\n\r\n`,
+  );
+  const epilogue = encoder.encode(`\r\n--${boundary}--`);
+  const imageBytes = new Uint8Array(imageBuffer);
+  const body = new Uint8Array(preamble.length + imageBytes.length + epilogue.length);
+  body.set(preamble, 0);
+  body.set(imageBytes, preamble.length);
+  body.set(epilogue, preamble.length + imageBytes.length);
+
+  const uploadRes = await fetch(
+    'https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&fields=id',
+    {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${token}`,
+        'Content-Type': `multipart/related; boundary=${boundary}`,
+      },
+      body: body.buffer,
     },
-    body: JSON.stringify({
-      role: 'writer',
-      type: 'user',
-      emailAddress: email,
-    }),
-  });
-}
-
-// ── Service account JWT (RS256) ───────────────────────────────────────────────
-
-async function getServiceAccountToken(env: Env): Promise<string> {
-  const now = Math.floor(Date.now() / 1000);
-
-  const header  = b64url(JSON.stringify({ alg: 'RS256', typ: 'JWT' }));
-  const payload = b64url(JSON.stringify({
-    iss: env.GOOGLE_SERVICE_ACCOUNT_EMAIL,
-    scope: SCOPES,
-    aud: TOKEN_URL,
-    iat: now,
-    exp: now + 3600,
-  }));
-
-  const signingInput = `${header}.${payload}`;
-  const key = await importRsaPrivateKey(env.GOOGLE_SERVICE_ACCOUNT_PRIVATE_KEY);
-  const sigBytes = await crypto.subtle.sign(
-    { name: 'RSASSA-PKCS1-v1_5' },
-    key,
-    new TextEncoder().encode(signingInput)
   );
+  const uploadData = await uploadRes.json() as { id?: string };
+  if (!uploadData.id) throw new Error('Drive photo upload failed');
 
-  const jwt = `${signingInput}.${b64urlRaw(new Uint8Array(sigBytes))}`;
+  const fileId = uploadData.id;
 
-  const res = await fetch(TOKEN_URL, {
+  await fetch(`${DRIVE_API}/${fileId}/permissions`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-    body: new URLSearchParams({
-      grant_type: 'urn:ietf:params:oauth:grant-type:jwt-bearer',
-      assertion: jwt,
-    }),
+    headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ role: 'reader', type: 'anyone' }),
   });
 
-  const data = await res.json() as { access_token?: string };
-  if (!data.access_token) throw new Error('Failed to obtain Google service account token');
-  return data.access_token;
+  return `https://lh3.googleusercontent.com/d/${fileId}`;
 }
 
-async function importRsaPrivateKey(pem: string): Promise<CryptoKey> {
-  // Wrangler stores multiline secrets with literal \n — normalize both cases
-  const normalized = pem.replace(/\\n/g, '\n');
-  const body = normalized
-    .replace(/-----BEGIN PRIVATE KEY-----/, '')
-    .replace(/-----END PRIVATE KEY-----/, '')
-    .replace(/\n/g, '')
-    .trim();
+async function getOrCreateShowFolder(showName: string, token: string): Promise<string> {
+  const now = new Date();
+  const monthYear = now.toLocaleString('en-US', { month: 'long', year: 'numeric' });
+  const folderName = `${showName} — ${monthYear}`;
 
-  const keyData = Uint8Array.from(atob(body), c => c.charCodeAt(0));
-
-  return crypto.subtle.importKey(
-    'pkcs8',
-    keyData,
-    { name: 'RSASSA-PKCS1-v1_5', hash: 'SHA-256' },
-    false,
-    ['sign']
+  const q = encodeURIComponent(
+    `name='${folderName.replace(/'/g, "\\'")}' and mimeType='application/vnd.google-apps.folder' and trashed=false`
   );
+  const searchRes = await fetch(
+    `${DRIVE_API}?q=${q}&fields=files(id)&pageSize=1`,
+    { headers: { Authorization: `Bearer ${token}` } },
+  );
+  const searchData = await searchRes.json() as { files?: Array<{ id: string }> };
+  if (searchData.files?.length) return searchData.files[0].id;
+
+  const createRes = await fetch(`${DRIVE_API}?fields=id`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ name: folderName, mimeType: 'application/vnd.google-apps.folder' }),
+  });
+  const createData = await createRes.json() as { id?: string };
+  if (!createData.id) throw new Error(`Drive folder create failed: ${folderName}`);
+  return createData.id;
 }
 
-// ── Base64url helpers ─────────────────────────────────────────────────────────
-
-function b64url(s: string): string {
-  return b64urlRaw(new TextEncoder().encode(s));
-}
-
-function b64urlRaw(buf: Uint8Array): string {
-  return btoa(String.fromCharCode(...buf))
-    .replace(/\+/g, '-').replace(/\//g, '_').replace(/=/g, '');
-}
