@@ -51,7 +51,7 @@ export async function createDriveFolder(name: string, parentId: string | null, t
   };
   if (parentId) body.parents = [parentId];
 
-  const res = await fetch(`${DRIVE_API}?fields=id`, {
+  const res = await fetch(`${DRIVE_API}?fields=id&supportsAllDrives=true`, {
     method: 'POST',
     headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
     body: JSON.stringify(body),
@@ -72,7 +72,7 @@ export async function shareDriveItem(
   role: 'reader' | 'writer' = 'writer',
   notify = true,
 ): Promise<void> {
-  const res = await fetch(`${DRIVE_API}/${fileId}/permissions?sendNotificationEmail=${notify}`, {
+  const res = await fetch(`${DRIVE_API}/${fileId}/permissions?sendNotificationEmail=${notify}&supportsAllDrives=true`, {
     method: 'POST',
     headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
     body: JSON.stringify({ role, type: 'user', emailAddress: email }),

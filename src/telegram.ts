@@ -1145,7 +1145,10 @@ async function saveLead(
             const namePart = (lead.name || 'card').replace(/[^a-z0-9]/gi, '_');
             const companyPart = lead.company ? `_${lead.company.replace(/[^a-z0-9]/gi, '_')}` : '';
             const fileName = `${namePart}${companyPart}.webp`;
-            cardPhotoUrl = await uploadCardPhotoToDrive(fileName, croppedBuffer, 'image/webp', googleToken, lead.show_name);
+            cardPhotoUrl = await uploadCardPhotoToDrive(
+              fileName, croppedBuffer, 'image/webp', googleToken, lead.show_name,
+              sheetOwner?.owner_type === 'service_account' ? env.SHARED_DRIVE_ID : undefined,
+            );
           }
         } catch { /* photo upload is best-effort */ }
       }

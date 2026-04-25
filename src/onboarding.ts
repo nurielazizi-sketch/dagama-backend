@@ -69,8 +69,11 @@ export async function handleOnboard(request: Request, env: Env): Promise<Respons
   let sheetUrl = '', sheetId = '', folderUrl = '', folderId = '';
   try {
     const token = await getServiceAccountToken(env);
-    // Drive folder: "DaGama — {show} ({email})" — keeps multiple users distinct in service account's view
-    const folder = await createDriveFolder(`DaGama — ${showName} (${body.email})`, null, token);
+    if (!env.SHARED_DRIVE_ID) {
+      return jsonError(500, 'SHARED_DRIVE_ID not configured — service account cannot create files outside a Shared Drive.');
+    }
+    // Drive folder: "DaGama — {show} ({email})" — created inside the Shared Drive so the SA can own it.
+    const folder = await createDriveFolder(`DaGama — ${showName} (${body.email})`, env.SHARED_DRIVE_ID, token);
     folderId  = folder.id;
     folderUrl = folder.url;
 

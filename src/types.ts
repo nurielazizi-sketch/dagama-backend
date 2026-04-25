@@ -19,6 +19,12 @@ export interface Env {
   STRIPE_PRICE_TEAM_PLAN: string;
   GOOGLE_SERVICE_ACCOUNT_EMAIL: string;
   GOOGLE_SERVICE_ACCOUNT_PRIVATE_KEY: string;
+  // Shared Drive ID where service-account-owned folders/sheets/photos live.
+  // Service accounts on personal GCP projects have 0 GB of personal Drive
+  // storage, so all files they create must live in a Shared Drive (which
+  // owns the storage instead of the SA). Required for any onboarding/capture
+  // flow that uses the service-account token.
+  SHARED_DRIVE_ID: string;
   GMAIL_CLIENT_ID: string;
   GMAIL_CLIENT_SECRET: string;
   // Central transactional email — once nurielazizi@gmail.com (later noreply@heydagama.com)

@@ -48,6 +48,7 @@ crons = ["0 * * * *"]
 [env.production.vars]
 ENVIRONMENT = "production"
 ORIGIN = "https://heydagama.com"
+SHARED_DRIVE_ID = "0AKPcQEYiY_9IUk9PVA"
 
 [[env.production.d1_databases]]
 binding = "DB"

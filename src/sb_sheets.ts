@@ -40,6 +40,18 @@ export interface SbSupplierRow {
   notes?:              string;
 }
 
+// SourceBot "Products" tab — one row per product so each has its own image,
+// dedicated price column, dedicated MOQ column, etc.
+//   A=Timestamp · B=Supplier · C=Product Name · D=Image · E=Description
+//   F=Price · G=MOQ · H=Lead Time · I=Tone · J=Notes · K=Last Updated
+export const SB_PRODUCT_HEADERS = [
+  'Timestamp', 'Supplier', 'Product Name', 'Image', 'Description',
+  'Price', 'MOQ', 'Lead Time', 'Tone', 'Notes', 'Last Updated',
+];
+
+const PRODUCTS_TAB_NAME = 'Products';
+const NO_DETAILS_PLACEHOLDER = '— no details yet (reply on Telegram with text or voice) —';
+
 // Create a SourceBot Sheet inside a Drive folder. Returns the spreadsheet id+url.
 export async function createSourceBotSheet(
   showName: string,
@@ -49,7 +61,7 @@ export async function createSourceBotSheet(
   const title = `DaGama — ${showName} Supplier list`;
 
   // Create as a Drive file inside the buyer's show folder
-  const driveRes = await fetch(`${DRIVE_API}?fields=id`, {
+  const driveRes = await fetch(`${DRIVE_API}?fields=id&supportsAllDrives=true`, {
     method: 'POST',
     headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
     body: JSON.stringify({
@@ -62,15 +74,40 @@ export async function createSourceBotSheet(
   if (!driveData.id) throw new Error(`Sheet create failed: ${driveRes.status} ${JSON.stringify(driveData)}`);
   const spreadsheetId = driveData.id;
 
-  // Write headers
-  const headerRes = await fetch(`${SHEETS_API}/${spreadsheetId}/values/A1?valueInputOption=USER_ENTERED`, {
+  // Rename Sheet1 → "Suppliers", write supplier headers, add a Products tab
+  await fetch(`${SHEETS_API}/${spreadsheetId}:batchUpdate`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      requests: [
+        { updateSheetProperties: { properties: { sheetId: 0, title: 'Suppliers' }, fields: 'title' } },
+        { addSheet: { properties: { title: PRODUCTS_TAB_NAME } } },
+      ],
+    }),
+  });
+
+  // Suppliers headers
+  const sHeaderRes = await fetch(`${SHEETS_API}/${spreadsheetId}/values/Suppliers!A1?valueInputOption=USER_ENTERED`, {
     method: 'PUT',
     headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
     body: JSON.stringify({ values: [SB_SHEET_HEADERS] }),
   });
-  if (!headerRes.ok) throw new Error(`Header write failed: ${headerRes.status} ${await headerRes.text()}`);
+  if (!sHeaderRes.ok) throw new Error(`Supplier header write failed: ${sHeaderRes.status} ${await sHeaderRes.text()}`);
 
-  // Freeze header row + auto-resize columns A:AD (30 columns)
+  // Products headers
+  const pHeaderRes = await fetch(`${SHEETS_API}/${spreadsheetId}/values/${PRODUCTS_TAB_NAME}!A1?valueInputOption=USER_ENTERED`, {
+    method: 'PUT',
+    headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ values: [SB_PRODUCT_HEADERS] }),
+  });
+  if (!pHeaderRes.ok) throw new Error(`Product header write failed: ${pHeaderRes.status} ${await pHeaderRes.text()}`);
+
+  // Freeze headers + auto-size on both tabs. Products tab id we have to look up.
+  const meta = await fetch(`${SHEETS_API}/${spreadsheetId}?fields=sheets.properties(sheetId,title)`, {
+    headers: { Authorization: `Bearer ${token}` },
+  }).then(r => r.json()) as { sheets?: Array<{ properties?: { sheetId: number; title: string } }> };
+  const productsSheetId = meta.sheets?.find(s => s.properties?.title === PRODUCTS_TAB_NAME)?.properties?.sheetId ?? null;
+
   await fetch(`${SHEETS_API}/${spreadsheetId}:batchUpdate`, {
     method: 'POST',
     headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
@@ -78,6 +115,13 @@ export async function createSourceBotSheet(
       requests: [
         { updateSheetProperties: { properties: { sheetId: 0, gridProperties: { frozenRowCount: 1 } }, fields: 'gridProperties.frozenRowCount' } },
         { autoResizeDimensions: { dimensions: { sheetId: 0, dimension: 'COLUMNS', startIndex: 0, endIndex: SB_SHEET_HEADERS.length } } },
+        ...(productsSheetId !== null ? [
+          { updateSheetProperties: { properties: { sheetId: productsSheetId, gridProperties: { frozenRowCount: 1, rowCount: 1000, columnCount: SB_PRODUCT_HEADERS.length } }, fields: 'gridProperties.frozenRowCount,gridProperties.rowCount,gridProperties.columnCount' } },
+          // Set a sensible default row height so image previews fit
+          { updateDimensionProperties: { range: { sheetId: productsSheetId, dimension: 'ROWS', startIndex: 1, endIndex: 1000 }, properties: { pixelSize: 110 }, fields: 'pixelSize' } },
+          // Image column wide enough for a thumbnail
+          { updateDimensionProperties: { range: { sheetId: productsSheetId, dimension: 'COLUMNS', startIndex: 3, endIndex: 4 }, properties: { pixelSize: 160 }, fields: 'pixelSize' } },
+        ] : []),
       ],
     }),
   });
@@ -86,6 +130,129 @@ export async function createSourceBotSheet(
     sheetId: spreadsheetId,
     sheetUrl: `https://docs.google.com/spreadsheets/d/${spreadsheetId}`,
   };
+}
+
+// Lazy: ensure the "Products" tab exists on an already-created sheet (for
+// buyers whose sheet was provisioned before the tab was introduced).
+export async function ensureProductsTab(sheetId: string, token: string): Promise<void> {
+  const meta = await fetch(`${SHEETS_API}/${sheetId}?fields=sheets.properties(sheetId,title)`, {
+    headers: { Authorization: `Bearer ${token}` },
+  }).then(r => r.json()) as { sheets?: Array<{ properties?: { sheetId: number; title: string } }> };
+  const exists = meta.sheets?.some(s => s.properties?.title === PRODUCTS_TAB_NAME);
+  if (exists) return;
+
+  await fetch(`${SHEETS_API}/${sheetId}:batchUpdate`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      requests: [{ addSheet: { properties: { title: PRODUCTS_TAB_NAME } } }],
+    }),
+  });
+  await fetch(`${SHEETS_API}/${sheetId}/values/${PRODUCTS_TAB_NAME}!A1?valueInputOption=USER_ENTERED`, {
+    method: 'PUT',
+    headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ values: [SB_PRODUCT_HEADERS] }),
+  });
+  // Reload to get the new sheet id, then set frozen header + image col width
+  const meta2 = await fetch(`${SHEETS_API}/${sheetId}?fields=sheets.properties(sheetId,title)`, {
+    headers: { Authorization: `Bearer ${token}` },
+  }).then(r => r.json()) as { sheets?: Array<{ properties?: { sheetId: number; title: string } }> };
+  const productsSheetId = meta2.sheets?.find(s => s.properties?.title === PRODUCTS_TAB_NAME)?.properties?.sheetId;
+  if (productsSheetId !== undefined) {
+    await fetch(`${SHEETS_API}/${sheetId}:batchUpdate`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        requests: [
+          { updateSheetProperties: { properties: { sheetId: productsSheetId, gridProperties: { frozenRowCount: 1 } }, fields: 'gridProperties.frozenRowCount' } },
+          { updateDimensionProperties: { range: { sheetId: productsSheetId, dimension: 'ROWS', startIndex: 1, endIndex: 1000 }, properties: { pixelSize: 110 }, fields: 'pixelSize' } },
+          { updateDimensionProperties: { range: { sheetId: productsSheetId, dimension: 'COLUMNS', startIndex: 3, endIndex: 4 }, properties: { pixelSize: 160 }, fields: 'pixelSize' } },
+        ],
+      }),
+    });
+  }
+}
+
+export interface SbProductRow {
+  timestamp:    string;
+  supplier:     string;
+  productName:  string;
+  imageUrl?:    string;  // raw Drive URL (e.g. lh3.googleusercontent.com/d/<id>) — wrapped in IMAGE() via toSheetsImageUrl
+  description?: string;
+  price?:       string;
+  moq?:         string;
+  leadTime?:    string;
+  tone?:        string;
+  notes?:       string;
+}
+
+// Append a product row to the Products tab. Returns the 1-based row index.
+export async function appendProductRow(sheetId: string, row: SbProductRow, token: string): Promise<{ rowIndex: number }> {
+  const placeholder = NO_DETAILS_PLACEHOLDER;
+  const values = [
+    row.timestamp,
+    row.supplier,
+    row.productName,
+    '',                                       // D image — written via formula below
+    row.description || placeholder,
+    row.price       || '—',
+    row.moq         || '—',
+    row.leadTime    || '—',
+    row.tone        || '',
+    row.notes       || '',
+    new Date().toISOString(),
+  ];
+
+  const appendRes = await fetch(
+    `${SHEETS_API}/${sheetId}/values/${PRODUCTS_TAB_NAME}!A1:append?valueInputOption=USER_ENTERED&insertDataOption=INSERT_ROWS`,
+    {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ values: [values] }),
+    },
+  );
+  const appendData = await appendRes.json() as { updates?: { updatedRange?: string } };
+  const rowMatch = (appendData.updates?.updatedRange ?? '').match(/!?[A-Z]+(\d+):/);
+  const rowIndex = rowMatch ? parseInt(rowMatch[1], 10) : 2;
+
+  // Write the IMAGE() formula in column D
+  if (row.imageUrl) {
+    await fetch(`${SHEETS_API}/${sheetId}/values/${PRODUCTS_TAB_NAME}!D${rowIndex}?valueInputOption=USER_ENTERED`, {
+      method: 'PUT',
+      headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ values: [[`=IMAGE("${toSheetsImageUrl(row.imageUrl)}")`]] }),
+    });
+  }
+
+  return { rowIndex };
+}
+
+// Update an existing product row's cells (E:Last Updated). Empty/blank values
+// fall through to the placeholder so the row visibly invites the user to add details.
+export async function updateProductRow(
+  sheetId: string,
+  rowIndex: number,
+  fields: { description?: string; price?: string; moq?: string; leadTime?: string; tone?: string; notes?: string },
+  token: string,
+): Promise<void> {
+  const placeholder = NO_DETAILS_PLACEHOLDER;
+  const values = [
+    fields.description?.trim() || placeholder,
+    fields.price?.trim()       || '—',
+    fields.moq?.trim()         || '—',
+    fields.leadTime?.trim()    || '—',
+    fields.tone               ?? '',
+    fields.notes              ?? '',
+    new Date().toISOString(),
+  ];
+  await fetch(
+    `${SHEETS_API}/${sheetId}/values/${PRODUCTS_TAB_NAME}!E${rowIndex}:K${rowIndex}?valueInputOption=USER_ENTERED`,
+    {
+      method: 'PUT',
+      headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ values: [values] }),
+    },
+  );
 }
 
 // Append a supplier+contact row. Returns the row index for later updates.
@@ -144,11 +311,20 @@ export async function appendSupplierRow(
     await fetch(`${SHEETS_API}/${sheetId}/values/N${rowIndex}?valueInputOption=USER_ENTERED`, {
       method: 'PUT',
       headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ range: `N${rowIndex}`, values: [[`=IMAGE("${row.cardFrontUrl}")`]] }),
+      body: JSON.stringify({ range: `N${rowIndex}`, values: [[`=IMAGE("${toSheetsImageUrl(row.cardFrontUrl)}")`]] }),
     });
   }
 
   return { rowIndex };
+}
+
+// Google Sheets =IMAGE() can't reliably load `lh3.googleusercontent.com/d/<id>`
+// URLs (often returns #REF!). The `drive.google.com/thumbnail?id=<id>` endpoint
+// works in both Sheets and HTML <img> tags.
+export function toSheetsImageUrl(driveUrl: string): string {
+  const m = driveUrl.match(/\/d\/([^/?#]+)/);
+  if (!m) return driveUrl;
+  return `https://drive.google.com/thumbnail?id=${m[1]}&sz=w800`;
 }
 
 // Update the Email Sent / Sent At / Subject / Status columns (V, W, X, Y).

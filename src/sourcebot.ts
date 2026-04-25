@@ -2,8 +2,8 @@
 
 import type { Env } from './types';
 import { consumeOnboardingToken } from './onboarding';
-import { getServiceAccountToken } from './google';
-import { appendSupplierRow, updateSupplierProducts, updateSupplierVoiceNote, updateSupplierEmailStatus } from './sb_sheets';
+import { getServiceAccountToken, createDriveFolder } from './google';
+import { appendSupplierRow, updateSupplierProducts, updateSupplierVoiceNote, updateSupplierEmailStatus, appendProductRow, updateProductRow, ensureProductsTab } from './sb_sheets';
 import { buildGmailAuthUrl, getGmailToken, getValidAccessToken, sendGmailEmail } from './gmail';
 import { ocrThenExtract } from './extract';
 
@@ -96,9 +96,9 @@ async function handleMessage(msg: TgMessage, env: Env): Promise<void> {
     return;
   }
 
-  if (text === '/cancel') {
+  if (text === '/cancel' || text === '/done') {
     await setSession(chatId, { step: 'idle' }, env);
-    await send(chatId, `❌ Cancelled. Send a supplier card photo to start again.`, env);
+    await send(chatId, `👍 Done. Send a supplier card photo to start again.`, env);
     return;
   }
 
@@ -140,17 +140,47 @@ async function handleMessage(msg: TgMessage, env: Env): Promise<void> {
   if (session.step === 'awaiting_product_photo') {
     if (msg.photo && msg.photo.length > 0) {
       await handleProductPhoto(chatId, msg.photo, session, buyer, env);
-    } else {
-      await send(chatId, `📸 Please send a *photo* of the product, or /cancel.`, env, true);
+      return;
     }
+    // Reply (text or voice) attaches details to the most recently saved product.
+    if (msg.voice && session.activeProductId) {
+      await handleProductDetailsVoice(chatId, msg.voice, session, buyer, env);
+      return;
+    }
+    if (text && session.activeProductId) {
+      await handleProductDetailsText(chatId, text, session, buyer, env);
+      return;
+    }
+    // Fallback — no product yet, treat as company-level note
+    if (msg.voice) {
+      await handleVoiceNote(chatId, msg.voice, session, buyer, env);
+      return;
+    }
+    if (text) {
+      await handleDetailsText(chatId, text, session, buyer, env);
+      return;
+    }
+    await send(chatId, `📸 Send a product photo, or reply to the last item to add details.`, env, true);
     return;
   }
   if (session.step === 'awaiting_voice_note') {
+    // A photo arriving in voice-note mode means the user is moving on — exit the
+    // voice prompt and process the photo as a product.
+    if (msg.photo && msg.photo.length > 0) {
+      await setSession(chatId, { step: 'awaiting_product_photo', activeCompanyId: session.activeCompanyId }, env);
+      const refreshed = await getSession(chatId, env);
+      await handleProductPhoto(chatId, msg.photo, refreshed, buyer, env);
+      return;
+    }
     if (msg.voice) {
       await handleVoiceNote(chatId, msg.voice, session, buyer, env);
-    } else {
-      await send(chatId, `🎤 Please send a *voice message*, or /cancel.`, env, true);
+      return;
     }
+    if (text) {
+      await handleDetailsText(chatId, text, session, buyer, env);
+      return;
+    }
+    await send(chatId, `💬 Reply with text, hold 🎤 for a voice note, or send a product photo. /cancel to abort.`, env, true);
     return;
   }
   if (session.step === 'awaiting_product_price') {
@@ -207,12 +237,20 @@ async function handleCallback(cb: TgCallbackQuery, env: Env): Promise<void> {
   if (data.startsWith('add_voice:')) {
     const companyId = data.slice('add_voice:'.length);
     await setSession(chatId, { step: 'awaiting_voice_note', activeCompanyId: companyId }, env);
-    await send(chatId, `🎤 Send a *voice message* about this supplier. I'll transcribe it and pull out any prices, MOQ, and lead times you mention.`, env, true);
+    await sendForceReply(chatId,
+      `💬 *Reply to this message* with details about this supplier — type a note or hold 🎤 to record. ` +
+      `I'll pull out any prices, MOQ, lead times, and tone you mention.`,
+      env, true);
     return;
   }
   if (data === 'done_capturing') {
     await setSession(chatId, { step: 'idle' }, env);
     await send(chatId, `👍 Done. Send the next supplier card whenever you're ready.`, env);
+    return;
+  }
+  if (data === 'new_supplier') {
+    await setSession(chatId, { step: 'idle' }, env);
+    await send(chatId, `📷 Send the next supplier's business card.`, env);
     return;
   }
   if (data === 'skip_field') {
@@ -236,10 +274,11 @@ async function handleCallback(cb: TgCallbackQuery, env: Env): Promise<void> {
 
 function toastFor(data: string): string {
   if (data.startsWith('add_product:')) return '📦 Add product';
-  if (data.startsWith('add_voice:'))   return '🎤 Voice note';
+  if (data.startsWith('add_voice:'))   return '💬 Add details';
   if (data.startsWith('email_send:'))  return '📧 Sending…';
   if (data === 'email_discard')        return '🗑 Discarded';
   if (data === 'done_capturing')       return '✅ Done';
+  if (data === 'new_supplier')         return '📷 New supplier';
   if (data === 'skip_field')           return '⏭ Skip';
   return '⏳';
 }
@@ -820,19 +859,7 @@ async function handleSupplierCard(
     return;
   }
 
-  // 3. Upload card to Drive (under the buyer's show folder, in a "Cards" subfolder we lazily create later — MVP just drops in the show folder)
-  let cardUrl: string | undefined;
-  try {
-    if (pass.drive_folder_id) {
-      const token = await getServiceAccountToken(env);
-      cardUrl = await uploadCardImage(rawBuffer, extracted.name || 'card', extracted.company, pass.drive_folder_id, token);
-    }
-  } catch (e) {
-    console.error('[sourcebot] drive upload failed:', e);
-    // non-fatal; row still gets written without the photo
-  }
-
-  // 4. Insert sb_companies (dedupe by buyer + show + company name) + sb_contacts
+  // 3. Upsert sb_companies first so we have an id to attach the per-supplier folder to.
   const companyName = (extracted.company || extracted.name || 'Unknown').trim();
   const existingCompany = await env.DB.prepare(
     `SELECT id FROM sb_companies WHERE buyer_id = ? AND show_name = ? AND lower(name) = lower(?) LIMIT 1`
@@ -843,6 +870,28 @@ async function handleSupplierCard(
      VALUES (?, ?, ?, ?, ?) RETURNING id`
   ).bind(buyer.buyerId, pass.show_name, companyName, extracted.website || null, null).first<{ id: string }>())?.id;
   if (!companyId) { await send(chatId, `❌ Failed to save the supplier.`, env); return; }
+
+  // 3b. Per-supplier Drive folder named "{Company} — {Month YYYY}". Cached on sb_companies.
+  let supplierFolderId: string | undefined;
+  if (pass.drive_folder_id) {
+    try {
+      supplierFolderId = await getOrCreateSupplierFolder(companyId, companyName, pass.drive_folder_id, env);
+    } catch (e) {
+      console.error('[sourcebot] supplier folder create failed:', e);
+    }
+  }
+
+  // 3c. Upload card to the per-supplier folder (or the show folder as fallback).
+  let cardUrl: string | undefined;
+  try {
+    const parent = supplierFolderId ?? pass.drive_folder_id;
+    if (parent) {
+      const tok = await getServiceAccountToken(env);
+      cardUrl = await uploadCardImage(rawBuffer, extracted.name || 'card', extracted.company, parent, tok);
+    }
+  } catch (e) {
+    console.error('[sourcebot] card upload failed:', e);
+  }
 
   await env.DB.prepare(
     `INSERT INTO sb_contacts (company_id, buyer_id, show_name, name, title, email, phone, linkedin_url, address, card_front_url)
@@ -883,18 +932,28 @@ async function handleSupplierCard(
     return;
   }
 
-  // 6. Confirm + offer to add products / voice note
-  await sendButtons(chatId,
+  // 6. Confirm + auto-enter product-photo mode so the user can just keep snapping product photos
+  await setSession(chatId, { step: 'awaiting_product_photo', activeCompanyId: companyId }, env);
+
+  const preview =
     `✅ *Supplier saved*\n\n` +
-    `🏢 ${companyName}\n` +
-    (extracted.name  ? `👤 ${extracted.name}\n`  : '') +
-    (extracted.email ? `📧 ${extracted.email}\n` : '') +
-    (extracted.phone ? `📞 ${extracted.phone}\n` : '') +
-    `\n_Add a product, leave a voice note, or send the next card._`,
+    `📛 *Name:* ${extracted.name    || '—'}\n` +
+    `💼 *Title:* ${extracted.title  || '—'}\n` +
+    `🏢 *Company:* ${companyName}\n` +
+    `📧 *Email:* ${extracted.email  || '—'}\n` +
+    `📞 *Phone:* ${extracted.phone  || '—'}\n` +
+    (extracted.country  ? `🌍 *Country:* ${extracted.country}\n`   : '') +
+    (extracted.website  ? `🌐 *Website:* ${extracted.website}\n`   : '') +
+    (extracted.linkedin ? `🔗 *LinkedIn:* ${extracted.linkedin}\n` : '') +
+    (extracted.address  ? `📍 *Address:* ${extracted.address}\n`   : '') +
+    `\n📦 *Send product photos* to attach them to this supplier — or tap below.`;
+
+  await sendButtons(chatId,
+    preview,
     [
-      [{ text: '📦 Add product', callback_data: `add_product:${companyId}` },
-       { text: '🎤 Voice note',  callback_data: `add_voice:${companyId}` }],
-      [{ text: '✅ Done', callback_data: 'done_capturing' }],
+      [{ text: '💬 Add details',         callback_data: `add_voice:${companyId}` }],
+      [{ text: '📷 New supplier card',  callback_data: 'new_supplier' }],
+      [{ text: '✅ Done',                callback_data: 'done_capturing' }],
     ],
     env, true);
 }
@@ -928,11 +987,18 @@ async function handleProductPhoto(
   const rawBuffer = await imgRes.arrayBuffer();
   const base64 = arrayBufferToBase64(rawBuffer);
 
-  // Extract a product name from the image (best-effort — falls back to "Product")
+  // Classify + extract in one call. If Gemini decides this is actually a business card,
+  // transparently exit product mode and hand off to the supplier-capture flow.
   let productName = 'Product';
   let productDesc = '';
   try {
     const fields = await extractProductFromImage(base64, filePath.endsWith('.png') ? 'image/png' : 'image/jpeg', env);
+    if (fields.type === 'business_card') {
+      await setSession(chatId, { step: 'idle' }, env);
+      await send(chatId, `📷 That looks like a business card — capturing as a new supplier.`, env);
+      await handleSupplierCard(chatId, photos, buyer, env);
+      return;
+    }
     productName = fields.name || 'Product';
     productDesc = fields.description || '';
   } catch (e) {
@@ -945,33 +1011,73 @@ async function handleProductPhoto(
   ).bind(session.activeCompanyId).first<{ show_name: string }>();
   if (!company) { await send(chatId, `Lost track of supplier. Please rescan the card.`, env); return; }
 
-  // Upload product photo to Drive
+  // Upload product photo to the per-supplier Drive folder (created at supplier capture).
   let imageUrl: string | undefined;
   try {
-    const pass = await env.DB.prepare(
-      `SELECT drive_folder_id FROM sb_buyer_shows WHERE buyer_id = ? AND show_name = ?`
-    ).bind(buyer.buyerId, company.show_name).first<{ drive_folder_id: string | null }>();
-    if (pass?.drive_folder_id) {
+    const folderId = await getOrCreateSupplierFolderById(session.activeCompanyId, env, company.show_name, buyer);
+    if (folderId) {
       const token = await getServiceAccountToken(env);
-      imageUrl = await uploadCardImage(rawBuffer, productName, '', pass.drive_folder_id, token);
+      imageUrl = await uploadCardImage(rawBuffer, productName, '', folderId, token);
     }
   } catch (e) {
     console.error('[sourcebot] product drive upload failed:', e);
   }
 
-  // Insert the sb_products row (price/MOQ/lead_time filled in over the next few prompts)
+  // Insert the sb_products row.
   const product = await env.DB.prepare(
     `INSERT INTO sb_products (company_id, buyer_id, show_name, name, description, image_url)
      VALUES (?, ?, ?, ?, ?, ?) RETURNING id`
   ).bind(session.activeCompanyId, buyer.buyerId, company.show_name, productName, productDesc || null, imageUrl || null).first<{ id: string }>();
   if (!product?.id) { await send(chatId, `❌ Failed to save the product.`, env); return; }
 
-  await setSession(chatId, { step: 'awaiting_product_price', activeCompanyId: session.activeCompanyId, activeProductId: product.id }, env);
-  await sendButtons(chatId,
-    `📦 *${productName}* captured.\n\n💰 What's the price? (e.g. "$10/unit", or tap Skip)`,
-    [[{ text: '⏭ Skip', callback_data: 'skip_field' }]],
-    env, true,
-  );
+  // Append a row to the Products tab (per-product visibility with image, dedicated price/MOQ columns).
+  try {
+    const sheet = await env.DB.prepare(
+      `SELECT sheet_id FROM sb_buyer_shows WHERE buyer_id = ? AND show_name = ?`
+    ).bind(buyer.buyerId, company.show_name).first<{ sheet_id: string }>();
+    if (sheet?.sheet_id) {
+      const tok = await getServiceAccountToken(env);
+      await ensureProductsTab(sheet.sheet_id, tok);
+      const supplierName = await env.DB.prepare(`SELECT name FROM sb_companies WHERE id = ?`).bind(session.activeCompanyId).first<{ name: string }>();
+      const { rowIndex } = await appendProductRow(sheet.sheet_id, {
+        timestamp:   new Date().toISOString(),
+        supplier:    supplierName?.name ?? '',
+        productName,
+        imageUrl,
+        description: productDesc,
+      }, tok);
+      await env.DB.prepare(`UPDATE sb_products SET sheet_row = ? WHERE id = ?`).bind(rowIndex, product.id).run();
+
+      // Also keep the supplier's Products column (P) up to date as a quick at-a-glance summary.
+      const supplier = await env.DB.prepare(`SELECT sheet_row FROM sb_companies WHERE id = ?`).bind(session.activeCompanyId).first<{ sheet_row: number | null }>();
+      if (supplier?.sheet_row) {
+        const all = await env.DB.prepare(`SELECT name FROM sb_products WHERE company_id = ? ORDER BY created_at`).bind(session.activeCompanyId).all<{ name: string }>();
+        const productsText = all.results.map(p => `• ${p.name ?? '—'}`).join('\n');
+        await updateSupplierProducts(sheet.sheet_id, supplier.sheet_row, { productsText, priceRange: '', avgLeadTime: '' }, tok);
+      }
+    }
+  } catch (e) { console.error('[sourcebot] products tab append failed:', e); }
+
+  // Stay in product-photo mode but track the just-saved product so any text/voice
+  // reply attaches to *this* product. Sending another photo simply rotates activeProductId.
+  await setSession(chatId, {
+    step: 'awaiting_product_photo',
+    activeCompanyId: session.activeCompanyId,
+    activeProductId: product.id,
+  }, env);
+
+  // Send the photo back as a confirmation with force_reply — the reply preview
+  // shows this photo, so the user knows which product they're adding details to.
+  const caption =
+    `✅ *${productName}*` +
+    (productDesc ? `\n_${productDesc}_` : '') +
+    `\n\n💬 *Reply* with price, MOQ, lead time, or notes — or send the next product photo. Tap /done to finish.`;
+  try {
+    await sendPhotoForceReply(chatId, photo.file_id, caption, env, true);
+  } catch (e) {
+    console.error('[sourcebot] sendPhotoForceReply failed, falling back to text:', e);
+    await sendForceReply(chatId, caption, env, true);
+  }
 }
 
 async function handleProductPrice(chatId: number, text: string, session: SourceBotSession, buyer: { buyerId: string }, env: Env): Promise<void> {
@@ -1044,14 +1150,14 @@ async function finalizeProduct(chatId: number, session: SourceBotSession, buyer:
     }
   }
 
-  // Reset step but keep activeCompanyId so the next "Add product" tap goes to the right supplier
-  await setSession(chatId, { step: 'idle', activeCompanyId: session.activeCompanyId }, env);
+  // Stay in product-photo mode so the user can just keep sending product photos.
+  // They tap Done (or /cancel) to leave product capture; tap Voice note to switch modes.
+  await setSession(chatId, { step: 'awaiting_product_photo', activeCompanyId: session.activeCompanyId }, env);
 
   await sendButtons(chatId,
-    `✅ Product saved for *${company.name}*.\n\nAdd another, drop a voice note, or finish?`,
+    `✅ Product saved for *${company.name}*.\n\n📸 Send another product photo, or tap below.`,
     [
-      [{ text: '📦 Add another', callback_data: `add_product:${session.activeCompanyId}` },
-       { text: '🎤 Voice note',  callback_data: `add_voice:${session.activeCompanyId}` }],
+      [{ text: '💬 Add details',  callback_data: `add_voice:${session.activeCompanyId}` }],
       [{ text: '✅ Done', callback_data: 'done_capturing' }],
     ],
     env, true);
@@ -1153,7 +1259,7 @@ async function handleVoiceNote(
     (extras.length ? `\n\n${extras.join(' · ')}` : ''),
     [
       [{ text: '📦 Add product', callback_data: `add_product:${session.activeCompanyId}` },
-       { text: '🎤 Another voice', callback_data: `add_voice:${session.activeCompanyId}` }],
+       { text: '💬 More details', callback_data: `add_voice:${session.activeCompanyId}` }],
       [{ text: '✅ Done', callback_data: 'done_capturing' }],
     ],
     env, true);
@@ -1168,19 +1274,319 @@ interface VoiceExtraction {
   tone:       string;
 }
 
+// Same shape as transcribeAndExtract, but for typed text replies. Stored as a
+// "voice note" with no audio so it shows up alongside spoken notes in the sheet.
+async function handleDetailsText(
+  chatId: number,
+  text: string,
+  session: SourceBotSession,
+  buyer: { buyerId: string },
+  env: Env,
+): Promise<void> {
+  if (!session.activeCompanyId) {
+    await setSession(chatId, { step: 'idle' }, env);
+    await send(chatId, `Lost track of which supplier this is for. Please rescan the card.`, env);
+    return;
+  }
+
+  const company = await env.DB.prepare(
+    `SELECT name, show_name, sheet_row FROM sb_companies WHERE id = ?`
+  ).bind(session.activeCompanyId).first<{ name: string; show_name: string; sheet_row: number | null }>();
+  if (!company) { await setSession(chatId, { step: 'idle' }, env); return; }
+
+  // Pull price/MOQ/lead-time/tone from the typed text (best-effort)
+  let extras: { price: string; moq: string; lead_time: string; tone: string };
+  try {
+    extras = await extractFromDetailsText(text, env);
+  } catch {
+    extras = { price: '', moq: '', lead_time: '', tone: '' };
+  }
+
+  await env.DB.prepare(
+    `INSERT INTO sb_voice_notes
+       (company_id, buyer_id, show_name, transcript, language, duration_seconds,
+        extracted_price, extracted_moq, extracted_lead_time, extracted_tone)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+  ).bind(
+    session.activeCompanyId, buyer.buyerId, company.show_name,
+    text, null, null,
+    extras.price || null, extras.moq || null, extras.lead_time || null, extras.tone || null,
+  ).run();
+
+  if (company.sheet_row) {
+    try {
+      const all = await env.DB.prepare(
+        `SELECT transcript, created_at FROM sb_voice_notes WHERE company_id = ? ORDER BY created_at`
+      ).bind(session.activeCompanyId).all<{ transcript: string; created_at: string }>();
+      const aggregated = all.results.map(v => `[${v.created_at}] ${v.transcript}`).join('\n\n');
+      const sheet = await env.DB.prepare(
+        `SELECT sheet_id FROM sb_buyer_shows WHERE buyer_id = ? AND show_name = ?`
+      ).bind(buyer.buyerId, company.show_name).first<{ sheet_id: string }>();
+      if (sheet?.sheet_id) {
+        const tok = await getServiceAccountToken(env);
+        await updateSupplierVoiceNote(sheet.sheet_id, company.sheet_row, aggregated, tok);
+      }
+    } catch (e) { console.error('[sourcebot] sheet text-detail update failed:', e); }
+  }
+
+  // Stay in product-photo mode so the user can keep snapping after adding a note
+  await setSession(chatId, { step: 'awaiting_product_photo', activeCompanyId: session.activeCompanyId }, env);
+
+  const summary: string[] = [];
+  if (extras.price)     summary.push(`💰 ${extras.price}`);
+  if (extras.moq)       summary.push(`📊 MOQ ${extras.moq}`);
+  if (extras.lead_time) summary.push(`⏱ ${extras.lead_time}`);
+  if (extras.tone)      summary.push(`🎭 ${extras.tone}`);
+
+  await sendButtons(chatId,
+    `✅ Note saved for *${company.name}*` +
+    (summary.length ? `\n\n${summary.join(' · ')}` : '') +
+    `\n\n📸 Send a product photo, or tap below.`,
+    [
+      [{ text: '💬 More details',       callback_data: `add_voice:${session.activeCompanyId}` }],
+      [{ text: '📷 New supplier card',  callback_data: 'new_supplier' }],
+      [{ text: '✅ Done',                callback_data: 'done_capturing' }],
+    ],
+    env, true);
+}
+
+// Apply a typed reply to the active product (price/MOQ/lead-time/notes).
+async function handleProductDetailsText(
+  chatId: number,
+  text: string,
+  session: SourceBotSession,
+  buyer: { buyerId: string },
+  env: Env,
+): Promise<void> {
+  if (!session.activeProductId || !session.activeCompanyId) return;
+  let extras: { price: string; moq: string; lead_time: string; tone: string };
+  try { extras = await extractFromDetailsText(text, env); } catch { extras = { price: '', moq: '', lead_time: '', tone: '' }; }
+  await applyProductDetails(session.activeProductId, session.activeCompanyId, buyer, text, extras, env);
+  await sendProductDetailsConfirmation(chatId, session.activeProductId, extras, text, env);
+}
+
+// Same for a voice reply: transcribe via Gemini, then apply.
+async function handleProductDetailsVoice(
+  chatId: number,
+  voice: TgVoice,
+  session: SourceBotSession,
+  buyer: { buyerId: string },
+  env: Env,
+): Promise<void> {
+  if (!session.activeProductId || !session.activeCompanyId) return;
+  await send(chatId, `🎤 Transcribing…`, env);
+
+  const fileRes = await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN_SOURCE}/getFile?file_id=${voice.file_id}`);
+  const fileData = await fileRes.json() as { result?: { file_path?: string } };
+  const filePath = fileData.result?.file_path;
+  if (!filePath) { await send(chatId, `❌ Couldn't fetch the voice note. Try again.`, env); return; }
+  const audioRes = await fetch(`https://api.telegram.org/file/bot${env.TELEGRAM_BOT_TOKEN_SOURCE}/${filePath}`);
+  const audioBuffer = await audioRes.arrayBuffer();
+  const base64 = arrayBufferToBase64(audioBuffer);
+
+  let extracted: VoiceExtraction;
+  try { extracted = await transcribeAndExtract(base64, env); }
+  catch (e) {
+    console.error('[sourcebot] product voice transcribe failed:', e);
+    await send(chatId, `⚠️ Couldn't transcribe. Try again with a clearer recording.`, env);
+    return;
+  }
+  const transcript = (extracted.transcript || '').trim();
+  if (!transcript) { await send(chatId, `⚠️ I couldn't make out any speech.`, env); return; }
+
+  await applyProductDetails(session.activeProductId, session.activeCompanyId, buyer, transcript, extracted, env);
+  await sendProductDetailsConfirmation(chatId, session.activeProductId, extracted, transcript, env);
+}
+
+// Get-or-create the per-supplier folder named "{Company} — {Month YYYY}" inside the
+// buyer's show folder. Caches the id on sb_companies.cards_folder_id.
+async function getOrCreateSupplierFolder(
+  companyId: string,
+  companyName: string,
+  showFolderId: string,
+  env: Env,
+): Promise<string> {
+  const row = await env.DB.prepare(
+    `SELECT cards_folder_id FROM sb_companies WHERE id = ?`
+  ).bind(companyId).first<{ cards_folder_id: string | null }>();
+  if (row?.cards_folder_id) return row.cards_folder_id;
+
+  const month = new Date().toLocaleString('en-US', { month: 'long', year: 'numeric' });
+  const folderName = `${companyName} — ${month}`;
+  const tok = await getServiceAccountToken(env);
+  const folder = await createDriveFolder(folderName, showFolderId, tok);
+  await env.DB.prepare(
+    `UPDATE sb_companies SET cards_folder_id = ? WHERE id = ?`
+  ).bind(folder.id, companyId).run();
+  return folder.id;
+}
+
+// Same, but resolves the show folder id from the company id (used by handleProductPhoto).
+async function getOrCreateSupplierFolderById(
+  companyId: string,
+  env: Env,
+  showName: string,
+  buyer: { buyerId: string },
+): Promise<string | undefined> {
+  const c = await env.DB.prepare(
+    `SELECT cards_folder_id, name FROM sb_companies WHERE id = ?`
+  ).bind(companyId).first<{ cards_folder_id: string | null; name: string }>();
+  if (c?.cards_folder_id) return c.cards_folder_id;
+  if (!c?.name) return undefined;
+
+  const pass = await env.DB.prepare(
+    `SELECT drive_folder_id FROM sb_buyer_shows WHERE buyer_id = ? AND show_name = ?`
+  ).bind(buyer.buyerId, showName).first<{ drive_folder_id: string | null }>();
+  if (!pass?.drive_folder_id) return undefined;
+
+  return getOrCreateSupplierFolder(companyId, c.name, pass.drive_folder_id, env);
+}
+
+async function applyProductDetails(
+  productId: string,
+  companyId: string,
+  buyer: { buyerId: string },
+  notesText: string,
+  extras: { price: string; moq: string; lead_time: string; tone: string },
+  env: Env,
+): Promise<void> {
+  // Append the user's note to description (cumulative — keeps the photo-extracted
+  // type AND every voice/text reply, so colors/materials/sizes mentioned but not
+  // captured by the structured fields aren't lost).
+  await env.DB.prepare(
+    `UPDATE sb_products
+        SET price     = COALESCE(NULLIF(?, ''), price),
+            moq       = COALESCE(NULLIF(?, ''), moq),
+            lead_time = COALESCE(NULLIF(?, ''), lead_time),
+            description = CASE
+              WHEN description IS NULL OR description = '' THEN ?
+              ELSE description || char(10) || ?
+            END
+      WHERE id = ?`
+  ).bind(extras.price ?? '', extras.moq ?? '', extras.lead_time ?? '', notesText, notesText, productId).run();
+
+  // Update the dedicated per-product row on the Products tab. Also refresh the
+  // supplier-row aggregate (column P) so the at-a-glance summary stays current.
+  const company = await env.DB.prepare(
+    `SELECT show_name, sheet_row FROM sb_companies WHERE id = ?`
+  ).bind(companyId).first<{ show_name: string; sheet_row: number | null }>();
+  if (!company) return;
+
+  const product = await env.DB.prepare(
+    `SELECT sheet_row, name, description, price, moq, lead_time FROM sb_products WHERE id = ?`
+  ).bind(productId).first<{ sheet_row: number | null; name: string; description: string | null; price: string | null; moq: string | null; lead_time: string | null }>();
+
+  try {
+    const sheet = await env.DB.prepare(
+      `SELECT sheet_id FROM sb_buyer_shows WHERE buyer_id = ? AND show_name = ?`
+    ).bind(buyer.buyerId, company.show_name).first<{ sheet_id: string }>();
+    if (!sheet?.sheet_id) return;
+
+    const tok = await getServiceAccountToken(env);
+
+    // Write per-product row (Products tab)
+    if (product?.sheet_row) {
+      await updateProductRow(sheet.sheet_id, product.sheet_row, {
+        description: product.description ?? '',
+        price:       product.price       ?? '',
+        moq:         product.moq         ?? '',
+        leadTime:    product.lead_time   ?? '',
+        tone:        extras.tone         ?? '',
+        notes:       '',
+      }, tok);
+    }
+
+    // Refresh supplier row's aggregate column P / Q / R
+    if (company.sheet_row) {
+      const all = await env.DB.prepare(
+        `SELECT name, price, moq, lead_time FROM sb_products WHERE company_id = ? ORDER BY created_at`
+      ).bind(companyId).all<{ name: string; price: string | null; moq: string | null; lead_time: string | null }>();
+      const productsText = all.results
+        .map(p => {
+          return `• ${p.name ?? '—'}` +
+            (p.price     ? ` — ${p.price}`     : '') +
+            (p.moq       ? ` · MOQ ${p.moq}`   : '') +
+            (p.lead_time ? ` · ${p.lead_time}` : '');
+        })
+        .join('\n');
+      const prices = all.results.map(p => p.price).filter(Boolean) as string[];
+      const priceRange = prices.length === 0 ? '' : prices.length === 1 ? prices[0] : `${prices[0]} – ${prices[prices.length - 1]}`;
+      const leads = all.results.map(p => p.lead_time).filter(Boolean) as string[];
+      const avgLeadTime = leads[0] ?? '';
+      await updateSupplierProducts(sheet.sheet_id, company.sheet_row, { productsText, priceRange, avgLeadTime }, tok);
+    }
+  } catch (e) { console.error('[sourcebot] product detail sheet update failed:', e); }
+}
+
+async function sendProductDetailsConfirmation(
+  chatId: number,
+  productId: string,
+  extras: { price: string; moq: string; lead_time: string; tone: string },
+  notesText: string,
+  env: Env,
+): Promise<void> {
+  const product = await env.DB.prepare(
+    `SELECT name FROM sb_products WHERE id = ?`
+  ).bind(productId).first<{ name: string }>();
+
+  const summary: string[] = [];
+  if (extras.price)     summary.push(`💰 ${extras.price}`);
+  if (extras.moq)       summary.push(`📊 MOQ ${extras.moq}`);
+  if (extras.lead_time) summary.push(`⏱ ${extras.lead_time}`);
+  if (extras.tone)      summary.push(`🎭 ${extras.tone}`);
+
+  const trimmed = notesText.trim();
+  const transcriptLine = trimmed
+    ? `\n📝 _"${trimmed.slice(0, 280)}${trimmed.length > 280 ? '…' : ''}"_`
+    : '';
+
+  await send(chatId,
+    `✅ Updated *${product?.name ?? 'product'}*` +
+    (summary.length ? `\n${summary.join(' · ')}` : '') +
+    transcriptLine +
+    `\n\n📸 Send the next product photo, or /done.`,
+    env, true);
+}
+
+async function extractFromDetailsText(text: string, env: Env): Promise<{ price: string; moq: string; lead_time: string; tone: string }> {
+  const prompt =
+    `Read the following note a buyer wrote about a supplier at a trade show. ` +
+    `Pull out: price, minimum order quantity (MOQ), lead time, and overall tone. ` +
+    `Return ONLY JSON with these fields:\n` +
+    `- price (NORMALIZED to standard money format with currency symbol and decimals — e.g. "$5.20" not "$5 and 20 cents", "€12.50" not "twelve fifty euros". Empty if not mentioned.)\n` +
+    `- moq (number with units, e.g. "5,000 pcs", "1 pallet". Empty if not mentioned.)\n` +
+    `- lead_time (e.g. "30 days", "4 weeks". Empty if not mentioned.)\n` +
+    `- tone (one of: positive, neutral, negative, enthusiastic, skeptical; empty if unclear)\n\n` +
+    `NOTE:\n${text}`;
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${env.GEMINI_API_KEY}`;
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      contents: [{ parts: [{ text: prompt }] }],
+      generationConfig: { responseMimeType: 'application/json' },
+    }),
+  });
+  const data = await res.json() as { candidates?: Array<{ content?: { parts?: Array<{ text?: string }> } }> };
+  if (!data.candidates?.length) return { price: '', moq: '', lead_time: '', tone: '' };
+  const raw = data.candidates[0]?.content?.parts?.[0]?.text ?? '{}';
+  const parsed = JSON.parse(raw.replace(/```json|```/g, '').trim()) as Partial<{ price: string; moq: string; lead_time: string; tone: string }>;
+  return { price: parsed.price ?? '', moq: parsed.moq ?? '', lead_time: parsed.lead_time ?? '', tone: parsed.tone ?? '' };
+}
+
 // Single Gemini 2.5 Flash call: takes audio bytes, returns verbatim transcript
 // + parsed price/MOQ/lead-time/tone keywords. Audio is OGG/Opus from Telegram.
 async function transcribeAndExtract(base64: string, env: Env): Promise<VoiceExtraction> {
   const prompt =
     `You are processing a voice memo a buyer recorded about a supplier at a trade show. ` +
     `Transcribe the audio verbatim in the original language (do not translate). Then scan the ` +
-    `transcript for any mentions of price, minimum order quantity, lead time, and overall tone. ` +
+    `transcript for price, minimum order quantity, lead time, and overall tone. ` +
     `Return ONLY a JSON object with these exact fields:\n` +
     `- transcript (verbatim, full)\n` +
     `- language (best-effort 2-letter code, e.g. "en", "zh", "es"; empty if unsure)\n` +
-    `- price (any price mentioned, exact phrasing; empty if none)\n` +
-    `- moq (any MOQ mentioned, exact phrasing; empty if none)\n` +
-    `- lead_time (any lead time mentioned, exact phrasing; empty if none)\n` +
+    `- price (NORMALIZED to standard money format with currency symbol and decimals — e.g. "$5.20" not "$5 and 20 cents", "€12.50" not "twelve fifty euros". Empty if no price mentioned.)\n` +
+    `- moq (number with units, e.g. "5,000 pcs", "1 pallet". Empty if not mentioned.)\n` +
+    `- lead_time (e.g. "30 days", "4 weeks". Empty if not mentioned.)\n` +
     `- tone (one of: positive, neutral, negative, enthusiastic, skeptical; empty if unclear)`;
 
   const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${env.GEMINI_API_KEY}`;
@@ -1213,10 +1619,16 @@ async function transcribeAndExtract(base64: string, env: Env): Promise<VoiceExtr
 }
 
 // Best-effort: ask Gemini to extract product name + short description from a product photo.
-async function extractProductFromImage(base64: string, mimeType: string, env: Env): Promise<{ name: string; description: string }> {
+async function extractProductFromImage(base64: string, mimeType: string, env: Env): Promise<{ type: 'business_card' | 'product'; name: string; description: string }> {
   const prompt =
-    `You are looking at a product photo (e.g. a single SKU on a trade-show booth). Return ONLY a JSON object with: ` +
-    `name (short product name, 1-6 words), description (one-line description). Use empty strings if unclear.`;
+    `You are looking at a photo a sourcing buyer just took at a trade show. ` +
+    `Decide which kind of photo it is: ` +
+    `(a) "business_card" — a printed business/contact card (rectangular card, contact details, company logo with email/phone). ` +
+    `(b) "product" — a physical product, SKU, sample, or packaging on a booth. ` +
+    `Return ONLY JSON: {type: "business_card" | "product", name: string, description: string}. ` +
+    `If type is "product", name = short product name (1-6 words), description = one-line description. ` +
+    `If type is "business_card", set name and description to empty strings. ` +
+    `When unsure between the two, prefer "business_card" only when the photo clearly shows a small rectangular card with multiple lines of contact-like text.`;
   const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${env.GEMINI_API_KEY}`;
   const res = await fetch(url, {
     method: 'POST',
@@ -1227,10 +1639,11 @@ async function extractProductFromImage(base64: string, mimeType: string, env: En
     }),
   });
   const data = await res.json() as { candidates?: Array<{ content?: { parts?: Array<{ text?: string }> } }> };
-  if (!data.candidates?.length) return { name: '', description: '' };
+  if (!data.candidates?.length) return { type: 'product', name: '', description: '' };
   const raw = data.candidates[0]?.content?.parts?.[0]?.text ?? '{}';
-  const parsed = JSON.parse(raw.replace(/```json|```/g, '').trim()) as { name?: string; description?: string };
-  return { name: parsed.name ?? '', description: parsed.description ?? '' };
+  const parsed = JSON.parse(raw.replace(/```json|```/g, '').trim()) as { type?: string; name?: string; description?: string };
+  const type = parsed.type === 'business_card' ? 'business_card' : 'product';
+  return { type, name: parsed.name ?? '', description: parsed.description ?? '' };
 }
 
 // ── Local shape used by handleSupplierCard (sourced via shared extract.ts) ──
@@ -1275,7 +1688,7 @@ async function uploadCardImage(
   body.set(bytes, preamble.length);
   body.set(epilogue, preamble.length + bytes.length);
 
-  const res = await fetch('https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&fields=id', {
+  const res = await fetch('https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&fields=id&supportsAllDrives=true', {
     method: 'POST',
     headers: { Authorization: `Bearer ${token}`, 'Content-Type': `multipart/related; boundary=${boundary}` },
     body: body.buffer,
@@ -1285,7 +1698,7 @@ async function uploadCardImage(
   if (!data.id) throw new Error('Drive upload returned no id');
 
   // Make readable by anyone with the link, so =IMAGE() in Sheets works
-  await fetch(`https://www.googleapis.com/drive/v3/files/${data.id}/permissions`, {
+  await fetch(`https://www.googleapis.com/drive/v3/files/${data.id}/permissions?supportsAllDrives=true`, {
     method: 'POST',
     headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
     body: JSON.stringify({ role: 'reader', type: 'anyone' }),
@@ -1308,6 +1721,38 @@ async function send(chatId: number, text: string, env: Env, markdown = false): P
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ chat_id: chatId, text, parse_mode: markdown ? 'Markdown' : undefined }),
+  });
+}
+
+// Send a message that triggers Telegram's "reply to this message" UI on the
+// user's keyboard — they can then type or hold-to-record a voice note and the
+// app submits it as a reply automatically.
+async function sendForceReply(chatId: number, text: string, env: Env, markdown = false): Promise<void> {
+  await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN_SOURCE}/sendMessage`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      chat_id: chatId,
+      text,
+      parse_mode: markdown ? 'Markdown' : undefined,
+      reply_markup: { force_reply: true, input_field_placeholder: 'Type details or hold 🎤 for a voice note' },
+    }),
+  });
+}
+
+// Send a photo back with a caption + force_reply UI, so the reply preview shows
+// the photo and the user knows exactly which item they're describing.
+async function sendPhotoForceReply(chatId: number, photoFileId: string, caption: string, env: Env, markdown = false): Promise<void> {
+  await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN_SOURCE}/sendPhoto`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      chat_id: chatId,
+      photo: photoFileId,
+      caption,
+      parse_mode: markdown ? 'Markdown' : undefined,
+      reply_markup: { force_reply: true, input_field_placeholder: 'Type details or hold 🎤 for a voice note' },
+    }),
   });
 }
 

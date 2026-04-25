@@ -223,7 +223,7 @@ async function createSheet(showName: string, token: string, parentFolderId?: str
   };
   if (parentFolderId) driveBody.parents = [parentFolderId];
 
-  const driveRes = await fetch(`${DRIVE_API}?fields=id`, {
+  const driveRes = await fetch(`${DRIVE_API}?fields=id&supportsAllDrives=true`, {
     method: 'POST',
     headers: {
       Authorization: `Bearer ${token}`,
@@ -275,8 +275,9 @@ export async function uploadCardPhotoToDrive(
   mimeType: string,
   token: string,
   showName?: string,
+  sharedDriveId?: string,
 ): Promise<string> {
-  const parentFolderId = showName ? await getOrCreateShowFolder(showName, token) : undefined;
+  const parentFolderId = showName ? await getOrCreateShowFolder(showName, token, sharedDriveId) : undefined;
 
   const boundary = '--------dagama_boundary';
   const metadata = JSON.stringify({
@@ -298,7 +299,7 @@ export async function uploadCardPhotoToDrive(
   body.set(epilogue, preamble.length + imageBytes.length);
 
   const uploadRes = await fetch(
-    'https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&fields=id',
+    'https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&fields=id&supportsAllDrives=true',
     {
       method: 'POST',
       headers: {
@@ -313,7 +314,7 @@ export async function uploadCardPhotoToDrive(
 
   const fileId = uploadData.id;
 
-  await fetch(`${DRIVE_API}/${fileId}/permissions`, {
+  await fetch(`${DRIVE_API}/${fileId}/permissions?supportsAllDrives=true`, {
     method: 'POST',
     headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
     body: JSON.stringify({ role: 'reader', type: 'anyone' }),
@@ -322,7 +323,7 @@ export async function uploadCardPhotoToDrive(
   return `https://lh3.googleusercontent.com/d/${fileId}`;
 }
 
-async function getOrCreateShowFolder(showName: string, token: string): Promise<string> {
+async function getOrCreateShowFolder(showName: string, token: string, sharedDriveId?: string): Promise<string> {
   const now = new Date();
   const monthYear = now.toLocaleString('en-US', { month: 'long', year: 'numeric' });
   const folderName = `${showName} — ${monthYear}`;
@@ -330,17 +331,26 @@ async function getOrCreateShowFolder(showName: string, token: string): Promise<s
   const q = encodeURIComponent(
     `name='${folderName.replace(/'/g, "\\'")}' and mimeType='application/vnd.google-apps.folder' and trashed=false`
   );
-  const searchRes = await fetch(
-    `${DRIVE_API}?q=${q}&fields=files(id)&pageSize=1`,
-    { headers: { Authorization: `Bearer ${token}` } },
-  );
+  const searchUrl = new URL(DRIVE_API);
+  searchUrl.searchParams.set('q', decodeURIComponent(q));
+  searchUrl.searchParams.set('fields', 'files(id)');
+  searchUrl.searchParams.set('pageSize', '1');
+  searchUrl.searchParams.set('supportsAllDrives', 'true');
+  if (sharedDriveId) {
+    searchUrl.searchParams.set('includeItemsFromAllDrives', 'true');
+    searchUrl.searchParams.set('corpora', 'drive');
+    searchUrl.searchParams.set('driveId', sharedDriveId);
+  }
+  const searchRes = await fetch(searchUrl, { headers: { Authorization: `Bearer ${token}` } });
   const searchData = await searchRes.json() as { files?: Array<{ id: string }> };
   if (searchData.files?.length) return searchData.files[0].id;
 
-  const createRes = await fetch(`${DRIVE_API}?fields=id`, {
+  const createBody: Record<string, unknown> = { name: folderName, mimeType: 'application/vnd.google-apps.folder' };
+  if (sharedDriveId) createBody.parents = [sharedDriveId];
+  const createRes = await fetch(`${DRIVE_API}?fields=id&supportsAllDrives=true`, {
     method: 'POST',
     headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
-    body: JSON.stringify({ name: folderName, mimeType: 'application/vnd.google-apps.folder' }),
+    body: JSON.stringify(createBody),
   });
   const createData = await createRes.json() as { id?: string };
   if (!createData.id) throw new Error(`Drive folder create failed: ${folderName}`);
