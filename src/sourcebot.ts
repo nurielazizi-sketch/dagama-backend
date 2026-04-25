@@ -4,6 +4,7 @@ import type { Env } from './types';
 import { consumeOnboardingToken } from './onboarding';
 import { getServiceAccountToken, createDriveFolder } from './google';
 import { scheduleFunnelOnFirstScan, trackEvent } from './funnel';
+import { generateSupplierPdf, generateShowPdf } from './pdf';
 import { appendSupplierRow, updateSupplierProducts, updateSupplierVoiceNote, updateSupplierEmailStatus, appendProductRow, updateProductRow, ensureProductsTab, updateSupplierCardBack, updateSupplierPerson } from './sb_sheets';
 import { buildGmailAuthUrl, getGmailToken, getValidAccessToken, sendGmailEmail } from './gmail';
 import { ocrThenExtract } from './extract';
@@ -152,6 +153,10 @@ async function handleMessage(msg: TgMessage, env: Env): Promise<void> {
   if (text === '/allshows')                               { await cmdAllShows(chatId, buyer, env); return; }
   if (text === '/upgrade' || text === '/pay')             { await cmdUpgrade(chatId, buyer, env); return; }
   if (text === '/newshow' || text.startsWith('/newshow ')) { await cmdNewShow(chatId, text.slice('/newshow'.length).trim(), buyer, env); return; }
+  if (text === '/pdf' || text.startsWith('/pdf '))         { await cmdPdf(chatId, text.slice('/pdf'.length).trim(), buyer, env); return; }
+  if (text === '/pdfshow')                                 { await cmdPdfShow(chatId, buyer, env); return; }
+  if (text === '/blast')                                   { await cmdBlast(chatId, buyer, env); return; }
+  if (text === '/clear')                                   { await cmdClear(chatId, env); return; }
 
   // ── Reply-to-message corrections ──
   // If the user is replying to a confirmation message we previously sent, look
@@ -324,6 +329,68 @@ async function handleCallback(cb: TgCallbackQuery, env: Env): Promise<void> {
     await send(chatId, `🗑 Draft discarded.`, env);
     return;
   }
+  if (data.startsWith('blast_send:')) {
+    const showName = data.slice('blast_send:'.length);
+    const buyer = await getBuyerForChat(chatId, env);
+    if (buyer) await runBlast(chatId, showName, buyer, env);
+    return;
+  }
+  if (data === 'blast_cancel') {
+    await send(chatId, `❌ Bulk send cancelled.`, env);
+    return;
+  }
+}
+
+async function runBlast(chatId: number, showName: string, buyer: { buyerId: string }, env: Env): Promise<void> {
+  const targets = await env.DB.prepare(
+    `SELECT c.id, c.name, MIN(co.email) AS email
+       FROM sb_companies c JOIN sb_contacts co ON co.company_id = c.id
+       LEFT JOIN sb_emails_sent es ON es.company_id = c.id AND es.status = 'sent'
+      WHERE c.buyer_id = ? AND c.show_name = ?
+        AND co.email IS NOT NULL AND co.email != ''
+        AND es.id IS NULL
+      GROUP BY c.id, c.name
+      LIMIT 50`
+  ).bind(buyer.buyerId, showName).all<{ id: string; name: string; email: string }>();
+
+  if (!targets.results.length) {
+    await send(chatId, `Nothing to send.`, env);
+    return;
+  }
+  await send(chatId, `✉️ Sending follow-ups to ${targets.results.length} supplier${targets.results.length === 1 ? '' : 's'}…`, env);
+
+  let ok = 0, failed = 0;
+  for (const t of targets.results) {
+    try {
+      await blastSendOne(chatId, t.id, t.name, t.email, buyer, env);
+      ok++;
+    } catch (e) {
+      console.error('[blast] one failed:', e);
+      failed++;
+    }
+  }
+  await send(chatId,
+    `✅ *Bulk follow-up complete*\n\nSent: ${ok}${failed ? ` · Failed: ${failed}` : ''}`,
+    env, true);
+  await trackEvent(env, { buyerId: buyer.buyerId, eventName: 'blast_complete', properties: { ok, failed, show: showName } });
+}
+
+async function blastSendOne(chatId: number, companyId: string, supplierName: string, _email: string, buyer: { buyerId: string }, env: Env): Promise<void> {
+  // Reuse the /email pipeline: cmdEmail builds + sends a draft. We invoke its
+  // internals here by passing the supplier name. The existing implementation
+  // already handles confirm+send via callback, but for bulk we want unattended
+  // send — fall back to a streamlined path that drafts + sends inline.
+  await cmdEmail(chatId, supplierName, buyer, env);
+  // Auto-send: pull the latest draft from the session and send it
+  const sess = await getSession(chatId, env);
+  if (sess.activeEmailDraft) {
+    await sendDraftedEmail(chatId, sess.activeEmailDraft.draftId, buyer, env);
+  } else {
+    // Fall back: insert a row into sb_emails_sent so /pending stops listing it
+    await env.DB.prepare(
+      `INSERT INTO sb_emails_sent (company_id, buyer_id, show_name, recipient_email, status, error_msg) VALUES (?, ?, '', ?, 'failed', ?)`
+    ).bind(companyId, buyer.buyerId, _email, 'No draft generated').run();
+  }
 }
 
 function toastFor(data: string): string {
@@ -408,13 +475,16 @@ async function cmdHelp(chatId: number, env: Env): Promise<void> {
     `/pending — products missing price or MOQ\n` +
     `/followups — suppliers with email but no follow-up sent\n` +
     `/email <supplier> — draft + send a follow-up email\n` +
+    `/blast — bulk send follow-ups to all uncontacted suppliers\n` +
+    `/pdf <supplier> — one-pager PDF for a supplier\n` +
+    `/pdfshow — PDF recap of the whole show\n` +
     `/connectgmail — connect your Gmail (sends from your address)\n\n` +
     `*Shows + billing*\n` +
     `/shows — list your shows · /switch <name> — change active show\n` +
     `/newshow <name> [days] — register another show\n` +
     `/allshows — cross-show summary\n` +
     `/upgrade — unlock unlimited scans (Stripe)\n` +
-    `/done · /cancel — exit current step`,
+    `/done · /cancel · /clear — exit current step`,
     env, true);
 }
 
@@ -1183,6 +1253,100 @@ async function checkAndConsumeScan(pass: ActivePass, env: Env): Promise<ScanChec
       WHERE id = ?`
   ).bind(now, pass.id).run();
   return { allowed: true };
+}
+
+// ── /pdf · /pdfshow · /blast · /clear ───────────────────────────────────────
+
+async function cmdPdf(chatId: number, query: string, buyer: { buyerId: string }, env: Env): Promise<void> {
+  if (!query) {
+    await send(chatId, `Usage: \`/pdf <supplier name>\` — generates a one-pager PDF with all photos + products.`, env, true);
+    return;
+  }
+  const pass = await env.DB.prepare(
+    `SELECT show_name FROM sb_buyer_shows WHERE buyer_id = ? AND status IN ('active','grace') ORDER BY created_at DESC LIMIT 1`
+  ).bind(buyer.buyerId).first<{ show_name: string }>();
+  if (!pass) { await send(chatId, `No active show found.`, env); return; }
+
+  const company = await env.DB.prepare(
+    `SELECT id, name FROM sb_companies WHERE buyer_id = ? AND show_name = ? AND lower(name) LIKE lower(?) ORDER BY created_at DESC LIMIT 1`
+  ).bind(buyer.buyerId, pass.show_name, `%${query}%`).first<{ id: string; name: string }>();
+  if (!company) { await send(chatId, `No supplier matching "${query}".`, env); return; }
+
+  await send(chatId, `📄 Generating PDF for *${company.name}*… (a few seconds)`, env, true);
+  try {
+    const result = await generateSupplierPdf(company.id, env);
+    if (!result) { await send(chatId, `❌ Couldn't generate PDF (folder not provisioned yet?).`, env); return; }
+    await send(chatId,
+      `✅ *${company.name}* PDF ready:\n\n📄 [Download PDF](${result.pdfUrl})\n📝 [Open as Doc](${result.docUrl})`,
+      env, true);
+    await trackEvent(env, { buyerId: buyer.buyerId, eventName: 'pdf_supplier', properties: { company: company.name } });
+  } catch (e) {
+    console.error('[sourcebot] /pdf failed:', e);
+    await send(chatId, `❌ PDF generation failed.`, env);
+  }
+}
+
+async function cmdPdfShow(chatId: number, buyer: { buyerId: string }, env: Env): Promise<void> {
+  const pass = await env.DB.prepare(
+    `SELECT show_name FROM sb_buyer_shows WHERE buyer_id = ? AND status IN ('active','grace') ORDER BY created_at DESC LIMIT 1`
+  ).bind(buyer.buyerId).first<{ show_name: string }>();
+  if (!pass) { await send(chatId, `No active show found.`, env); return; }
+
+  await send(chatId, `📄 Generating *${pass.show_name}* recap PDF… (this may take a minute for many suppliers)`, env, true);
+  try {
+    const result = await generateShowPdf(buyer.buyerId, pass.show_name, env);
+    if (!result) { await send(chatId, `❌ Couldn't generate PDF.`, env); return; }
+    await send(chatId,
+      `✅ *${pass.show_name}* recap ready:\n\n📄 [Download PDF](${result.pdfUrl})\n📝 [Open as Doc](${result.docUrl})`,
+      env, true);
+    await trackEvent(env, { buyerId: buyer.buyerId, eventName: 'pdf_show', properties: { show: pass.show_name } });
+  } catch (e) {
+    console.error('[sourcebot] /pdfshow failed:', e);
+    await send(chatId, `❌ PDF generation failed.`, env);
+  }
+}
+
+async function cmdBlast(chatId: number, buyer: { buyerId: string }, env: Env): Promise<void> {
+  const pass = await env.DB.prepare(
+    `SELECT show_name FROM sb_buyer_shows WHERE buyer_id = ? AND status IN ('active','grace') ORDER BY created_at DESC LIMIT 1`
+  ).bind(buyer.buyerId).first<{ show_name: string }>();
+  if (!pass) { await send(chatId, `No active show found.`, env); return; }
+
+  // Pick suppliers with email + no follow-up sent yet
+  const targets = await env.DB.prepare(
+    `SELECT c.id, c.name, MIN(co.email) AS email
+       FROM sb_companies c
+       JOIN sb_contacts co ON co.company_id = c.id
+       LEFT JOIN sb_emails_sent es ON es.company_id = c.id AND es.status = 'sent'
+      WHERE c.buyer_id = ? AND c.show_name = ?
+        AND co.email IS NOT NULL AND co.email != ''
+        AND es.id IS NULL
+      GROUP BY c.id, c.name
+      ORDER BY c.created_at DESC
+      LIMIT 50`
+  ).bind(buyer.buyerId, pass.show_name).all<{ id: string; name: string; email: string }>();
+
+  if (!targets.results.length) {
+    await send(chatId, `🎉 No suppliers pending follow-up in *${pass.show_name}*.`, env, true);
+    return;
+  }
+
+  await sendButtons(chatId,
+    `📧 *Bulk follow-up — ${pass.show_name}*\n\n` +
+    `${targets.results.length} supplier${targets.results.length === 1 ? '' : 's'} have an email but no follow-up sent yet:\n\n` +
+    targets.results.slice(0, 10).map(t => `• ${t.name} — ${t.email}`).join('\n') +
+    (targets.results.length > 10 ? `\n…and ${targets.results.length - 10} more.\n` : '\n') +
+    `\nThis will draft + send a personalized follow-up to each.`,
+    [
+      [{ text: '✉️ Send all', callback_data: `blast_send:${pass.show_name}` }],
+      [{ text: '❌ Cancel', callback_data: 'blast_cancel' }],
+    ],
+    env, true);
+}
+
+async function cmdClear(chatId: number, env: Env): Promise<void> {
+  await setSession(chatId, { step: 'idle' }, env);
+  await send(chatId, `✅ Cleared current state. Send a card photo to start.`, env);
 }
 
 // ── /summary ─────────────────────────────────────────────────────────────────
