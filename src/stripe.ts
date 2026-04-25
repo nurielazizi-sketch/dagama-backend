@@ -167,6 +167,21 @@ export async function handleSubscriptionStatus(request: Request, env: Env): Prom
 async function handleCheckoutCompleted(session: Record<string, unknown>, env: Env): Promise<void> {
   const sessionId = session['id'] as string;
   const metadata = session['metadata'] as Record<string, string> | null;
+
+  // SourceBot upgrade flow — metadata.bot === 'sourcebot' identifies a per-show
+  // upgrade keyed by sb_buyer_shows.id, not a user-level subscription.
+  if (metadata?.['bot'] === 'sourcebot') {
+    const showId = metadata['show_id'];
+    const planTier = metadata['plan'] ?? 'event_49';
+    if (!showId) return;
+    const now = Math.floor(Date.now() / 1000);
+    await env.DB.prepare(
+      `UPDATE sb_buyer_shows SET paid_plan = ?, paid_at = ? WHERE id = ?`
+    ).bind(planTier, now, showId).run();
+    return;
+  }
+
+  // BoothBot / web subscription flow (existing behavior)
   const userId = metadata?.['user_id'];
   const plan = metadata?.['plan'] as Plan | undefined;
   const customerId = session['customer'] as string;
@@ -177,8 +192,6 @@ async function handleCheckoutCompleted(session: Record<string, unknown>, env: En
   const config = PLAN_CONFIG[plan];
   if (!config) return;
 
-  // For recurring subscriptions, set expires_at to null (managed by Stripe events)
-  // For one-time payments, no expiry
   await env.DB.prepare(
     `UPDATE subscriptions
      SET status = 'active',

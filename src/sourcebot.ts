@@ -146,6 +146,11 @@ async function handleMessage(msg: TgMessage, env: Env): Promise<void> {
     await cmdProducts(chatId, text.slice('/products'.length).trim(), buyer, env);
     return;
   }
+  if (text === '/shows')                                  { await cmdShows(chatId, buyer, env); return; }
+  if (text === '/switch' || text.startsWith('/switch '))  { await cmdSwitch(chatId, text.slice('/switch'.length).trim(), buyer, env); return; }
+  if (text === '/allshows')                               { await cmdAllShows(chatId, buyer, env); return; }
+  if (text === '/upgrade' || text === '/pay')             { await cmdUpgrade(chatId, buyer, env); return; }
+  if (text === '/newshow' || text.startsWith('/newshow ')) { await cmdNewShow(chatId, text.slice('/newshow'.length).trim(), buyer, env); return; }
 
   // ── Reply-to-message corrections ──
   // If the user is replying to a confirmation message we previously sent, look
@@ -888,6 +893,279 @@ async function cmdProducts(chatId: number, query: string, buyer: { buyerId: stri
     env, true);
 }
 
+// ── /shows · /switch · /allshows · /newshow · /upgrade ──────────────────────
+
+async function cmdShows(chatId: number, buyer: { buyerId: string }, env: Env): Promise<void> {
+  const rows = await env.DB.prepare(
+    `SELECT id, show_name, status, duration_days, paid_plan, total_captures, created_at
+       FROM sb_buyer_shows
+      WHERE buyer_id = ?
+      ORDER BY (status = 'active') DESC, created_at DESC`
+  ).bind(buyer.buyerId).all<{ id: string; show_name: string; status: string; duration_days: number; paid_plan: string | null; total_captures: number; created_at: string }>();
+
+  if (!rows.results.length) {
+    await send(chatId, `No shows yet. Use /newshow <name> [days] to register one.`, env);
+    return;
+  }
+
+  const buyerRow = await env.DB.prepare(`SELECT current_show_id FROM sb_buyers WHERE id = ?`).bind(buyer.buyerId).first<{ current_show_id: string | null }>();
+  const lines = rows.results.map(r => {
+    const active = (buyerRow?.current_show_id === r.id) || (!buyerRow?.current_show_id && r.status === 'active');
+    const paid = r.paid_plan ? ` · 💳 ${r.paid_plan}` : ' · 🆓 free';
+    return `${active ? '✅' : '  '} *${r.show_name}* — ${r.duration_days}d · ${r.total_captures} capture${r.total_captures === 1 ? '' : 's'} · ${r.status}${paid}`;
+  }).join('\n');
+
+  await send(chatId,
+    `🗓 *Your shows:*\n\n${lines}\n\nUse \`/switch <name>\` to change the active show.`,
+    env, true);
+}
+
+async function cmdSwitch(chatId: number, query: string, buyer: { buyerId: string }, env: Env): Promise<void> {
+  if (!query) {
+    await send(chatId, `Usage: \`/switch <show name>\``, env, true);
+    return;
+  }
+  const target = await env.DB.prepare(
+    `SELECT id, show_name FROM sb_buyer_shows
+      WHERE buyer_id = ? AND lower(show_name) LIKE lower(?)
+      ORDER BY created_at DESC LIMIT 1`
+  ).bind(buyer.buyerId, `%${query}%`).first<{ id: string; show_name: string }>();
+  if (!target) {
+    await send(chatId, `No show matching "${query}". Use /shows to see your list.`, env);
+    return;
+  }
+  await env.DB.prepare(`UPDATE sb_buyers SET current_show_id = ? WHERE id = ?`).bind(target.id, buyer.buyerId).run();
+  await send(chatId, `🔁 Active show is now *${target.show_name}*.`, env, true);
+}
+
+async function cmdAllShows(chatId: number, buyer: { buyerId: string }, env: Env): Promise<void> {
+  const rows = await env.DB.prepare(
+    `SELECT
+        bs.show_name,
+        bs.duration_days,
+        bs.status,
+        (SELECT COUNT(*) FROM sb_companies c  WHERE c.buyer_id = bs.buyer_id AND c.show_name  = bs.show_name) AS suppliers,
+        (SELECT COUNT(*) FROM sb_products  p  WHERE p.buyer_id = bs.buyer_id AND p.show_name  = bs.show_name) AS products,
+        (SELECT COUNT(*) FROM sb_emails_sent e WHERE e.buyer_id = bs.buyer_id AND e.show_name = bs.show_name AND e.status = 'sent') AS emails
+       FROM sb_buyer_shows bs
+      WHERE bs.buyer_id = ?
+      ORDER BY bs.created_at DESC`
+  ).bind(buyer.buyerId).all<{ show_name: string; duration_days: number; status: string; suppliers: number; products: number; emails: number }>();
+
+  if (!rows.results.length) {
+    await send(chatId, `No shows yet.`, env);
+    return;
+  }
+
+  const totals = rows.results.reduce((acc, r) => ({ s: acc.s + r.suppliers, p: acc.p + r.products, e: acc.e + r.emails }), { s: 0, p: 0, e: 0 });
+  const lines = rows.results.map(r =>
+    `*${r.show_name}* (${r.duration_days}d · ${r.status}) — ${r.suppliers} suppliers · ${r.products} products · ${r.emails} emails`
+  ).join('\n');
+
+  await send(chatId,
+    `📊 *Cross-show summary:*\n\n${lines}\n\n*Totals:* ${totals.s} suppliers · ${totals.p} products · ${totals.e} emails sent`,
+    env, true);
+}
+
+async function cmdNewShow(chatId: number, query: string, buyer: { buyerId: string }, env: Env): Promise<void> {
+  if (!query) {
+    await send(chatId, `Usage: \`/newshow <name> [duration_days]\` — e.g. \`/newshow Canton Fair 5\``, env, true);
+    return;
+  }
+  // Parse optional trailing number for duration_days
+  const m = query.match(/^(.+?)\s+(\d+)$/);
+  const showName     = (m ? m[1] : query).trim();
+  const durationDays = m ? parseInt(m[2], 10) : 3;
+
+  const now = Math.floor(Date.now() / 1000);
+  const SHOW_PASS_DURATION_SEC = 96 * 3600;
+  const GRACE_PERIOD_SEC       = 2 * 3600;
+  const passExpiresAt  = now + SHOW_PASS_DURATION_SEC;
+  const gracePeriodEnd = passExpiresAt + GRACE_PERIOD_SEC;
+
+  // Get the existing buyer's first show (for sheet/folder reuse) — minimum viable: reuse the same sheet+folder
+  const existingShow = await env.DB.prepare(
+    `SELECT sheet_id, sheet_url, drive_folder_id, drive_folder_url FROM sb_buyer_shows WHERE buyer_id = ? ORDER BY created_at LIMIT 1`
+  ).bind(buyer.buyerId).first<{ sheet_id: string; sheet_url: string; drive_folder_id: string | null; drive_folder_url: string | null }>();
+
+  if (!existingShow) {
+    await send(chatId, `Can't add a show without an existing one. Onboard first via the website.`, env);
+    return;
+  }
+
+  const ins = await env.DB.prepare(
+    `INSERT INTO sb_buyer_shows
+       (buyer_id, show_name, status, sheet_id, sheet_url, drive_folder_id, drive_folder_url,
+        pass_expires_at, grace_period_end, duration_days,
+        free_scans_limit)
+     VALUES (?, ?, 'active', ?, ?, ?, ?, ?, ?, ?, ?)
+     RETURNING id`
+  ).bind(
+    buyer.buyerId, showName,
+    existingShow.sheet_id, existingShow.sheet_url,
+    existingShow.drive_folder_id, existingShow.drive_folder_url,
+    passExpiresAt, gracePeriodEnd, durationDays,
+    durationDays === 2 ? 10 : null,
+  ).first<{ id: string }>();
+
+  await env.DB.prepare(`UPDATE sb_buyers SET current_show_id = ? WHERE id = ?`).bind(ins?.id, buyer.buyerId).run();
+
+  const passNote = durationDays === 2
+    ? '10 scans on Day 1 · then upgrade to keep going'
+    : '24h unlimited from your first scan · then upgrade to keep going';
+  await send(chatId,
+    `✅ Show *${showName}* registered (${durationDays} days).\n\n🆓 Free tier: ${passNote}\n\nIt's now your active show — start sending cards!`,
+    env, true);
+}
+
+async function cmdUpgrade(chatId: number, buyer: { buyerId: string }, env: Env): Promise<void> {
+  const pass = await getActivePass(buyer.buyerId, env);
+  if (!pass) { await send(chatId, `No active show to upgrade.`, env); return; }
+
+  if (pass.paid_plan) {
+    await send(chatId, `✅ *${pass.show_name}* is already on the *${pass.paid_plan}* plan.`, env, true);
+    return;
+  }
+
+  // Build a Stripe Checkout session for event_49 (single-show pass).
+  const priceId = env.STRIPE_PRICE_SINGLE_SHOW;
+  if (!priceId || priceId.startsWith('price_placeholder')) {
+    await send(chatId,
+      `💳 *Upgrade to keep capturing*\n\n` +
+      `Plans:\n` +
+      `• *event_49* — $49, unlimited scans for this show\n` +
+      `• *event_199* — $199, 5-show pack (coming soon)\n` +
+      `• *team_79* — $79/mo, team plan (coming soon)\n\n` +
+      `_Stripe is not yet configured for SourceBot. Contact support._`,
+      env, true);
+    return;
+  }
+
+  const buyerRow = await env.DB.prepare(`SELECT email, name FROM sb_buyers WHERE id = ?`).bind(buyer.buyerId).first<{ email: string; name: string }>();
+  if (!buyerRow) { await send(chatId, `Buyer not found.`, env); return; }
+
+  const params = new URLSearchParams();
+  params.set('mode', 'payment');
+  params.set('line_items[0][price]', priceId);
+  params.set('line_items[0][quantity]', '1');
+  params.set('customer_email', buyerRow.email);
+  params.set('success_url', `${env.ORIGIN}/upgrade-success?show=${encodeURIComponent(pass.show_name)}`);
+  params.set('cancel_url',  `${env.ORIGIN}/upgrade-cancel`);
+  params.set('metadata[bot]',          'sourcebot');
+  params.set('metadata[buyer_id]',     buyer.buyerId);
+  params.set('metadata[show_id]',      pass.id);
+  params.set('metadata[show_name]',    pass.show_name);
+  params.set('metadata[plan]',         'event_49');
+  params.set('allow_promotion_codes',  'true');
+
+  const r = await fetch('https://api.stripe.com/v1/checkout/sessions', {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${env.STRIPE_SECRET_KEY}`, 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: params.toString(),
+  });
+  const d = await r.json() as { url?: string; id?: string; error?: { message: string } };
+  if (!r.ok || !d.url) {
+    console.error('[sourcebot] stripe checkout failed:', d);
+    await send(chatId, `❌ Couldn't create checkout: ${d.error?.message ?? 'unknown'}`, env);
+    return;
+  }
+
+  if (d.id) {
+    await env.DB.prepare(`UPDATE sb_buyer_shows SET stripe_session_id = ? WHERE id = ?`).bind(d.id, pass.id).run();
+  }
+
+  await send(chatId,
+    `💳 *Upgrade ${pass.show_name} — $49*\n\nUnlimited scans for this show + post-show retargeting.\n\n[Pay securely with Stripe](${d.url})`,
+    env, true);
+}
+
+// Look up the buyer's active show, honoring an explicit /switch override.
+interface ActivePass {
+  id: string;
+  show_name: string;
+  status: string;
+  duration_days: number;
+  first_scan_at: number | null;
+  free_window_ends_at: number | null;
+  free_scans_limit: number | null;
+  free_scans_used: number;
+  paid_plan: string | null;
+  sheet_id: string | null;
+  sheet_url: string | null;
+  drive_folder_id: string | null;
+}
+
+async function getActivePass(buyerId: string, env: Env): Promise<ActivePass | null> {
+  const buyerRow = await env.DB.prepare(`SELECT current_show_id FROM sb_buyers WHERE id = ?`).bind(buyerId).first<{ current_show_id: string | null }>();
+  if (buyerRow?.current_show_id) {
+    const r = await env.DB.prepare(
+      `SELECT id, show_name, status, duration_days, first_scan_at, free_window_ends_at,
+              free_scans_limit, free_scans_used, paid_plan, sheet_id, sheet_url, drive_folder_id
+         FROM sb_buyer_shows WHERE id = ?`
+    ).bind(buyerRow.current_show_id).first<ActivePass>();
+    if (r) return r;
+  }
+  return env.DB.prepare(
+    `SELECT id, show_name, status, duration_days, first_scan_at, free_window_ends_at,
+            free_scans_limit, free_scans_used, paid_plan, sheet_id, sheet_url, drive_folder_id
+       FROM sb_buyer_shows
+      WHERE buyer_id = ? AND status IN ('active','grace')
+      ORDER BY created_at DESC LIMIT 1`
+  ).bind(buyerId).first<ActivePass>();
+}
+
+// Plan rules (per spec):
+//   - Paid plan → unlimited
+//   - First scan: trigger free window → 24h unlimited (3+ day shows) OR 10 scans (2-day shows)
+//   - Subsequent scans: enforce window/cap
+// Returns { allowed: true } or { allowed: false, reason }
+interface ScanCheck { allowed: boolean; reason?: string; }
+
+async function checkAndConsumeScan(pass: ActivePass, env: Env): Promise<ScanCheck> {
+  const now = Math.floor(Date.now() / 1000);
+
+  if (pass.paid_plan) {
+    await env.DB.prepare(
+      `UPDATE sb_buyer_shows SET total_captures = total_captures + 1, last_capture_at = ? WHERE id = ?`
+    ).bind(now, pass.id).run();
+    return { allowed: true };
+  }
+
+  // First scan — set the free window
+  if (!pass.first_scan_at) {
+    const isShortShow = pass.duration_days === 2;
+    const windowEnd = isShortShow ? null : now + 24 * 3600;
+    const limit     = isShortShow ? 10   : null;
+    await env.DB.prepare(
+      `UPDATE sb_buyer_shows
+          SET first_scan_at = ?, free_window_ends_at = ?, free_scans_limit = ?,
+              free_scans_used = 1, total_captures = total_captures + 1, last_capture_at = ?
+        WHERE id = ?`
+    ).bind(now, windowEnd, limit, now, pass.id).run();
+    return { allowed: true };
+  }
+
+  // Time-window expired (3+ day shows)
+  if (pass.free_window_ends_at && now > pass.free_window_ends_at) {
+    return { allowed: false, reason: `🆓 Your 24h free window for *${pass.show_name}* ended. Tap /upgrade for unlimited scans + post-show retargeting.` };
+  }
+
+  // Scan-count exceeded (2-day shows)
+  if (pass.free_scans_limit !== null && pass.free_scans_used >= pass.free_scans_limit) {
+    return { allowed: false, reason: `🆓 You've used all ${pass.free_scans_limit} free scans for *${pass.show_name}*. Tap /upgrade for unlimited.` };
+  }
+
+  // Allowed — increment counters
+  await env.DB.prepare(
+    `UPDATE sb_buyer_shows
+        SET free_scans_used = free_scans_used + 1,
+            total_captures  = total_captures + 1,
+            last_capture_at = ?
+      WHERE id = ?`
+  ).bind(now, pass.id).run();
+  return { allowed: true };
+}
+
 // ── /summary ─────────────────────────────────────────────────────────────────
 
 async function cmdSummary(chatId: number, buyer: { buyerId: string }, env: Env): Promise<void> {
@@ -988,14 +1266,18 @@ async function handleSupplierCard(
 ): Promise<void> {
   const photo = photos.reduce((a, b) => (b.file_size ?? 0) > (a.file_size ?? 0) ? b : a);
 
-  // Find the buyer's active show pass (sheet location)
-  const pass = await env.DB.prepare(
-    `SELECT show_name, sheet_id, drive_folder_id FROM sb_buyer_shows
-     WHERE buyer_id = ? AND status IN ('active','grace')
-     ORDER BY created_at DESC LIMIT 1`
-  ).bind(buyer.buyerId).first<{ show_name: string; sheet_id: string | null; drive_folder_id: string | null }>();
+  // Find the buyer's active show pass (sheet location + plan state)
+  const pass = await getActivePass(buyer.buyerId, env);
   if (!pass?.sheet_id) {
-    await send(chatId, `⚠️ I couldn't find an active show for your account. Please contact support.`, env);
+    await send(chatId, `⚠️ I couldn't find an active show for your account. Use /shows or contact support.`, env);
+    return;
+  }
+
+  // Plan rules: paid → unlimited; free 3+ day shows → 24h from first scan;
+  // free 2-day shows → 10 scans Day 1. Block + prompt /upgrade if exceeded.
+  const check = await checkAndConsumeScan(pass, env);
+  if (!check.allowed) {
+    await send(chatId, check.reason ?? `Free tier exhausted. Tap /upgrade to keep capturing.`, env, true);
     return;
   }
 
