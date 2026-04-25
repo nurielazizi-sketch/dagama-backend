@@ -5,7 +5,12 @@ import type { Env } from './types';
 const GMAIL_AUTH_URL  = 'https://accounts.google.com/o/oauth2/v2/auth';
 const GMAIL_TOKEN_URL = 'https://oauth2.googleapis.com/token';
 const GMAIL_SEND_URL  = 'https://gmail.googleapis.com/gmail/v1/users/me/messages/send';
-const GMAIL_SCOPE     = 'https://www.googleapis.com/auth/gmail.send';
+const GMAIL_SCOPE     = [
+  'https://www.googleapis.com/auth/gmail.send',
+  'https://www.googleapis.com/auth/spreadsheets',
+  'https://www.googleapis.com/auth/drive.file',
+  'email',
+].join(' ');
 
 function getRedirectUri(env: Env): string {
   return `${env.ORIGIN}/api/gmail/callback`;
@@ -27,7 +32,10 @@ export interface SendEmailResult {
 
 // ── OAuth consent URL ─────────────────────────────────────────────────────────
 
-export function buildGmailAuthUrl(chatId: number, env: Env): string {
+// `botRole` is round-tripped through the OAuth `state` so the callback can
+// route the confirmation message back via the right bot's token. Defaults to
+// 'boothbot' for backward compatibility with existing /connectgmail links.
+export function buildGmailAuthUrl(chatId: number, env: Env, botRole: 'boothbot' | 'sourcebot' = 'boothbot'): string {
   const params = new URLSearchParams({
     client_id:     env.GMAIL_CLIENT_ID,
     redirect_uri:  getRedirectUri(env),
@@ -35,7 +43,7 @@ export function buildGmailAuthUrl(chatId: number, env: Env): string {
     scope:         GMAIL_SCOPE,
     access_type:   'offline',
     prompt:        'consent',
-    state:         String(chatId),
+    state:         botRole === 'sourcebot' ? `${chatId}:sourcebot` : String(chatId),
   });
   return `${GMAIL_AUTH_URL}?${params.toString()}`;
 }
@@ -52,7 +60,10 @@ export async function handleGmailCallback(request: Request, env: Env): Promise<R
     return new Response(OAUTH_ERROR_HTML, { headers: { 'Content-Type': 'text/html' } });
   }
 
-  const chatId = parseInt(state, 10);
+  // state can be `${chatId}` (legacy boothbot) or `${chatId}:sourcebot`
+  const [chatIdStr, botRoleRaw] = state.split(':');
+  const chatId  = parseInt(chatIdStr, 10);
+  const botRole: 'boothbot' | 'sourcebot' = botRoleRaw === 'sourcebot' ? 'sourcebot' : 'boothbot';
   if (isNaN(chatId)) return new Response('Bad state', { status: 400 });
 
   // Exchange code for tokens
@@ -99,13 +110,19 @@ export async function handleGmailCallback(request: Request, env: Env): Promise<R
       updated_at    = datetime('now')
   `).bind(chatId, gmailAddress, tokens.access_token, tokens.refresh_token, tokenExpiry).run();
 
-  // Notify user in Telegram
-  await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`, {
+  // Notify user via the bot they came from
+  const botToken = botRole === 'sourcebot' && env.TELEGRAM_BOT_TOKEN_SOURCE
+    ? env.TELEGRAM_BOT_TOKEN_SOURCE
+    : env.TELEGRAM_BOT_TOKEN;
+  const helpHint = botRole === 'sourcebot'
+    ? 'You can now use /email <supplier> to send follow-up emails.'
+    : 'You can now use /sendemail N to send follow-up emails.';
+  await fetch(`https://api.telegram.org/bot${botToken}/sendMessage`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
       chat_id: chatId,
-      text: `✅ Gmail connected! You can now use /sendemail N to send follow-up emails directly from ${gmailAddress}.`,
+      text: `✅ Gmail connected as ${gmailAddress}!\n\n${helpHint}`,
     }),
   });
 
