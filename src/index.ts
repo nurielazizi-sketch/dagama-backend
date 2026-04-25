@@ -5,6 +5,11 @@ import { handleTelegramWebhook, handleSetupWebhook } from './telegram';
 import { handleGmailCallback } from './gmail';
 import { handleCreateCheckout, handleStripeWebhook, handleBillingPortal, handleSubscriptionStatus } from './stripe';
 import { getUserSheets } from './sheets';
+import { handleProcessCard, type ProcessCardJob } from './queue';
+import { handleShowPassCron } from './telegram';
+import { handleOnboard, handleOnboardingStatus } from './onboarding';
+import { handleGoogleAuthStart, handleGoogleAuthCallback } from './google_auth';
+import { handleSourceBotWebhook, handleSourceBotSetupWebhook, handleSourceBotShowPassCron } from './sourcebot';
 import type { Env } from './types';
 
 const CORS_HEADERS = {
@@ -14,6 +19,28 @@ const CORS_HEADERS = {
 };
 
 export default {
+  async scheduled(_event: ScheduledEvent, env: Env): Promise<void> {
+    await handleShowPassCron(env);
+    await handleSourceBotShowPassCron(env);
+  },
+
+  async queue(batch: MessageBatch<ProcessCardJob>, env: Env): Promise<void> {
+    for (const msg of batch.messages) {
+      const job = msg.body;
+      try {
+        if (job.jobType === 'process_card') {
+          await handleProcessCard(job, env);
+          msg.ack();
+        } else {
+          msg.ack(); // unknown type — don't retry
+        }
+      } catch (e) {
+        console.error(`Queue job ${job.jobId} failed:`, e);
+        msg.retry();
+      }
+    }
+  },
+
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
     const path = url.pathname;
@@ -24,6 +51,7 @@ export default {
     }
 
     // API routes
+    if (path === '/api/health')        return addCors(await handleHealth(env));
     if (path === '/api/auth/register') return addCors(await handleRegister(request, env));
     if (path === '/api/auth/login')    return addCors(await handleLogin(request, env));
     if (path === '/api/me')                  return addCors(await handleMe(request, env));
@@ -37,6 +65,23 @@ export default {
     if (path === '/api/stripe/status')       return addCors(await handleSubscriptionStatus(request, env));
     if (path === '/api/google/sheets')       return addCors(await handleGetSheets(request, env));
     if (path === '/api/gmail/callback')      return handleGmailCallback(request, env);
+    if (path === '/api/onboard')              return addCors(await handleOnboard(request, env));
+    if (path === '/api/me/onboarding-status') return addCors(await handleOnboardingStatus(request, env));
+    if (path === '/api/auth/google')          return handleGoogleAuthStart(request, env);
+    if (path === '/api/auth/google/callback') return handleGoogleAuthCallback(request, env);
+    if (path === '/api/sourcebot/webhook')   return handleSourceBotWebhook(request, env);
+    if (path === '/api/sourcebot/setup')     return addCors(await handleSourceBotSetupWebhook(request, env));
+
+    // Internal R2 pass-through — used so CF image transforms can fetch objects
+    // from our private bucket via a URL on this worker's zone.
+    if (path.startsWith('/_r2/')) {
+      const key = decodeURIComponent(path.slice(5));
+      const obj = await env.R2_BUCKET.get(key);
+      if (!obj) return new Response('Not Found', { status: 404 });
+      return new Response(obj.body, {
+        headers: { 'Content-Type': obj.httpMetadata?.contentType ?? 'application/octet-stream' },
+      });
+    }
 
     // UI routes
     if (path === '/') {
@@ -63,9 +108,43 @@ export default {
       });
     }
 
+    if (path === '/onboard-complete') {
+      return new Response(ONBOARD_COMPLETE_PAGE, {
+        headers: { 'Content-Type': 'text/html; charset=utf-8' }
+      });
+    }
+
     return new Response('Not found', { status: 404 });
   }
 };
+
+async function handleHealth(env: Env): Promise<Response> {
+  // Cheap pings — confirm bindings are wired up. Keep this fast (used for uptime probes).
+  const checks: Record<string, { ok: boolean; detail?: string }> = {};
+  try {
+    const row = await env.DB.prepare(`SELECT 1 AS ok`).first<{ ok: number }>();
+    checks.d1 = { ok: row?.ok === 1 };
+  } catch (e) {
+    checks.d1 = { ok: false, detail: e instanceof Error ? e.message : String(e) };
+  }
+  checks.r2     = { ok: typeof env.R2_BUCKET?.put === 'function' };
+  checks.queue  = { ok: typeof env.CARD_QUEUE?.send === 'function' };
+  checks.boothbot_token  = { ok: !!env.TELEGRAM_BOT_TOKEN };
+  checks.sourcebot_token = { ok: !!env.TELEGRAM_BOT_TOKEN_SOURCE };
+  checks.gemini = { ok: !!env.GEMINI_API_KEY };
+  checks.gcv    = { ok: !!env.GCV_API_KEY };
+
+  const overall = Object.values(checks).every(c => c.ok);
+  return new Response(JSON.stringify({
+    status: overall ? 'ok' : 'degraded',
+    env:    env.ENVIRONMENT,
+    time:   new Date().toISOString(),
+    checks,
+  }, null, 2), {
+    status: overall ? 200 : 503,
+    headers: { 'Content-Type': 'application/json' },
+  });
+}
 
 async function handleGetSheets(request: Request, env: Env): Promise<Response> {
   if (request.method !== 'GET') return new Response('Method not allowed', { status: 405 });
@@ -1588,6 +1667,122 @@ const DASHBOARD_PAGE = `<!DOCTYPE html>
       localStorage.removeItem('dagama_user');
       window.location.href = '/';
     }
+  </script>
+</body>
+</html>`;
+
+const ONBOARD_COMPLETE_PAGE = `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Complete Setup — DaGama</title>
+  <link href="https://fonts.googleapis.com/css2?family=Playfair+Display:wght@700&family=Outfit:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body { background: linear-gradient(135deg, #0F1419 0%, #1a2844 100%); color: #F5F5F5; font-family: 'Outfit', sans-serif; min-height: 100vh; display: flex; align-items: center; justify-content: center; padding: 1.5rem; }
+    .container { max-width: 540px; width: 100%; padding: 2.5rem; background: linear-gradient(135deg, rgba(30,41,59,0.9), rgba(30,41,59,0.6)); border: 1px solid rgba(212,175,55,0.15); border-radius: 16px; backdrop-filter: blur(20px); box-shadow: 0 8px 32px rgba(0,0,0,0.3); }
+    h1 { font-family: 'Playfair Display', serif; font-size: 2rem; margin-bottom: 0.5rem; background: linear-gradient(135deg, #F5F5F5, #D4AF37); -webkit-background-clip: text; -webkit-text-fill-color: transparent; background-clip: text; text-align: center; }
+    .subtitle { text-align: center; color: #94A3B8; margin-bottom: 2rem; font-size: 0.95rem; }
+    .role-row { display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; margin-bottom: 1.5rem; }
+    .role { padding: 1.2rem; background: rgba(51,65,85,0.4); border: 1px solid rgba(212,175,55,0.15); border-radius: 12px; cursor: pointer; transition: all 0.2s; text-align: center; }
+    .role:hover { border-color: rgba(212,175,55,0.4); }
+    .role.selected { border-color: #D4AF37; background: rgba(212,175,55,0.1); }
+    .role-icon { font-size: 2rem; margin-bottom: 0.4rem; }
+    .role-name { font-weight: 600; margin-bottom: 0.2rem; }
+    .role-desc { font-size: 0.8rem; color: #94A3B8; line-height: 1.4; }
+    label { display: block; color: #94A3B8; font-size: 0.85rem; font-weight: 500; margin-bottom: 0.5rem; }
+    input { width: 100%; padding: 0.9rem; margin-bottom: 1.5rem; background: rgba(51,65,85,0.5); border: 1px solid rgba(212,175,55,0.15); border-radius: 8px; color: #F5F5F5; font-family: 'Outfit', sans-serif; font-size: 1rem; }
+    input:focus { outline: none; border-color: rgba(212,175,55,0.4); }
+    button { width: 100%; padding: 1rem; background: linear-gradient(135deg, #D4AF37, #E8C547); color: #0F1419; border: none; border-radius: 8px; font-weight: 600; cursor: pointer; transition: all 0.3s ease; font-size: 1rem; }
+    button:hover { transform: translateY(-2px); box-shadow: 0 6px 20px rgba(212,175,55,0.3); }
+    button:disabled { opacity: 0.5; cursor: not-allowed; transform: none; }
+    .error { display:none; color:#f87171; background:rgba(248,113,113,0.1); border:1px solid rgba(248,113,113,0.3); border-radius:8px; padding:0.75rem 1rem; margin-bottom:1rem; font-size:0.9rem; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h1>One last step</h1>
+    <div class="subtitle">Tell us how you'll use DaGama and we'll set up your sheet.</div>
+    <div id="error" class="error"></div>
+
+    <label>Which side are you on?</label>
+    <div class="role-row">
+      <div class="role" data-role="boothbot" onclick="pickRole(this)">
+        <div class="role-icon">🎤</div>
+        <div class="role-name">BoothBot</div>
+        <div class="role-desc">I'm exhibiting — capture buyers at my booth.</div>
+      </div>
+      <div class="role" data-role="sourcebot" onclick="pickRole(this)">
+        <div class="role-icon">📦</div>
+        <div class="role-name">SourceBot</div>
+        <div class="role-desc">I'm sourcing — capture suppliers and products.</div>
+      </div>
+    </div>
+
+    <label for="show">Show or event you're attending</label>
+    <input id="show" type="text" placeholder='e.g. "Canton Fair 2026"' />
+
+    <button id="btn" onclick="submitForm()">Set up my sheet</button>
+  </div>
+
+  <script>
+    const token = localStorage.getItem('dagama_token');
+    const user  = JSON.parse(localStorage.getItem('dagama_user') || '{}');
+    if (!token || !user.id) { window.location.replace('/login'); }
+
+    let selectedRole = null;
+    function pickRole(el) {
+      document.querySelectorAll('.role').forEach(r => r.classList.remove('selected'));
+      el.classList.add('selected');
+      selectedRole = el.dataset.role;
+    }
+
+    // If the user is already onboarded, skip straight to the dashboard.
+    fetch('/api/me/onboarding-status', { headers: { Authorization: 'Bearer ' + token } })
+      .then(r => r.json())
+      .then(d => { if (d.onboarded) window.location.replace('/dashboard'); })
+      .catch(() => {});
+
+    function showError(msg) {
+      const e = document.getElementById('error');
+      e.textContent = msg; e.style.display = 'block';
+    }
+
+    async function submitForm() {
+      const show = document.getElementById('show').value.trim();
+      const btn = document.getElementById('btn');
+      document.getElementById('error').style.display = 'none';
+      if (!selectedRole) { showError('Please pick BoothBot or SourceBot.'); return; }
+      if (!show) { showError('Please enter your show name.'); return; }
+
+      btn.disabled = true; btn.textContent = 'Setting up…';
+      try {
+        const res = await fetch('/api/onboard', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + token },
+          body: JSON.stringify({
+            user_id: user.id,
+            email:   user.email,
+            name:    user.name,
+            role:    selectedRole,
+            show_name: show,
+          }),
+        });
+        const data = await res.json();
+        if (!res.ok || !data.success) {
+          showError(data.error || 'Setup failed. Please try again.');
+          btn.disabled = false; btn.textContent = 'Set up my sheet';
+          return;
+        }
+        window.location.replace('/dashboard');
+      } catch (e) {
+        showError('Network error. Please try again.');
+        btn.disabled = false; btn.textContent = 'Set up my sheet';
+      }
+    }
+
+    document.addEventListener('keydown', e => { if (e.key === 'Enter') submitForm(); });
   </script>
 </body>
 </html>`;
