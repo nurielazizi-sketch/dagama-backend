@@ -3,7 +3,7 @@
 import type { Env } from './types';
 import { consumeOnboardingToken } from './onboarding';
 import { getServiceAccountToken, createDriveFolder } from './google';
-import { appendSupplierRow, updateSupplierProducts, updateSupplierVoiceNote, updateSupplierEmailStatus, appendProductRow, updateProductRow, ensureProductsTab } from './sb_sheets';
+import { appendSupplierRow, updateSupplierProducts, updateSupplierVoiceNote, updateSupplierEmailStatus, appendProductRow, updateProductRow, ensureProductsTab, updateSupplierCardBack, updateSupplierPerson } from './sb_sheets';
 import { buildGmailAuthUrl, getGmailToken, getValidAccessToken, sendGmailEmail } from './gmail';
 import { ocrThenExtract } from './extract';
 
@@ -29,6 +29,7 @@ interface TgMessage {
   text?: string;
   photo?: TgPhotoSize[];
   voice?: TgVoice;
+  reply_to_message?: { message_id: number; text?: string; caption?: string };
 }
 interface TgCallbackQuery {
   id: string;
@@ -51,7 +52,9 @@ type SourceBotStep =
   | 'awaiting_product_price'
   | 'awaiting_product_moq'
   | 'awaiting_product_lead_time'
-  | 'awaiting_voice_note';
+  | 'awaiting_voice_note'
+  | 'awaiting_card_back'
+  | 'awaiting_person_photo';
 
 interface SourceBotSession {
   step: SourceBotStep;
@@ -133,7 +136,24 @@ async function handleMessage(msg: TgMessage, env: Env): Promise<void> {
     await cmdConnectGmail(chatId, env);
     return;
   }
-  if (text === '/pending') { await cmdPending(chatId, buyer, env); return; }
+  if (text === '/pending')   { await cmdPending(chatId, buyer, env); return; }
+  if (text === '/followups') { await cmdFollowups(chatId, buyer, env); return; }
+  if (text === '/supplier' || text.startsWith('/supplier ')) {
+    await cmdSupplier(chatId, text.slice('/supplier'.length).trim(), buyer, env);
+    return;
+  }
+  if (text === '/products' || text.startsWith('/products ')) {
+    await cmdProducts(chatId, text.slice('/products'.length).trim(), buyer, env);
+    return;
+  }
+
+  // ── Reply-to-message corrections ──
+  // If the user is replying to a confirmation message we previously sent, look
+  // up which row owns that message_id and treat the reply as a correction.
+  if (msg.reply_to_message && text) {
+    const handled = await handleCorrectionReply(chatId, msg.reply_to_message.message_id, text, buyer, env);
+    if (handled) return;
+  }
 
   // ── Step machine: in-flow handling for the product capture sequence ──
   const session = await getSession(chatId, env);
@@ -161,6 +181,22 @@ async function handleMessage(msg: TgMessage, env: Env): Promise<void> {
       return;
     }
     await send(chatId, `📸 Send a product photo, or reply to the last item to add details.`, env, true);
+    return;
+  }
+  if (session.step === 'awaiting_card_back') {
+    if (msg.photo && msg.photo.length > 0) {
+      await handleCardBack(chatId, msg.photo, session, buyer, env);
+      return;
+    }
+    await send(chatId, `📷 Please send the *back of the card* photo, or /cancel.`, env, true);
+    return;
+  }
+  if (session.step === 'awaiting_person_photo') {
+    if (msg.photo && msg.photo.length > 0) {
+      await handlePersonPhoto(chatId, msg.photo, session, buyer, env);
+      return;
+    }
+    await send(chatId, `👤 Please send a *photo of the person*, or /cancel.`, env, true);
     return;
   }
   if (session.step === 'awaiting_voice_note') {
@@ -253,6 +289,18 @@ async function handleCallback(cb: TgCallbackQuery, env: Env): Promise<void> {
     await send(chatId, `📷 Send the next supplier's business card.`, env);
     return;
   }
+  if (data.startsWith('card_back:')) {
+    const companyId = data.slice('card_back:'.length);
+    await setSession(chatId, { step: 'awaiting_card_back', activeCompanyId: companyId }, env);
+    await send(chatId, `📷 Send the *back* of the business card.`, env, true);
+    return;
+  }
+  if (data.startsWith('person_photo:')) {
+    const companyId = data.slice('person_photo:'.length);
+    await setSession(chatId, { step: 'awaiting_person_photo', activeCompanyId: companyId }, env);
+    await send(chatId, `👤 Send a *photo of the person* (e.g. them at the booth). I'll attach it to this contact.`, env, true);
+    return;
+  }
   if (data === 'skip_field') {
     await advanceProductFlow(chatId, '', env);  // empty = "TBD"
     return;
@@ -279,6 +327,8 @@ function toastFor(data: string): string {
   if (data === 'email_discard')        return '🗑 Discarded';
   if (data === 'done_capturing')       return '✅ Done';
   if (data === 'new_supplier')         return '📷 New supplier';
+  if (data.startsWith('card_back:'))    return '📷 Card back';
+  if (data.startsWith('person_photo:')) return '👤 Person';
   if (data === 'skip_field')           return '⏭ Skip';
   return '⏳';
 }
@@ -338,18 +388,22 @@ async function cmdStartWithToken(chatId: number, firstName: string, token: strin
 async function cmdHelp(chatId: number, env: Env): Promise<void> {
   await send(chatId,
     `*DaGama SourceBot — quick reference*\n\n` +
-    `📸 Send a business card photo to save the supplier\n` +
-    `📦 After saving, tap *Add product* to capture products\n` +
-    `🎤 Tap *Voice note* to record a memo about a supplier\n\n` +
-    `*Commands*\n` +
-    `/find <query> — search your captured suppliers, contacts, products, voice notes\n` +
-    `/compare <product> — AI comparison of a product across your suppliers\n` +
-    `/summary — AI summary of suppliers at this show\n` +
-    `/email <supplier> — draft and send a follow-up email\n` +
-    `/pending — list suppliers you haven't emailed yet\n` +
-    `/connectgmail — connect your Gmail to send emails from your own address\n` +
-    `/cancel — stop the current step\n` +
-    `/help — show this message`,
+    `📸 *Send a business card photo* → supplier saved\n` +
+    `📦 *Send product photos* → captured under that supplier\n` +
+    `💬 *Reply to any photo* with text or voice → details extracted (price, MOQ, lead time, colors)\n` +
+    `✏️ *Reply to a confirmation* with corrections → fields fixed automatically\n\n` +
+    `*Lookup commands*\n` +
+    `/supplier [query] — list captured suppliers\n` +
+    `/products [query] — list captured products\n` +
+    `/find <query> — search across suppliers, products, voice notes\n` +
+    `/compare <product> — AI ranking across your suppliers\n` +
+    `/summary — AI summary of this show\n\n` +
+    `*Action commands*\n` +
+    `/pending — products missing price or MOQ\n` +
+    `/followups — suppliers with email but no follow-up sent\n` +
+    `/email <supplier> — draft + send a follow-up email\n` +
+    `/connectgmail — connect your Gmail (sends from your address)\n` +
+    `/done · /cancel — exit current step`,
     env, true);
 }
 
@@ -673,10 +727,9 @@ async function draftFollowUpEmail(ctx: DraftContext, env: Env): Promise<{ subjec
   return { subject: parsed.subject ?? '', body: parsed.body ?? '' };
 }
 
-// ── /pending ─────────────────────────────────────────────────────────────────
+// ── /pending — products missing price or MOQ (per spec) ─────────────────────
 
 async function cmdPending(chatId: number, buyer: { buyerId: string }, env: Env): Promise<void> {
-  // Resolve the buyer's currently-active show
   const pass = await env.DB.prepare(
     `SELECT show_name FROM sb_buyer_shows
        WHERE buyer_id = ? AND status IN ('active','grace')
@@ -684,7 +737,43 @@ async function cmdPending(chatId: number, buyer: { buyerId: string }, env: Env):
   ).bind(buyer.buyerId).first<{ show_name: string }>();
   if (!pass) { await send(chatId, `No active show found.`, env); return; }
 
-  // Suppliers with at least one contact email but NO sent email
+  const rows = await env.DB.prepare(
+    `SELECT p.id, p.name, p.price, p.moq, p.lead_time, c.name AS supplier
+       FROM sb_products p
+       JOIN sb_companies c ON c.id = p.company_id
+      WHERE p.buyer_id = ? AND p.show_name = ?
+        AND ((p.price IS NULL OR p.price = '') OR (p.moq IS NULL OR p.moq = ''))
+      ORDER BY p.created_at DESC
+      LIMIT 30`
+  ).bind(buyer.buyerId, pass.show_name).all<{ id: string; name: string; price: string | null; moq: string | null; lead_time: string | null; supplier: string }>();
+
+  if (!rows.results.length) {
+    await send(chatId, `🎉 *${pass.show_name}* — every product has price + MOQ recorded.`, env, true);
+    return;
+  }
+
+  const lines = rows.results.map(r => {
+    const missing: string[] = [];
+    if (!r.price) missing.push('price');
+    if (!r.moq)   missing.push('MOQ');
+    return `• *${r.name}* (${r.supplier}) — missing: ${missing.join(', ')}`;
+  }).join('\n');
+  await send(chatId,
+    `📋 *${rows.results.length} product${rows.results.length === 1 ? '' : 's'} missing details for ${pass.show_name}:*\n\n${lines}\n\n` +
+    `Send a voice note or text reply to a product photo to fill in price/MOQ/lead time.`,
+    env, true);
+}
+
+// ── /followups — suppliers with email but no follow-up sent yet ─────────────
+
+async function cmdFollowups(chatId: number, buyer: { buyerId: string }, env: Env): Promise<void> {
+  const pass = await env.DB.prepare(
+    `SELECT show_name FROM sb_buyer_shows
+       WHERE buyer_id = ? AND status IN ('active','grace')
+       ORDER BY created_at DESC LIMIT 1`
+  ).bind(buyer.buyerId).first<{ show_name: string }>();
+  if (!pass) { await send(chatId, `No active show found.`, env); return; }
+
   const rows = await env.DB.prepare(
     `SELECT c.id, c.name, MIN(co.email) AS email
        FROM sb_companies c
@@ -699,14 +788,103 @@ async function cmdPending(chatId: number, buyer: { buyerId: string }, env: Env):
   ).bind(buyer.buyerId, pass.show_name).all<{ id: string; name: string; email: string }>();
 
   if (!rows.results.length) {
-    await send(chatId, `🎉 No pending follow-ups for *${pass.show_name}* — every supplier with an email has been contacted.`, env, true);
+    await send(chatId, `🎉 No pending follow-ups for *${pass.show_name}*.`, env, true);
     return;
   }
-
   const lines = rows.results.map(r => `• *${r.name}* — ${r.email}`).join('\n');
   await send(chatId,
     `📬 *${rows.results.length} supplier${rows.results.length === 1 ? '' : 's'} pending follow-up:*\n\n${lines}\n\n` +
-    `Tap one with \`/email <name>\` to draft and send.`,
+    `Use \`/email <name>\` to draft and send.`,
+    env, true);
+}
+
+// ── /supplier — list captured suppliers + counts in active show ─────────────
+
+async function cmdSupplier(chatId: number, query: string, buyer: { buyerId: string }, env: Env): Promise<void> {
+  const pass = await env.DB.prepare(
+    `SELECT show_name, sheet_url FROM sb_buyer_shows
+       WHERE buyer_id = ? AND status IN ('active','grace')
+       ORDER BY created_at DESC LIMIT 1`
+  ).bind(buyer.buyerId).first<{ show_name: string; sheet_url: string }>();
+  if (!pass) { await send(chatId, `No active show found.`, env); return; }
+
+  const where = query
+    ? `c.buyer_id = ? AND c.show_name = ? AND lower(c.name) LIKE lower(?)`
+    : `c.buyer_id = ? AND c.show_name = ?`;
+  const binds: (string | number)[] = query
+    ? [buyer.buyerId, pass.show_name, `%${query}%`]
+    : [buyer.buyerId, pass.show_name];
+
+  const rows = await env.DB.prepare(
+    `SELECT c.id, c.name,
+            (SELECT COUNT(*) FROM sb_products p WHERE p.company_id = c.id) AS product_count,
+            (SELECT MIN(co.email) FROM sb_contacts co WHERE co.company_id = c.id) AS email
+       FROM sb_companies c
+      WHERE ${where}
+      ORDER BY c.created_at DESC
+      LIMIT 30`
+  ).bind(...binds).all<{ id: string; name: string; product_count: number; email: string | null }>();
+
+  if (!rows.results.length) {
+    await send(chatId, query
+      ? `No suppliers matching "${query}" in *${pass.show_name}*.`
+      : `No suppliers captured yet in *${pass.show_name}*. Send a card photo to start.`,
+      env, true);
+    return;
+  }
+
+  const lines = rows.results.map(r =>
+    `• *${r.name}* — ${r.product_count} product${r.product_count === 1 ? '' : 's'}` +
+    (r.email ? ` · ${r.email}` : '')
+  ).join('\n');
+  await send(chatId,
+    `🏢 *${rows.results.length} supplier${rows.results.length === 1 ? '' : 's'} in ${pass.show_name}:*\n\n${lines}\n\n` +
+    `📊 [Open Sheet](${pass.sheet_url})`,
+    env, true);
+}
+
+// ── /products — list products in active show, optional filter ────────────────
+
+async function cmdProducts(chatId: number, query: string, buyer: { buyerId: string }, env: Env): Promise<void> {
+  const pass = await env.DB.prepare(
+    `SELECT show_name FROM sb_buyer_shows
+       WHERE buyer_id = ? AND status IN ('active','grace')
+       ORDER BY created_at DESC LIMIT 1`
+  ).bind(buyer.buyerId).first<{ show_name: string }>();
+  if (!pass) { await send(chatId, `No active show found.`, env); return; }
+
+  const where = query
+    ? `p.buyer_id = ? AND p.show_name = ? AND (lower(p.name) LIKE lower(?) OR lower(c.name) LIKE lower(?))`
+    : `p.buyer_id = ? AND p.show_name = ?`;
+  const binds: string[] = query
+    ? [buyer.buyerId, pass.show_name, `%${query}%`, `%${query}%`]
+    : [buyer.buyerId, pass.show_name];
+
+  const rows = await env.DB.prepare(
+    `SELECT p.id, p.name, p.price, p.moq, p.lead_time, c.name AS supplier
+       FROM sb_products p
+       JOIN sb_companies c ON c.id = p.company_id
+      WHERE ${where}
+      ORDER BY p.created_at DESC
+      LIMIT 30`
+  ).bind(...binds).all<{ id: string; name: string; price: string | null; moq: string | null; lead_time: string | null; supplier: string }>();
+
+  if (!rows.results.length) {
+    await send(chatId, query
+      ? `No products matching "${query}" in *${pass.show_name}*.`
+      : `No products captured yet. Send a card → photo to start.`,
+      env, true);
+    return;
+  }
+
+  const lines = rows.results.map(r =>
+    `• *${r.name}* (${r.supplier})` +
+    (r.price     ? ` — ${r.price}`     : '') +
+    (r.moq       ? ` · MOQ ${r.moq}`   : '') +
+    (r.lead_time ? ` · ${r.lead_time}` : '')
+  ).join('\n');
+  await send(chatId,
+    `📦 *${rows.results.length} product${rows.results.length === 1 ? '' : 's'} in ${pass.show_name}:*\n\n${lines}`,
     env, true);
 }
 
@@ -871,20 +1049,20 @@ async function handleSupplierCard(
   ).bind(buyer.buyerId, pass.show_name, companyName, extracted.website || null, null).first<{ id: string }>())?.id;
   if (!companyId) { await send(chatId, `❌ Failed to save the supplier.`, env); return; }
 
-  // 3b. Per-supplier Drive folder named "{Company} — {Month YYYY}". Cached on sb_companies.
-  let supplierFolderId: string | undefined;
+  // 3b. Per-supplier folder set: "{Company} — {Month YYYY}" / Cards / Products
+  let folders: SupplierFolders | undefined;
   if (pass.drive_folder_id) {
     try {
-      supplierFolderId = await getOrCreateSupplierFolder(companyId, companyName, pass.drive_folder_id, env);
+      folders = await getOrCreateSupplierFolders(companyId, companyName, pass.drive_folder_id, env);
     } catch (e) {
       console.error('[sourcebot] supplier folder create failed:', e);
     }
   }
 
-  // 3c. Upload card to the per-supplier folder (or the show folder as fallback).
+  // 3c. Upload card front to Cards/ subfolder (or fall back to the show folder).
   let cardUrl: string | undefined;
   try {
-    const parent = supplierFolderId ?? pass.drive_folder_id;
+    const parent = folders?.cards ?? pass.drive_folder_id;
     if (parent) {
       const tok = await getServiceAccountToken(env);
       cardUrl = await uploadCardImage(rawBuffer, extracted.name || 'card', extracted.company, parent, tok);
@@ -946,16 +1124,411 @@ async function handleSupplierCard(
     (extracted.website  ? `🌐 *Website:* ${extracted.website}\n`   : '') +
     (extracted.linkedin ? `🔗 *LinkedIn:* ${extracted.linkedin}\n` : '') +
     (extracted.address  ? `📍 *Address:* ${extracted.address}\n`   : '') +
+    `\n_Reply to this message to fix any field._\n` +
     `\n📦 *Send product photos* to attach them to this supplier — or tap below.`;
 
-  await sendButtons(chatId,
+  const { messageId } = await sendButtons(chatId,
     preview,
     [
+      [{ text: '📷 Scan back of card',  callback_data: `card_back:${companyId}` },
+       { text: '👤 Person photo',       callback_data: `person_photo:${companyId}` }],
       [{ text: '💬 Add details',         callback_data: `add_voice:${companyId}` }],
       [{ text: '📷 New supplier card',  callback_data: 'new_supplier' }],
       [{ text: '✅ Done',                callback_data: 'done_capturing' }],
     ],
     env, true);
+
+  // Remember this message_id so reply-to-corrections can route back to this row.
+  if (messageId) {
+    await env.DB.prepare(`UPDATE sb_companies SET confirmation_message_id = ? WHERE id = ?`).bind(messageId, companyId).run();
+    await env.DB.prepare(
+      `UPDATE sb_contacts SET confirmation_message_id = ?
+        WHERE id = (SELECT id FROM sb_contacts WHERE company_id = ? ORDER BY created_at DESC LIMIT 1)`
+    ).bind(messageId, companyId).run();
+  }
+}
+
+// ── Reply-to-confirmation correction handler ───────────────────────────────
+
+// Returns true if we recognized the reply as a correction we could route.
+async function handleCorrectionReply(
+  chatId: number,
+  repliedToMsgId: number,
+  text: string,
+  buyer: { buyerId: string },
+  env: Env,
+): Promise<boolean> {
+  // Try contact (most common — user fixes a name/email/phone typo on the supplier card)
+  const contact = await env.DB.prepare(
+    `SELECT c.id, c.company_id, c.name, c.title, c.email, c.phone, c.linkedin_url, c.address,
+            co.show_name, co.sheet_row, co.name AS company_name
+       FROM sb_contacts c JOIN sb_companies co ON co.id = c.company_id
+      WHERE c.confirmation_message_id = ? AND c.buyer_id = ?`
+  ).bind(repliedToMsgId, buyer.buyerId).first<{
+    id: string; company_id: string; name: string | null; title: string | null;
+    email: string | null; phone: string | null; linkedin_url: string | null; address: string | null;
+    show_name: string; sheet_row: number | null; company_name: string;
+  }>();
+
+  if (contact) {
+    return applyContactCorrection(chatId, text, contact, buyer, env);
+  }
+
+  // Try product
+  const product = await env.DB.prepare(
+    `SELECT p.id, p.company_id, p.name, p.description, p.price, p.moq, p.lead_time, p.sheet_row,
+            co.show_name
+       FROM sb_products p JOIN sb_companies co ON co.id = p.company_id
+      WHERE p.confirmation_message_id = ? AND p.buyer_id = ?`
+  ).bind(repliedToMsgId, buyer.buyerId).first<{
+    id: string; company_id: string; name: string; description: string | null;
+    price: string | null; moq: string | null; lead_time: string | null; sheet_row: number | null;
+    show_name: string;
+  }>();
+
+  if (product) {
+    return applyProductCorrection(chatId, text, product, buyer, env);
+  }
+
+  return false;
+}
+
+interface ContactCorrectionRow {
+  id: string; company_id: string; name: string | null; title: string | null;
+  email: string | null; phone: string | null; linkedin_url: string | null; address: string | null;
+  show_name: string; sheet_row: number | null; company_name: string;
+}
+
+async function applyContactCorrection(
+  chatId: number,
+  text: string,
+  c: ContactCorrectionRow,
+  buyer: { buyerId: string },
+  env: Env,
+): Promise<boolean> {
+  const prompt =
+    `A buyer is correcting a previously-extracted business card. Original fields:\n` +
+    `name: ${c.name ?? ''}\ntitle: ${c.title ?? ''}\nemail: ${c.email ?? ''}\n` +
+    `phone: ${c.phone ?? ''}\nlinkedin: ${c.linkedin_url ?? ''}\naddress: ${c.address ?? ''}\n` +
+    `company: ${c.company_name}\n\n` +
+    `BUYER'S CORRECTION (free text):\n${text}\n\n` +
+    `Return ONLY a JSON object with the fields the buyer is updating. Use these exact keys: ` +
+    `name, title, email, phone, linkedin, address, company. Omit fields the buyer didn't mention.`;
+  let updates: Record<string, string> = {};
+  try {
+    const r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${env.GEMINI_API_KEY}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        contents: [{ parts: [{ text: prompt }] }],
+        generationConfig: { responseMimeType: 'application/json' },
+      }),
+    });
+    const d = await r.json() as { candidates?: Array<{ content?: { parts?: Array<{ text?: string }> } }> };
+    const raw = d.candidates?.[0]?.content?.parts?.[0]?.text ?? '{}';
+    updates = JSON.parse(raw.replace(/```json|```/g, '').trim()) as Record<string, string>;
+  } catch (e) {
+    console.error('[sourcebot] correction parse failed:', e);
+    await send(chatId, `⚠️ I couldn't understand that correction. Try: "name: Uriel Aziz" or "fix email to uriel@dazzle.com.hk".`, env);
+    return true;
+  }
+
+  // Apply to D1
+  if (Object.keys(updates).length === 0) {
+    await send(chatId, `🤔 I couldn't find a field to update in that reply. Try naming the field, e.g. "name: Uriel Aziz".`, env);
+    return true;
+  }
+
+  const setParts: string[] = [];
+  const binds: (string | null)[] = [];
+  if ('name'    in updates) { setParts.push('name = ?');         binds.push(updates.name    || null); }
+  if ('title'   in updates) { setParts.push('title = ?');        binds.push(updates.title   || null); }
+  if ('email'   in updates) { setParts.push('email = ?');        binds.push(updates.email   || null); }
+  if ('phone'   in updates) { setParts.push('phone = ?');        binds.push(updates.phone   || null); }
+  if ('linkedin' in updates){ setParts.push('linkedin_url = ?'); binds.push(updates.linkedin|| null); }
+  if ('address' in updates) { setParts.push('address = ?');      binds.push(updates.address || null); }
+  if (setParts.length) {
+    await env.DB.prepare(`UPDATE sb_contacts SET ${setParts.join(', ')} WHERE id = ?`).bind(...binds, c.id).run();
+  }
+
+  // Company name is on sb_companies, not sb_contacts
+  let companyChanged = false;
+  if ('company' in updates && updates.company && updates.company !== c.company_name) {
+    await env.DB.prepare(`UPDATE sb_companies SET name = ? WHERE id = ?`).bind(updates.company, c.company_id).run();
+    companyChanged = true;
+  }
+
+  // Push to the sheet (Suppliers tab columns C–I + B for company)
+  if (c.sheet_row) {
+    try {
+      const sheet = await env.DB.prepare(`SELECT sheet_id FROM sb_buyer_shows WHERE buyer_id = ? AND show_name = ?`).bind(buyer.buyerId, c.show_name).first<{ sheet_id: string }>();
+      if (sheet?.sheet_id) {
+        const tok = await getServiceAccountToken(env);
+        // Re-fetch the corrected contact + company
+        const fresh = await env.DB.prepare(
+          `SELECT c.name, c.title, c.email, c.phone, c.linkedin_url, c.address, co.name AS company_name
+             FROM sb_contacts c JOIN sb_companies co ON co.id = c.company_id WHERE c.id = ?`
+        ).bind(c.id).first<{ name: string | null; title: string | null; email: string | null; phone: string | null; linkedin_url: string | null; address: string | null; company_name: string }>();
+        if (fresh) {
+          // B=Company, C=Name, D=Title, E=Email, F=Phone, I=LinkedIn (and address goes nowhere on the supplier row currently)
+          await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${sheet.sheet_id}/values/B${c.sheet_row}:I${c.sheet_row}?valueInputOption=USER_ENTERED`, {
+            method: 'PUT',
+            headers: { Authorization: `Bearer ${tok}`, 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              values: [[
+                fresh.company_name,
+                fresh.name ?? '',
+                fresh.title ?? '',
+                fresh.email ?? '',
+                fresh.phone ?? '',
+                '', // G phone country
+                '', // H website unchanged
+                fresh.linkedin_url ?? '',
+              ]],
+            }),
+          });
+        }
+      }
+    } catch (e) { console.error('[sourcebot] correction sheet update failed:', e); }
+  }
+
+  const updatedFields = Object.keys(updates).filter(k => updates[k]);
+  await send(chatId, `✅ Updated: ${updatedFields.join(', ')}${companyChanged ? ' (company name changed)' : ''}.`, env);
+  return true;
+}
+
+interface ProductCorrectionRow {
+  id: string; company_id: string; name: string; description: string | null;
+  price: string | null; moq: string | null; lead_time: string | null; sheet_row: number | null;
+  show_name: string;
+}
+
+async function applyProductCorrection(
+  chatId: number,
+  text: string,
+  p: ProductCorrectionRow,
+  buyer: { buyerId: string },
+  env: Env,
+): Promise<boolean> {
+  const prompt =
+    `A buyer is correcting a previously-saved product. Original fields:\n` +
+    `name: ${p.name}\nprice: ${p.price ?? ''}\nmoq: ${p.moq ?? ''}\nlead_time: ${p.lead_time ?? ''}\n` +
+    `description: ${p.description ?? ''}\n\n` +
+    `BUYER'S CORRECTION:\n${text}\n\n` +
+    `Return ONLY JSON with the fields being updated. Keys: name, price (normalized e.g. "$5.20"), ` +
+    `moq, lead_time, description. Omit fields not mentioned.`;
+  let updates: Record<string, string> = {};
+  try {
+    const r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${env.GEMINI_API_KEY}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        contents: [{ parts: [{ text: prompt }] }],
+        generationConfig: { responseMimeType: 'application/json' },
+      }),
+    });
+    const d = await r.json() as { candidates?: Array<{ content?: { parts?: Array<{ text?: string }> } }> };
+    const raw = d.candidates?.[0]?.content?.parts?.[0]?.text ?? '{}';
+    updates = JSON.parse(raw.replace(/```json|```/g, '').trim()) as Record<string, string>;
+  } catch (e) {
+    console.error('[sourcebot] product correction parse failed:', e);
+    await send(chatId, `⚠️ Couldn't parse that correction.`, env);
+    return true;
+  }
+
+  if (Object.keys(updates).length === 0) {
+    await send(chatId, `🤔 No field to update in that reply.`, env);
+    return true;
+  }
+
+  const setParts: string[] = [];
+  const binds: (string | null)[] = [];
+  if ('name' in updates)        { setParts.push('name = ?');        binds.push(updates.name        || null); }
+  if ('price' in updates)       { setParts.push('price = ?');       binds.push(updates.price       || null); }
+  if ('moq' in updates)         { setParts.push('moq = ?');         binds.push(updates.moq         || null); }
+  if ('lead_time' in updates)   { setParts.push('lead_time = ?');   binds.push(updates.lead_time   || null); }
+  if ('description' in updates) { setParts.push('description = ?'); binds.push(updates.description || null); }
+  if (setParts.length) {
+    await env.DB.prepare(`UPDATE sb_products SET ${setParts.join(', ')} WHERE id = ?`).bind(...binds, p.id).run();
+  }
+
+  // Push to Products tab row
+  if (p.sheet_row) {
+    try {
+      const sheet = await env.DB.prepare(`SELECT sheet_id FROM sb_buyer_shows WHERE buyer_id = ? AND show_name = ?`).bind(buyer.buyerId, p.show_name).first<{ sheet_id: string }>();
+      if (sheet?.sheet_id) {
+        const tok = await getServiceAccountToken(env);
+        const fresh = await env.DB.prepare(
+          `SELECT name, description, price, moq, lead_time FROM sb_products WHERE id = ?`
+        ).bind(p.id).first<{ name: string; description: string | null; price: string | null; moq: string | null; lead_time: string | null }>();
+        if (fresh) {
+          // Update C (name) and E:K (description, price, moq, lead time, tone, notes, last updated)
+          await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${sheet.sheet_id}/values/Products!C${p.sheet_row}?valueInputOption=USER_ENTERED`, {
+            method: 'PUT',
+            headers: { Authorization: `Bearer ${tok}`, 'Content-Type': 'application/json' },
+            body: JSON.stringify({ values: [[fresh.name]] }),
+          });
+          await updateProductRow(sheet.sheet_id, p.sheet_row, {
+            description: fresh.description ?? '',
+            price:       fresh.price       ?? '',
+            moq:         fresh.moq         ?? '',
+            leadTime:    fresh.lead_time   ?? '',
+            tone:        '',
+            notes:       '',
+          }, tok);
+        }
+      }
+    } catch (e) { console.error('[sourcebot] product correction sheet update failed:', e); }
+  }
+
+  const updatedFields = Object.keys(updates).filter(k => updates[k]);
+  await send(chatId, `✅ Updated *${p.name}*: ${updatedFields.join(', ')}.`, env, true);
+  return true;
+}
+
+// ── Card back / person photo flows ──────────────────────────────────────────
+
+async function handleCardBack(
+  chatId: number,
+  photos: TgPhotoSize[],
+  session: SourceBotSession,
+  buyer: { buyerId: string },
+  env: Env,
+): Promise<void> {
+  if (!session.activeCompanyId) {
+    await setSession(chatId, { step: 'idle' }, env);
+    await send(chatId, `Lost the supplier context. Rescan the front first.`, env);
+    return;
+  }
+
+  const photo = photos.reduce((a, b) => (b.file_size ?? 0) > (a.file_size ?? 0) ? b : a);
+
+  // Download
+  const fileRes = await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN_SOURCE}/getFile?file_id=${photo.file_id}`);
+  const fileData = await fileRes.json() as { result?: { file_path?: string } };
+  const filePath = fileData.result?.file_path;
+  if (!filePath) { await send(chatId, `❌ Couldn't fetch the photo.`, env); return; }
+  const imgRes = await fetch(`https://api.telegram.org/file/bot${env.TELEGRAM_BOT_TOKEN_SOURCE}/${filePath}`);
+  const rawBuffer = await imgRes.arrayBuffer();
+
+  const company = await env.DB.prepare(
+    `SELECT show_name, sheet_row, name FROM sb_companies WHERE id = ?`
+  ).bind(session.activeCompanyId).first<{ show_name: string; sheet_row: number | null; name: string }>();
+  if (!company) { await setSession(chatId, { step: 'idle' }, env); return; }
+
+  // Upload to Cards/ subfolder
+  let cardBackUrl: string | undefined;
+  try {
+    const folders = await getSupplierFoldersById(session.activeCompanyId, env, company.show_name, buyer);
+    if (folders) {
+      const tok = await getServiceAccountToken(env);
+      cardBackUrl = await uploadCardImage(rawBuffer, `${company.name}_back`, '', folders.cards, tok);
+    }
+  } catch (e) { console.error('[sourcebot] card back upload failed:', e); }
+
+  // Save to D1 (latest contact for this company)
+  if (cardBackUrl) {
+    await env.DB.prepare(
+      `UPDATE sb_contacts SET card_back_url = ?
+        WHERE id = (SELECT id FROM sb_contacts WHERE company_id = ? ORDER BY created_at DESC LIMIT 1)`
+    ).bind(cardBackUrl, session.activeCompanyId).run();
+  }
+
+  // Sheet column O
+  if (cardBackUrl && company.sheet_row) {
+    try {
+      const sheet = await env.DB.prepare(`SELECT sheet_id FROM sb_buyer_shows WHERE buyer_id = ? AND show_name = ?`).bind(buyer.buyerId, company.show_name).first<{ sheet_id: string }>();
+      if (sheet?.sheet_id) {
+        const tok = await getServiceAccountToken(env);
+        await updateSupplierCardBack(sheet.sheet_id, company.sheet_row, cardBackUrl, tok);
+      }
+    } catch (e) { console.error('[sourcebot] sheet card back update failed:', e); }
+  }
+
+  // Resume product-photo mode
+  await setSession(chatId, { step: 'awaiting_product_photo', activeCompanyId: session.activeCompanyId }, env);
+  await send(chatId, `✅ Card back saved.\n\n📦 Send product photos, or tap below.`, env);
+}
+
+async function handlePersonPhoto(
+  chatId: number,
+  photos: TgPhotoSize[],
+  session: SourceBotSession,
+  buyer: { buyerId: string },
+  env: Env,
+): Promise<void> {
+  if (!session.activeCompanyId) {
+    await setSession(chatId, { step: 'idle' }, env);
+    await send(chatId, `Lost the supplier context. Rescan the front first.`, env);
+    return;
+  }
+
+  const photo = photos.reduce((a, b) => (b.file_size ?? 0) > (a.file_size ?? 0) ? b : a);
+
+  // Download
+  const fileRes = await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN_SOURCE}/getFile?file_id=${photo.file_id}`);
+  const fileData = await fileRes.json() as { result?: { file_path?: string } };
+  const filePath = fileData.result?.file_path;
+  if (!filePath) { await send(chatId, `❌ Couldn't fetch the photo.`, env); return; }
+  const imgRes = await fetch(`https://api.telegram.org/file/bot${env.TELEGRAM_BOT_TOKEN_SOURCE}/${filePath}`);
+  const rawBuffer = await imgRes.arrayBuffer();
+  const base64 = arrayBufferToBase64(rawBuffer);
+
+  const company = await env.DB.prepare(
+    `SELECT show_name, sheet_row, name FROM sb_companies WHERE id = ?`
+  ).bind(session.activeCompanyId).first<{ show_name: string; sheet_row: number | null; name: string }>();
+  if (!company) { await setSession(chatId, { step: 'idle' }, env); return; }
+
+  // Best-effort: ask Gemini for a one-liner description
+  let personDescription = '';
+  try {
+    const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${env.GEMINI_API_KEY}`;
+    const r = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        contents: [{ parts: [
+          { text: 'Describe this person in ONE short line (e.g. "Tall man in blue suit, glasses, holding a sample"). Return only the description, no preface.' },
+          { inline_data: { mime_type: filePath.endsWith('.png') ? 'image/png' : 'image/jpeg', data: base64 } },
+        ] }],
+      }),
+    });
+    const d = await r.json() as { candidates?: Array<{ content?: { parts?: Array<{ text?: string }> } }> };
+    personDescription = (d.candidates?.[0]?.content?.parts?.[0]?.text ?? '').trim().split('\n')[0] ?? '';
+  } catch (e) { console.error('[sourcebot] person description failed:', e); }
+
+  // Upload to Cards/ subfolder
+  let personUrl: string | undefined;
+  try {
+    const folders = await getSupplierFoldersById(session.activeCompanyId, env, company.show_name, buyer);
+    if (folders) {
+      const tok = await getServiceAccountToken(env);
+      personUrl = await uploadCardImage(rawBuffer, `${company.name}_person`, '', folders.cards, tok);
+    }
+  } catch (e) { console.error('[sourcebot] person upload failed:', e); }
+
+  if (personUrl) {
+    await env.DB.prepare(
+      `UPDATE sb_contacts SET person_photo_url = ?, person_description = ?
+        WHERE id = (SELECT id FROM sb_contacts WHERE company_id = ? ORDER BY created_at DESC LIMIT 1)`
+    ).bind(personUrl, personDescription || null, session.activeCompanyId).run();
+
+    if (company.sheet_row) {
+      try {
+        const sheet = await env.DB.prepare(`SELECT sheet_id FROM sb_buyer_shows WHERE buyer_id = ? AND show_name = ?`).bind(buyer.buyerId, company.show_name).first<{ sheet_id: string }>();
+        if (sheet?.sheet_id) {
+          const tok = await getServiceAccountToken(env);
+          await updateSupplierPerson(sheet.sheet_id, company.sheet_row, { personPhotoUrl: personUrl, personDescription }, tok);
+        }
+      } catch (e) { console.error('[sourcebot] sheet person update failed:', e); }
+    }
+  }
+
+  // Resume product-photo mode
+  await setSession(chatId, { step: 'awaiting_product_photo', activeCompanyId: session.activeCompanyId }, env);
+  await send(chatId,
+    `✅ Person photo saved.` + (personDescription ? `\n_${personDescription}_` : '') +
+    `\n\n📦 Send product photos, or tap below.`, env, true);
 }
 
 // ── Product capture flow ─────────────────────────────────────────────────────
@@ -1011,13 +1584,13 @@ async function handleProductPhoto(
   ).bind(session.activeCompanyId).first<{ show_name: string }>();
   if (!company) { await send(chatId, `Lost track of supplier. Please rescan the card.`, env); return; }
 
-  // Upload product photo to the per-supplier Drive folder (created at supplier capture).
+  // Upload product photo to the supplier's Products/ subfolder.
   let imageUrl: string | undefined;
   try {
-    const folderId = await getOrCreateSupplierFolderById(session.activeCompanyId, env, company.show_name, buyer);
-    if (folderId) {
+    const folders = await getSupplierFoldersById(session.activeCompanyId, env, company.show_name, buyer);
+    if (folders) {
       const token = await getServiceAccountToken(env);
-      imageUrl = await uploadCardImage(rawBuffer, productName, '', folderId, token);
+      imageUrl = await uploadCardImage(rawBuffer, productName, '', folders.products, token);
     }
   } catch (e) {
     console.error('[sourcebot] product drive upload failed:', e);
@@ -1072,11 +1645,15 @@ async function handleProductPhoto(
     `✅ *${productName}*` +
     (productDesc ? `\n_${productDesc}_` : '') +
     `\n\n💬 *Reply* with price, MOQ, lead time, or notes — or send the next product photo. Tap /done to finish.`;
+  let messageId: number | null = null;
   try {
-    await sendPhotoForceReply(chatId, photo.file_id, caption, env, true);
+    ({ messageId } = await sendPhotoForceReply(chatId, photo.file_id, caption, env, true));
   } catch (e) {
     console.error('[sourcebot] sendPhotoForceReply failed, falling back to text:', e);
     await sendForceReply(chatId, caption, env, true);
+  }
+  if (messageId) {
+    await env.DB.prepare(`UPDATE sb_products SET confirmation_message_id = ? WHERE id = ?`).bind(messageId, product.id).run();
   }
 }
 
@@ -1398,48 +1975,76 @@ async function handleProductDetailsVoice(
   await sendProductDetailsConfirmation(chatId, session.activeProductId, extracted, transcript, env);
 }
 
-// Get-or-create the per-supplier folder named "{Company} — {Month YYYY}" inside the
-// buyer's show folder. Caches the id on sb_companies.cards_folder_id.
-async function getOrCreateSupplierFolder(
+interface SupplierFolders {
+  parent:   string;  // The "{Company} — {Month YYYY}" folder
+  cards:    string;  // Cards subfolder (front + back of business card, person photo)
+  products: string;  // Products subfolder (every product photo)
+}
+
+// Get-or-create the per-supplier folder named "{Company} — {Month YYYY}" inside
+// the buyer's show folder, plus its Cards/ and Products/ subfolders. Caches all
+// three ids on sb_companies. Spec layout: …/{Company}/Cards/ and …/{Company}/Products/
+async function getOrCreateSupplierFolders(
   companyId: string,
   companyName: string,
   showFolderId: string,
   env: Env,
-): Promise<string> {
+): Promise<SupplierFolders> {
   const row = await env.DB.prepare(
-    `SELECT cards_folder_id FROM sb_companies WHERE id = ?`
-  ).bind(companyId).first<{ cards_folder_id: string | null }>();
-  if (row?.cards_folder_id) return row.cards_folder_id;
+    `SELECT cards_folder_id, cards_subfolder_id, products_subfolder_id FROM sb_companies WHERE id = ?`
+  ).bind(companyId).first<{ cards_folder_id: string | null; cards_subfolder_id: string | null; products_subfolder_id: string | null }>();
 
-  const month = new Date().toLocaleString('en-US', { month: 'long', year: 'numeric' });
-  const folderName = `${companyName} — ${month}`;
+  let parent   = row?.cards_folder_id   ?? '';
+  let cards    = row?.cards_subfolder_id    ?? '';
+  let products = row?.products_subfolder_id ?? '';
+
   const tok = await getServiceAccountToken(env);
-  const folder = await createDriveFolder(folderName, showFolderId, tok);
+
+  if (!parent) {
+    const month = new Date().toLocaleString('en-US', { month: 'long', year: 'numeric' });
+    const folder = await createDriveFolder(`${companyName} — ${month}`, showFolderId, tok);
+    parent = folder.id;
+  }
+  if (!cards) {
+    const f = await createDriveFolder('Cards', parent, tok);
+    cards = f.id;
+  }
+  if (!products) {
+    const f = await createDriveFolder('Products', parent, tok);
+    products = f.id;
+  }
+
   await env.DB.prepare(
-    `UPDATE sb_companies SET cards_folder_id = ? WHERE id = ?`
-  ).bind(folder.id, companyId).run();
-  return folder.id;
+    `UPDATE sb_companies SET cards_folder_id = ?, cards_subfolder_id = ?, products_subfolder_id = ? WHERE id = ?`
+  ).bind(parent, cards, products, companyId).run();
+
+  return { parent, cards, products };
 }
 
-// Same, but resolves the show folder id from the company id (used by handleProductPhoto).
-async function getOrCreateSupplierFolderById(
+// Resolves the supplier's folder set by company id (used by handleProductPhoto and
+// the Card Back / Person Photo flows). Returns undefined if we can't resolve the
+// buyer's show folder.
+async function getSupplierFoldersById(
   companyId: string,
   env: Env,
   showName: string,
   buyer: { buyerId: string },
-): Promise<string | undefined> {
+): Promise<SupplierFolders | undefined> {
   const c = await env.DB.prepare(
-    `SELECT cards_folder_id, name FROM sb_companies WHERE id = ?`
-  ).bind(companyId).first<{ cards_folder_id: string | null; name: string }>();
-  if (c?.cards_folder_id) return c.cards_folder_id;
+    `SELECT name, cards_folder_id, cards_subfolder_id, products_subfolder_id FROM sb_companies WHERE id = ?`
+  ).bind(companyId).first<{ name: string; cards_folder_id: string | null; cards_subfolder_id: string | null; products_subfolder_id: string | null }>();
   if (!c?.name) return undefined;
+
+  if (c.cards_folder_id && c.cards_subfolder_id && c.products_subfolder_id) {
+    return { parent: c.cards_folder_id, cards: c.cards_subfolder_id, products: c.products_subfolder_id };
+  }
 
   const pass = await env.DB.prepare(
     `SELECT drive_folder_id FROM sb_buyer_shows WHERE buyer_id = ? AND show_name = ?`
   ).bind(buyer.buyerId, showName).first<{ drive_folder_id: string | null }>();
   if (!pass?.drive_folder_id) return undefined;
 
-  return getOrCreateSupplierFolder(companyId, c.name, pass.drive_folder_id, env);
+  return getOrCreateSupplierFolders(companyId, c.name, pass.drive_folder_id, env);
 }
 
 async function applyProductDetails(
@@ -1742,8 +2347,8 @@ async function sendForceReply(chatId: number, text: string, env: Env, markdown =
 
 // Send a photo back with a caption + force_reply UI, so the reply preview shows
 // the photo and the user knows exactly which item they're describing.
-async function sendPhotoForceReply(chatId: number, photoFileId: string, caption: string, env: Env, markdown = false): Promise<void> {
-  await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN_SOURCE}/sendPhoto`, {
+async function sendPhotoForceReply(chatId: number, photoFileId: string, caption: string, env: Env, markdown = false): Promise<{ messageId: number | null }> {
+  const r = await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN_SOURCE}/sendPhoto`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
@@ -1754,6 +2359,10 @@ async function sendPhotoForceReply(chatId: number, photoFileId: string, caption:
       reply_markup: { force_reply: true, input_field_placeholder: 'Type details or hold 🎤 for a voice note' },
     }),
   });
+  try {
+    const d = await r.json() as { result?: { message_id?: number } };
+    return { messageId: d.result?.message_id ?? null };
+  } catch { return { messageId: null }; }
 }
 
 async function sendButtons(
@@ -1762,8 +2371,8 @@ async function sendButtons(
   buttons: Array<Array<{ text: string; callback_data?: string; url?: string }>>,
   env: Env,
   markdown = false,
-): Promise<void> {
-  await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN_SOURCE}/sendMessage`, {
+): Promise<{ messageId: number | null }> {
+  const r = await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN_SOURCE}/sendMessage`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
@@ -1773,6 +2382,10 @@ async function sendButtons(
       reply_markup: { inline_keyboard: buttons },
     }),
   });
+  try {
+    const d = await r.json() as { result?: { message_id?: number } };
+    return { messageId: d.result?.message_id ?? null };
+  } catch { return { messageId: null }; }
 }
 
 async function getSession(chatId: number, env: Env): Promise<SourceBotSession> {

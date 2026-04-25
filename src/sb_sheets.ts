@@ -327,6 +327,34 @@ export function toSheetsImageUrl(driveUrl: string): string {
   return `https://drive.google.com/thumbnail?id=${m[1]}&sz=w800`;
 }
 
+// Card back photo → column O on the supplier row (Suppliers tab).
+export async function updateSupplierCardBack(
+  sheetId: string,
+  rowIndex: number,
+  cardBackUrl: string,
+  token: string,
+): Promise<void> {
+  await fetch(`${SHEETS_API}/${sheetId}/values/O${rowIndex}?valueInputOption=USER_ENTERED`, {
+    method: 'PUT',
+    headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ values: [[`=IMAGE("${toSheetsImageUrl(cardBackUrl)}")`]] }),
+  });
+}
+
+// Person photo + description → columns AB, AC on the supplier row (Suppliers tab).
+export async function updateSupplierPerson(
+  sheetId: string,
+  rowIndex: number,
+  args: { personPhotoUrl: string; personDescription: string },
+  token: string,
+): Promise<void> {
+  await fetch(`${SHEETS_API}/${sheetId}/values/AB${rowIndex}:AC${rowIndex}?valueInputOption=USER_ENTERED`, {
+    method: 'PUT',
+    headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ values: [[`=IMAGE("${toSheetsImageUrl(args.personPhotoUrl)}")`, args.personDescription]] }),
+  });
+}
+
 // Update the Email Sent / Sent At / Subject / Status columns (V, W, X, Y).
 export async function updateSupplierEmailStatus(
   sheetId: string,
