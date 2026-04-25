@@ -7,3 +7,10 @@
 # Build outputs
 dist/
 .wrangler/
+
+# Dependencies
+node_modules/
+
+# OS / editor noise
+.DS_Store
+*.log
