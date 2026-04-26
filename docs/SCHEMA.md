@@ -293,6 +293,7 @@ Same dedup as SourceBot but for DemoBot's webhook.
 | 021 | `021_whatsapp.sql` | ───────────────────────────────────────────────────────────────────────────── |
 | 022 | `022_demobot_self_serve.sql` | DemoBot self-serve onboarding: a chat starts /start with no token, we |
 | 023 | `023_demobot_whatsapp.sql` | DemoBot on WhatsApp — extends wa_user_mappings.bot_role CHECK to include |
+| 024 | `024_gmail_buyer_id.sql` | ───────────────────────────────────────────────────────────────────────────── |
 <!-- AUTO:MIGRATIONS:END -->
 
 ### Hand-curated highlights

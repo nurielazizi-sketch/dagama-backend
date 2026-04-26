@@ -44,6 +44,10 @@ Source: [src/index.ts](../src/index.ts).
 | ANY | `/api/leads` | `handleListLeads` |
 | ANY | `/api/suppliers` | `handleListSuppliers` |
 | GET | `/api/me/role` | `handleGetMyRole` |
+| ANY | `/api/blast` | `handleBlast` |
+| ANY | `/api/search` | `handleSearch` |
+| ANY | `/api/compare` | `handleCompare` |
+| ANY | `/api/show/pdf` | `handleShowPdf` |
 | POST | `/api/demobot/webhook` | `handleDemoBotWebhook` |
 | POST | `/api/demobot/setup` | `handleDemoBotSetupWebhook` |
 | ANY | `/api/demobot/admin/freelancer-token` | `handleIssueFreelancerToken` |
