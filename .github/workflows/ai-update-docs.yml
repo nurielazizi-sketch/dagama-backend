@@ -47,14 +47,6 @@ jobs:
         with:
           node-version: '20'
 
-      - name: Skip if no API key
-        if: ${{ env.ANTHROPIC_API_KEY == '' }}
-        run: |
-          echo "::warning::ANTHROPIC_API_KEY not set — add it under repo Settings → Secrets to enable AI doc updates."
-          exit 0
-        env:
-          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-
       - name: Run AI doc updater
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}

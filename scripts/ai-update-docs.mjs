@@ -52,7 +52,15 @@ function sh(cmd) {
 }
 
 const log = sh(`git log --since="${SINCE}" --pretty=format:"%h %s%n%b" --no-merges`);
-let diff = sh(`git diff --no-color "@{${SINCE}}" -- src/ migrations/ wrangler.toml`).slice(0, MAX_DIFF_CHARS);
+
+// Find the SHA of the most-recent commit *before* the SINCE cutoff. Diffing
+// against that gives us "everything that happened during the SINCE window".
+// We can't use `@{1 day ago}` reflog syntax — CI runners have empty reflogs.
+const baseSha = sh(`git rev-list -1 --before="${SINCE}" HEAD`).trim();
+let diff = '';
+if (baseSha) {
+  diff = sh(`git diff --no-color ${baseSha}..HEAD -- src/ migrations/ wrangler.toml`).slice(0, MAX_DIFF_CHARS);
+}
 const truncated = diff.length === MAX_DIFF_CHARS;
 
 if (!log && !diff) {
