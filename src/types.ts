@@ -7,6 +7,16 @@ export interface Env {
   TELEGRAM_BOT_USERNAME_BOOTH?: string;             // for deep links (defaults if absent)
   TELEGRAM_BOT_USERNAME_SOURCE?: string;
   WHATSAPP_BOT_NUMBER?: string;                     // e.g. "+1415..." — empty = "coming soon"
+  // ── WhatsApp Cloud API (Meta) ─────────────────────────────────────────────
+  // All five must be set together for the channel to activate. If any are
+  // missing, /api/whatsapp/webhook returns 503 and outbound sends are no-ops.
+  // See src/whatsapp.ts: isWhatsAppEnabled().
+  WHATSAPP_VERIFY_TOKEN?: string;                   // arbitrary string we pick; echoed during webhook subscribe
+  WHATSAPP_APP_SECRET?: string;                     // Meta App Secret — used to verify X-Hub-Signature-256
+  WHATSAPP_ACCESS_TOKEN?: string;                   // System User access token (long-lived) for graph.facebook.com
+  WHATSAPP_PHONE_NUMBER_ID?: string;                // graph API path segment — /v.../{phone-number-id}/messages
+  WHATSAPP_BUSINESS_ACCOUNT_ID?: string;            // WABA ID — used for template management + status callbacks
+  WHATSAPP_GRAPH_VERSION?: string;                  // optional override; defaults to 'v21.0'
   GEMINI_API_KEY: string;
   GCV_API_KEY: string;
   WEBHOOK_SECRET: string;

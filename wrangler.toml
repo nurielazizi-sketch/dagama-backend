@@ -85,3 +85,11 @@ binding = "CARD_QUEUE"
 # - GMAIL_CLIENT_ID                       (GCP OAuth 2.0 Client → Web Application)
 # - GMAIL_CLIENT_SECRET                   (GCP OAuth 2.0 Client)
 # - GOOGLE_SERVICE_ACCOUNT_TOKEN          (pre-refreshed OAuth2 Bearer token for Drive/Sheets)
+# ── WhatsApp Cloud API (Meta) ──────────────────────────────────────────────────
+# All five required to activate the channel. When unset, the webhook returns 503
+# and outbound sends are no-ops (see src/whatsapp.ts isWhatsAppEnabled).
+# - WHATSAPP_VERIFY_TOKEN                 (arbitrary string we pick — echoed during webhook subscribe)
+# - WHATSAPP_APP_SECRET                   (Meta App Secret — verifies X-Hub-Signature-256)
+# - WHATSAPP_ACCESS_TOKEN                 (System User long-lived token for graph.facebook.com)
+# - WHATSAPP_PHONE_NUMBER_ID              (Graph API path segment for outbound /messages)
+# - WHATSAPP_BUSINESS_ACCOUNT_ID          (WABA ID — template management + status callbacks)

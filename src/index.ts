@@ -10,6 +10,7 @@ import { handleShowPassCron } from './telegram';
 import { handleOnboard, handleOnboardingStatus } from './onboarding';
 import { handleGoogleAuthStart, handleGoogleAuthCallback } from './google_auth';
 import { handleSourceBotWebhook, handleSourceBotSetupWebhook, handleSourceBotShowPassCron } from './sourcebot';
+import { handleWhatsAppWebhook, isWhatsAppEnabled } from './whatsapp';
 import { processFunnelQueue } from './funnel';
 import type { Env } from './types';
 
@@ -79,6 +80,11 @@ export default {
     if (path === '/api/sourcebot/webhook')   return handleSourceBotWebhook(request, env);
     if (path === '/api/sourcebot/setup')     return addCors(await handleSourceBotSetupWebhook(request, env));
 
+    // ── WhatsApp Cloud API (Meta) ─────────────────────────────────────────────
+    // GET = subscribe-handshake (hub.challenge echo). POST = inbound events.
+    // Returns 503 until all WHATSAPP_* secrets are set (see isWhatsAppEnabled).
+    if (path === '/api/whatsapp/webhook')    return handleWhatsAppWebhook(request, env);
+
     // Internal R2 pass-through — used so CF image transforms can fetch objects
     // from our private bucket via a URL on this worker's zone.
     if (path.startsWith('/_r2/')) {
@@ -140,6 +146,10 @@ async function handleHealth(env: Env): Promise<Response> {
   checks.sourcebot_token = { ok: !!env.TELEGRAM_BOT_TOKEN_SOURCE };
   checks.gemini = { ok: !!env.GEMINI_API_KEY };
   checks.gcv    = { ok: !!env.GCV_API_KEY };
+  // WhatsApp is optional until Meta approval — report as informational only.
+  // (Not factored into overall ok: missing secrets are expected pre-approval.)
+  const waEnabled = isWhatsAppEnabled(env);
+  checks.whatsapp = { ok: true, detail: waEnabled ? 'enabled' : 'disabled (secrets unset)' };
 
   const overall = Object.values(checks).every(c => c.ok);
   return new Response(JSON.stringify({
