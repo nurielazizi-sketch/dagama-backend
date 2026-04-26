@@ -15,6 +15,7 @@ import {
   updateSupplierEmailStatus,
 } from './sb_sheets';
 import { sendGmailEmailForBuyer, getGmailTokenForBuyer, getValidAccessTokenForBuyer } from './gmail';
+import { generateSupplierPdf, generateShowPdf } from './pdf';
 import { scheduleFunnelOnFirstScan, trackEvent } from './funnel';
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1192,6 +1193,174 @@ ${productHtml}
 <p style="margin:0 0 16px;">${esc(p.ask)}</p>
 <p style="margin:24px 0 0;">${esc(p.closing)}</p>
 </body></html>`;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Phase 6: Find / Compare / PDF export.
+// Channel-agnostic — every channel feeds in (buyerId, query) and gets back
+// structured results. PDF generation reuses pdf.ts which is already bot-
+// agnostic (keyed by companyId or buyerId+showName).
+// ─────────────────────────────────────────────────────────────────────────────
+
+export interface FindResult {
+  type:        'company' | 'contact' | 'product' | 'voice';
+  companyId:   string;
+  companyName: string;
+  context:     string;
+}
+
+// Mirror of cmdFind (sourcebot.ts:631) UNION query — searches companies,
+// contacts, products, and voice notes by LIKE %query% across the buyer's data.
+export async function findAcrossSupplierData(buyerId: string, query: string, env: Env): Promise<FindResult[]> {
+  const trimmed = query.trim();
+  if (!trimmed) return [];
+  const like = `%${trimmed}%`;
+
+  const rows = await env.DB.prepare(
+    `SELECT type, company_id, company_name, context FROM (
+       SELECT 'company' AS type, c.id AS company_id, c.name AS company_name, '' AS context
+         FROM sb_companies c
+         WHERE c.buyer_id = ? AND c.name LIKE ?
+       UNION ALL
+       SELECT 'contact', co.company_id, c.name, COALESCE(co.name,'') || (CASE WHEN co.email IS NOT NULL THEN ' · ' || co.email ELSE '' END)
+         FROM sb_contacts co JOIN sb_companies c ON c.id = co.company_id
+         WHERE co.buyer_id = ?
+           AND (co.name LIKE ? OR co.email LIKE ? OR co.phone LIKE ?)
+       UNION ALL
+       SELECT 'product', p.company_id, c.name, p.name || (CASE WHEN p.price IS NOT NULL THEN ' · ' || p.price ELSE '' END)
+         FROM sb_products p JOIN sb_companies c ON c.id = p.company_id
+         WHERE p.buyer_id = ? AND p.name LIKE ?
+       UNION ALL
+       SELECT 'voice', v.company_id, c.name, substr(v.transcript, 1, 120)
+         FROM sb_voice_notes v JOIN sb_companies c ON c.id = v.company_id
+         WHERE v.buyer_id = ? AND v.transcript LIKE ?
+     )
+     LIMIT 25`
+  ).bind(
+    buyerId, like,
+    buyerId, like, like, like,
+    buyerId, like,
+    buyerId, like,
+  ).all<{ type: string; company_id: string; company_name: string; context: string }>();
+
+  return rows.results.map(r => ({
+    type:        r.type as FindResult['type'],
+    companyId:   r.company_id,
+    companyName: r.company_name,
+    context:     r.context ?? '',
+  }));
+}
+
+export interface CompareResult {
+  ok:        boolean;
+  status:    'success' | 'no_matches' | 'single_match';
+  matches:   Array<{ product: string; supplier: string; price: string; moq: string; leadTime: string; notes: string; website: string }>;
+  analysis?: string;
+}
+
+// Mirror of cmdCompare (sourcebot.ts:681) — pulls matching products + asks
+// Gemini for a concise side-by-side comparison.
+export async function compareProducts(buyerId: string, query: string, env: Env): Promise<CompareResult> {
+  const trimmed = query.trim();
+  if (!trimmed) return { ok: false, status: 'no_matches', matches: [] };
+  const like = `%${trimmed}%`;
+
+  const rows = await env.DB.prepare(
+    `SELECT p.name AS product, p.price, p.moq, p.lead_time, p.notes, c.name AS supplier, c.website
+       FROM sb_products p JOIN sb_companies c ON c.id = p.company_id
+      WHERE p.buyer_id = ? AND p.name LIKE ?
+      ORDER BY p.created_at DESC
+      LIMIT 30`
+  ).bind(buyerId, like).all<{ product: string | null; price: string | null; moq: string | null; lead_time: string | null; notes: string | null; supplier: string; website: string | null }>();
+
+  const matches = rows.results.map(m => ({
+    product:  m.product   ?? '—',
+    supplier: m.supplier,
+    price:    m.price     ?? '',
+    moq:      m.moq       ?? '',
+    leadTime: m.lead_time ?? '',
+    notes:    m.notes     ?? '',
+    website:  m.website   ?? '',
+  }));
+
+  if (matches.length === 0) return { ok: false, status: 'no_matches', matches: [] };
+  if (matches.length === 1) return { ok: true,  status: 'single_match', matches };
+
+  const corpus = matches.map((m, i) =>
+    `${i + 1}. ${m.product} from ${m.supplier}${m.website ? ` (${m.website})` : ''}` +
+    `${m.price    ? ` · price ${m.price}`         : ''}` +
+    `${m.moq      ? ` · MOQ ${m.moq}`             : ''}` +
+    `${m.leadTime ? ` · lead time ${m.leadTime}`  : ''}` +
+    `${m.notes    ? ` · notes: ${m.notes.slice(0, 100)}` : ''}`,
+  ).join('\n');
+
+  const prompt =
+    `A buyer is comparing offers for "${trimmed}" from multiple suppliers they've captured at a trade show. ` +
+    `Here is what they have:\n\n${corpus}\n\n` +
+    `Write a concise comparison in plain text (no markdown headings). Cover: best price, ` +
+    `best MOQ, fastest lead time, and an overall recommendation with one sentence of reasoning. ` +
+    `If a supplier has missing data (TBD, blank), call that out. Keep it under 8 sentences.`;
+
+  let analysis = '';
+  try {
+    const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${env.GEMINI_API_KEY}`;
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ contents: [{ parts: [{ text: prompt }] }] }),
+    });
+    const data = await res.json() as { candidates?: Array<{ content?: { parts?: Array<{ text?: string }> } }>; error?: { message?: string } };
+    analysis = (data.candidates?.[0]?.content?.parts?.[0]?.text ?? '').trim();
+  } catch (e) {
+    console.error('[sourcebot_core] compare gemini failed', e);
+  }
+
+  return { ok: true, status: 'success', matches, analysis };
+}
+
+// PDF wrappers — pdf.ts is already channel-agnostic. We surface scoped variants
+// so callers don't need to know about the underlying generator + pass through
+// the buyer-ownership check.
+export interface PdfResult {
+  ok:       boolean;
+  status:   'success' | 'no_supplier' | 'no_show' | 'failed';
+  pdfUrl?:  string;
+  docUrl?:  string;
+  error?:   string;
+}
+
+export async function exportSupplierPdf(companyId: string, buyerId: string, env: Env): Promise<PdfResult> {
+  const company = await env.DB.prepare(
+    `SELECT id FROM sb_companies WHERE id = ? AND buyer_id = ? LIMIT 1`
+  ).bind(companyId, buyerId).first<{ id: string }>();
+  if (!company) return { ok: false, status: 'no_supplier' };
+  try {
+    const r = await generateSupplierPdf(companyId, env);
+    if (!r) return { ok: false, status: 'failed', error: 'pdf_generation_returned_null' };
+    return { ok: true, status: 'success', pdfUrl: r.pdfUrl, docUrl: r.docUrl };
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    console.error('[sourcebot_core] supplier pdf failed', msg);
+    return { ok: false, status: 'failed', error: msg };
+  }
+}
+
+export async function exportShowPdf(buyerId: string, env: Env): Promise<PdfResult> {
+  const pass = await env.DB.prepare(
+    `SELECT show_name FROM sb_buyer_shows
+       WHERE buyer_id = ? AND status IN ('active','grace')
+       ORDER BY created_at DESC LIMIT 1`
+  ).bind(buyerId).first<{ show_name: string }>();
+  if (!pass) return { ok: false, status: 'no_show' };
+  try {
+    const r = await generateShowPdf(buyerId, pass.show_name, env);
+    if (!r) return { ok: false, status: 'failed', error: 'pdf_generation_returned_null' };
+    return { ok: true, status: 'success', pdfUrl: r.pdfUrl, docUrl: r.docUrl };
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    console.error('[sourcebot_core] show pdf failed', msg);
+    return { ok: false, status: 'failed', error: msg };
+  }
 }
 
 // ── Resolve buyer helper (for callers that only have user_id) ────────────────

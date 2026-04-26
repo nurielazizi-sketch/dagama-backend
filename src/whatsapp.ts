@@ -14,6 +14,10 @@ import {
   draftSupplierEmail,
   sendSupplierEmail,
   blastSuppliers,
+  findAcrossSupplierData,
+  compareProducts,
+  exportSupplierPdf,
+  exportShowPdf,
   type EmailDraft,
 } from './sourcebot_core';
 
@@ -447,6 +451,82 @@ async function routeToSourceBot(msg: WaInboundMessage, mapping: WaMapping, env: 
         `Blast complete: ✅ ${result.sent} sent · ⚠️ ${result.failed} failed · ↪️ ${result.skipped} skipped (of ${result.total}).`,
         env,
       );
+      return;
+    }
+
+    if (text.toLowerCase().startsWith('/find')) {
+      const q = text.slice('/find'.length).trim();
+      if (!q) {
+        await sendWhatsAppText(mapping.phone, `Usage: */find led panel* — searches your suppliers, contacts, products, and voice notes.`, env);
+        return;
+      }
+      const results = await findAcrossSupplierData(mapping.buyer_id, q, env);
+      if (!results.length) {
+        await sendWhatsAppText(mapping.phone, `🔍 No matches for *${q}*.`, env);
+        return;
+      }
+      const icon = (t: string) => t === 'company' ? '🏢' : t === 'contact' ? '👤' : t === 'product' ? '📦' : '🎤';
+      const lines = results.map(r => `${icon(r.type)} *${r.companyName}*${r.context ? ` — ${r.context}` : ''}`).join('\n');
+      await sendWhatsAppText(mapping.phone, `🔍 *Results for "${q}":*\n\n${lines}`, env);
+      return;
+    }
+
+    if (text.toLowerCase().startsWith('/compare')) {
+      const q = text.slice('/compare'.length).trim();
+      if (!q) {
+        await sendWhatsAppText(mapping.phone, `Usage: */compare led panel* — finds matching products across your suppliers and ranks them.`, env);
+        return;
+      }
+      await sendWhatsAppText(mapping.phone, `🤖 Comparing matches for *${q}*…`, env);
+      const result = await compareProducts(mapping.buyer_id, q, env);
+      if (!result.ok || result.matches.length === 0) {
+        await sendWhatsAppText(mapping.phone, `🔍 No matching products for *${q}*. Capture more product photos and try again.`, env);
+        return;
+      }
+      if (result.status === 'single_match') {
+        const m = result.matches[0];
+        await sendWhatsAppText(
+          mapping.phone,
+          `Only one match — nothing to compare yet:\n\n📦 *${m.product}* from *${m.supplier}*` +
+          (m.price ? `\n💰 ${m.price}` : '') + (m.moq ? `\n📊 MOQ ${m.moq}` : '') + (m.leadTime ? `\n⏱ ${m.leadTime}` : ''),
+          env,
+        );
+        return;
+      }
+      const summary = result.matches.slice(0, 5).map((m, i) =>
+        `${i + 1}. ${m.product} — ${m.supplier}${m.price ? ` · ${m.price}` : ''}${m.moq ? ` · MOQ ${m.moq}` : ''}${m.leadTime ? ` · ${m.leadTime}` : ''}`,
+      ).join('\n');
+      await sendWhatsAppText(
+        mapping.phone,
+        `📊 *Comparison for "${q}"* (${result.matches.length} matches)\n\n${summary}` +
+        (result.analysis ? `\n\n${result.analysis}` : ''),
+        env,
+      );
+      return;
+    }
+
+    if (text.toLowerCase().startsWith('/pdf')) {
+      const q = text.slice('/pdf'.length).trim();
+      if (!q) {
+        await sendWhatsAppText(mapping.phone, `Usage: */pdf <supplier name>* — generates a one-pager PDF with photos + products + notes.`, env);
+        return;
+      }
+      const company = await env.DB.prepare(
+        `SELECT id, name FROM sb_companies WHERE buyer_id = ? AND lower(name) LIKE lower(?) ORDER BY created_at DESC LIMIT 1`
+      ).bind(mapping.buyer_id, `%${q}%`).first<{ id: string; name: string }>();
+      if (!company) { await sendWhatsAppText(mapping.phone, `No supplier matching *${q}*.`, env); return; }
+      await sendWhatsAppText(mapping.phone, `📄 Generating PDF for *${company.name}*…`, env);
+      const r = await exportSupplierPdf(company.id, mapping.buyer_id, env);
+      if (r.ok) await sendWhatsAppText(mapping.phone, `✅ *${company.name}* PDF:\n📄 ${r.pdfUrl}\n📝 ${r.docUrl}`, env);
+      else      await sendWhatsAppText(mapping.phone, `❌ Couldn't generate the PDF (${r.status}${r.error ? ': ' + r.error.slice(0, 200) : ''}).`, env);
+      return;
+    }
+
+    if (text.toLowerCase() === '/pdfshow') {
+      await sendWhatsAppText(mapping.phone, `📄 Generating show PDF…`, env);
+      const r = await exportShowPdf(mapping.buyer_id, env);
+      if (r.ok) await sendWhatsAppText(mapping.phone, `✅ Show PDF:\n📄 ${r.pdfUrl}\n📝 ${r.docUrl}`, env);
+      else      await sendWhatsAppText(mapping.phone, `❌ Couldn't generate the show PDF (${r.status}${r.error ? ': ' + r.error.slice(0, 200) : ''}).`, env);
       return;
     }
   }

@@ -14,6 +14,10 @@ import {
   draftSupplierEmail,
   sendSupplierEmail,
   blastSuppliers,
+  findAcrossSupplierData,
+  compareProducts,
+  exportSupplierPdf,
+  exportShowPdf,
 } from './sourcebot_core';
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -559,6 +563,81 @@ export async function handleBlast(request: Request, env: Env): Promise<Response>
   if (!buyer) return jsonResponse({ error: 'SourceBot account required' }, 403);
 
   const result = await blastSuppliers(buyer.buyerId, env);
+  return jsonResponse(result);
+}
+
+// ── GET /api/search?q=... ────────────────────────────────────────────────────
+// Cross-table search over the buyer's data (companies + contacts + products +
+// voice notes). LIKE %q% matching with table-priority ranking.
+
+export async function handleSearch(request: Request, env: Env): Promise<Response> {
+  if (request.method !== 'GET') return new Response('Method not allowed', { status: 405 });
+
+  const auth = await requireAuth(request, env);
+  if (auth instanceof Response) return auth;
+
+  const buyer = await resolveBuyerForUser(auth.userId, env);
+  if (!buyer) return jsonResponse({ results: [], role: 'boothbot' });
+
+  const url = new URL(request.url);
+  const q = (url.searchParams.get('q') ?? '').trim();
+  if (!q) return jsonResponse({ results: [], q });
+
+  const results = await findAcrossSupplierData(buyer.buyerId, q, env);
+  return jsonResponse({ q, results });
+}
+
+// ── POST /api/compare  body { q } ────────────────────────────────────────────
+// Returns { matches[], analysis } — the dashboard renders this as a side-by-
+// side comparison plus the Gemini summary.
+
+export async function handleCompare(request: Request, env: Env): Promise<Response> {
+  if (request.method !== 'POST') return new Response('Method not allowed', { status: 405 });
+
+  const auth = await requireAuth(request, env);
+  if (auth instanceof Response) return auth;
+
+  const buyer = await resolveBuyerForUser(auth.userId, env);
+  if (!buyer) return jsonResponse({ error: 'SourceBot account required' }, 403);
+
+  let body: { q?: string };
+  try { body = await request.json() as typeof body; }
+  catch { return jsonResponse({ error: 'Invalid JSON' }, 400); }
+
+  const q = (body.q ?? '').trim();
+  if (!q) return jsonResponse({ error: 'q is required' }, 400);
+
+  const result = await compareProducts(buyer.buyerId, q, env);
+  return jsonResponse({ q, ...result });
+}
+
+// ── POST /api/suppliers/:id/pdf  +  POST /api/show/pdf ───────────────────────
+
+export async function handleSupplierPdf(request: Request, env: Env, companyId: string): Promise<Response> {
+  if (request.method !== 'POST') return new Response('Method not allowed', { status: 405 });
+
+  const auth = await requireAuth(request, env);
+  if (auth instanceof Response) return auth;
+
+  const buyer = await resolveBuyerForUser(auth.userId, env);
+  if (!buyer) return jsonResponse({ error: 'SourceBot account required' }, 403);
+
+  const result = await exportSupplierPdf(companyId, buyer.buyerId, env);
+  if (!result.ok) return jsonResponse({ error: result.error ?? result.status, status: result.status }, result.status === 'no_supplier' ? 404 : 502);
+  return jsonResponse(result);
+}
+
+export async function handleShowPdf(request: Request, env: Env): Promise<Response> {
+  if (request.method !== 'POST') return new Response('Method not allowed', { status: 405 });
+
+  const auth = await requireAuth(request, env);
+  if (auth instanceof Response) return auth;
+
+  const buyer = await resolveBuyerForUser(auth.userId, env);
+  if (!buyer) return jsonResponse({ error: 'SourceBot account required' }, 403);
+
+  const result = await exportShowPdf(buyer.buyerId, env);
+  if (!result.ok) return jsonResponse({ error: result.error ?? result.status, status: result.status }, result.status === 'no_show' ? 404 : 502);
   return jsonResponse(result);
 }
 

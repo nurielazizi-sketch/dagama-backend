@@ -16,6 +16,7 @@ import {
   handleWebUpload, handleListLeads, handleGetLead, handleListSuppliers, handleGetMyRole,
   handleSupplierExtension, handleSupplierVoice, handleSupplierProduct, handleUpdateProduct,
   handleEmailDraft, handleEmailSend, handleBlast,
+  handleSearch, handleCompare, handleSupplierPdf, handleShowPdf,
 } from './web_capture';
 import { processFunnelQueue } from './funnel';
 import { processDemobotQueue } from './db_emails';
@@ -138,7 +139,14 @@ export default {
       const m = path.match(/^\/api\/suppliers\/([a-f0-9-]+)\/email$/i);
       if (m) return addCors(await handleEmailSend(request, env, m[1]));
     }
-    if (path === '/api/blast') return addCors(await handleBlast(request, env));
+    if (path === '/api/blast')    return addCors(await handleBlast(request, env));
+    if (path === '/api/search')   return addCors(await handleSearch(request, env));
+    if (path === '/api/compare')  return addCors(await handleCompare(request, env));
+    if (path === '/api/show/pdf') return addCors(await handleShowPdf(request, env));
+    {
+      const m = path.match(/^\/api\/suppliers\/([a-f0-9-]+)\/pdf$/i);
+      if (m) return addCors(await handleSupplierPdf(request, env, m[1]));
+    }
 
     // ── DemoBot (freelancer-facing @DaGamaShow) ───────────────────────────────
     if (path === '/api/demobot/webhook')                  return handleDemoBotWebhook(request, env);
@@ -855,7 +863,13 @@ const DASHBOARD_PAGE = `<!DOCTYPE html>
     <div class="section-title" style="margin-top:2rem;display:flex;align-items:center;gap:0.6rem;flex-wrap:wrap;">
       <span data-list-title>Recent leads</span>
       <span class="badge badge-green" id="leads-count">0</span>
-      <button id="blast-btn" type="button" style="display:none;margin-left:auto;background:rgba(212,175,55,0.08);border:1px solid rgba(212,175,55,0.2);color:#D4AF37;border-radius:8px;padding:0.35rem 0.9rem;font-size:0.8rem;font-family:inherit;cursor:pointer;" onclick="runBlast()">📨 Blast follow-ups</button>
+      <button id="blast-btn"   type="button" style="display:none;margin-left:auto;background:rgba(212,175,55,0.08);border:1px solid rgba(212,175,55,0.2);color:#D4AF37;border-radius:8px;padding:0.35rem 0.9rem;font-size:0.8rem;font-family:inherit;cursor:pointer;" onclick="runBlast()">📨 Blast follow-ups</button>
+      <button id="showpdf-btn" type="button" style="display:none;background:rgba(212,175,55,0.08);border:1px solid rgba(212,175,55,0.2);color:#D4AF37;border-radius:8px;padding:0.35rem 0.9rem;font-size:0.8rem;font-family:inherit;cursor:pointer;" onclick="exportShowPdf()">📄 Show PDF</button>
+      <button id="compare-btn" type="button" style="display:none;background:rgba(212,175,55,0.08);border:1px solid rgba(212,175,55,0.2);color:#D4AF37;border-radius:8px;padding:0.35rem 0.9rem;font-size:0.8rem;font-family:inherit;cursor:pointer;" onclick="openCompare()">⚖️ Compare</button>
+    </div>
+    <div id="search-row" style="display:none;margin-bottom:1.25rem;">
+      <input id="search-input" type="search" placeholder="Search suppliers, contacts, products, voice notes…" style="width:100%;padding:0.75rem 1rem;background:rgba(51,65,85,0.5);border:1px solid rgba(212,175,55,0.15);border-radius:8px;color:#F5F5F5;font-family:'Outfit',sans-serif;font-size:0.95rem;" />
+      <div id="search-results" style="display:none;margin-top:0.75rem;background:linear-gradient(135deg,rgba(30,41,59,0.9),rgba(30,41,59,0.6));border:1px solid rgba(212,175,55,0.15);border-radius:12px;padding:0.5rem;"></div>
     </div>
     <div id="leads-box" class="empty-state">
       <div class="icon">📇</div>
@@ -1022,6 +1036,12 @@ const DASHBOARD_PAGE = `<!DOCTYPE html>
           if (captureShow) captureShow.style.display = 'none';
           const blastBtn = document.getElementById('blast-btn');
           if (blastBtn) blastBtn.style.display = 'inline-block';
+          ['showpdf-btn', 'compare-btn'].forEach(id => {
+            const el = document.getElementById(id);
+            if (el) el.style.display = 'inline-block';
+          });
+          const searchRow = document.getElementById('search-row');
+          if (searchRow) searchRow.style.display = 'block';
         }
         loadList();
       })
@@ -1164,6 +1184,7 @@ const DASHBOARD_PAGE = `<!DOCTYPE html>
           '<button type="button" style="' + btnStyle + '" id="voice-btn-' + s.id + '" onclick="toggleVoice(\'' + s.id + '\')">💬 Voice note</button>' +
           '<label style="' + btnStyle + '">📦 Add product<input type="file" accept="image/*" capture="environment" style="display:none;" onchange="uploadProduct(\'' + s.id + '\', this)" /></label>' +
           (s.email ? '<button type="button" style="' + btnStyle + '" onclick="openEmailDraft(\'' + s.id + '\')">📧 Follow up</button>' : '') +
+          '<button type="button" style="' + btnStyle + '" onclick="exportSupplierPdf(\'' + s.id + '\')">📄 PDF</button>' +
         '</div>' +
         '<div id="product-form-' + s.id + '" style="display:none;margin-top:0.65rem;background:rgba(15,20,25,0.5);border:1px solid rgba(212,175,55,0.15);border-radius:8px;padding:0.75rem;"></div>' +
         '<div id="email-form-' + s.id + '"   style="display:none;margin-top:0.65rem;background:rgba(15,20,25,0.5);border:1px solid rgba(212,175,55,0.15);border-radius:8px;padding:0.75rem;"></div>' +
@@ -1235,6 +1256,108 @@ const DASHBOARD_PAGE = `<!DOCTYPE html>
         loadList();
       } catch {
         captureStatus.style.display = 'block';
+        captureStatus.textContent = '⚠️ Network error.';
+      }
+    }
+
+    // ── Search / Compare / PDF (Phase 6) ───────────────────────────────────
+    let searchTimer;
+    const searchInput = document.getElementById('search-input');
+    if (searchInput) {
+      searchInput.addEventListener('input', () => {
+        clearTimeout(searchTimer);
+        searchTimer = setTimeout(runSearch, 250);
+      });
+    }
+
+    async function runSearch() {
+      const q = (document.getElementById('search-input').value || '').trim();
+      const out = document.getElementById('search-results');
+      if (!q) { out.style.display = 'none'; out.innerHTML = ''; return; }
+      try {
+        const res = await fetch('/api/search?q=' + encodeURIComponent(q), { headers: { Authorization: 'Bearer ' + token } });
+        const data = await res.json();
+        const results = data.results || [];
+        out.style.display = 'block';
+        if (!results.length) {
+          out.innerHTML = '<div style="padding:0.75rem 1rem;color:#94A3B8;font-size:0.85rem;">No matches.</div>';
+          return;
+        }
+        const icon = (t) => t === 'company' ? '🏢' : t === 'contact' ? '👤' : t === 'product' ? '📦' : '🎤';
+        out.innerHTML = results.map(r =>
+          '<div style="padding:0.5rem 0.75rem;border-bottom:1px solid rgba(255,255,255,0.05);font-size:0.85rem;">' +
+            icon(r.type) + ' <span style="color:#F5F5F5;font-weight:600;">' + r.companyName + '</span>' +
+            (r.context ? ' <span style="color:#94A3B8;">— ' + r.context + '</span>' : '') +
+          '</div>'
+        ).join('');
+      } catch {
+        out.style.display = 'block';
+        out.innerHTML = '<div style="padding:0.75rem 1rem;color:#f87171;font-size:0.85rem;">⚠️ Search failed.</div>';
+      }
+    }
+
+    async function openCompare() {
+      const q = (prompt('Compare which product (e.g. "led panel")?') || '').trim();
+      if (!q) return;
+      captureStatus.style.display = 'block';
+      captureStatus.textContent = '🤖 Comparing matches for "' + q + '"…';
+      try {
+        const res = await fetch('/api/compare', {
+          method: 'POST',
+          headers: { Authorization: 'Bearer ' + token, 'Content-Type': 'application/json' },
+          body: JSON.stringify({ q }),
+        });
+        const data = await res.json();
+        if (!res.ok) { captureStatus.textContent = '⚠️ ' + (data.error || 'Compare failed.'); return; }
+        const matches = data.matches || [];
+        if (!matches.length) { captureStatus.textContent = '🔍 No matches for "' + q + '".'; return; }
+        const lines = matches.slice(0, 8).map((m, i) =>
+          (i + 1) + '. ' + m.product + ' — ' + m.supplier +
+          (m.price ? ' · ' + m.price : '') + (m.moq ? ' · MOQ ' + m.moq : '') + (m.leadTime ? ' · ' + m.leadTime : '')
+        ).join('\\n');
+        captureResult.style.display = 'block';
+        captureResult.innerHTML =
+          '<div style="background:rgba(15,20,25,0.5);border:1px solid rgba(212,175,55,0.15);border-radius:8px;padding:1rem;white-space:pre-wrap;">' +
+            '<div style="font-weight:600;color:#F5F5F5;margin-bottom:0.5rem;">⚖️ Comparing "' + q + '" — ' + matches.length + ' matches</div>' +
+            '<div style="font-size:0.85rem;color:#94A3B8;margin-bottom:0.75rem;">' + lines + '</div>' +
+            (data.analysis ? '<div style="font-size:0.9rem;color:#F5F5F5;line-height:1.5;border-top:1px solid rgba(212,175,55,0.15);padding-top:0.75rem;">' + data.analysis + '</div>' : '') +
+          '</div>';
+        captureStatus.textContent = '✅ Comparison ready.';
+      } catch {
+        captureStatus.textContent = '⚠️ Network error.';
+      }
+    }
+
+    async function exportSupplierPdf(companyId) {
+      captureStatus.style.display = 'block';
+      captureStatus.textContent = '📄 Generating supplier PDF…';
+      try {
+        const res = await fetch('/api/suppliers/' + companyId + '/pdf', {
+          method: 'POST',
+          headers: { Authorization: 'Bearer ' + token },
+        });
+        const data = await res.json();
+        if (!res.ok || !data.pdfUrl) { captureStatus.textContent = '⚠️ ' + (data.error || 'PDF failed.'); return; }
+        captureStatus.textContent = '✅ Supplier PDF ready.';
+        window.open(data.pdfUrl, '_blank');
+      } catch {
+        captureStatus.textContent = '⚠️ Network error.';
+      }
+    }
+
+    async function exportShowPdf() {
+      captureStatus.style.display = 'block';
+      captureStatus.textContent = '📄 Generating show PDF…';
+      try {
+        const res = await fetch('/api/show/pdf', {
+          method: 'POST',
+          headers: { Authorization: 'Bearer ' + token },
+        });
+        const data = await res.json();
+        if (!res.ok || !data.pdfUrl) { captureStatus.textContent = '⚠️ ' + (data.error || 'PDF failed.'); return; }
+        captureStatus.textContent = '✅ Show PDF ready.';
+        window.open(data.pdfUrl, '_blank');
+      } catch {
         captureStatus.textContent = '⚠️ Network error.';
       }
     }
