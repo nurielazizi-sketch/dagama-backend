@@ -3,7 +3,7 @@
 import type { Env } from './types';
 import { routeToDemoBot, tryClaimAsDemoBot } from './demobot_wa';
 import { handleCardCapture, resolveActiveShow } from './capture';
-import { captureSupplierFromPhoto, attachCardBack, attachPersonPhoto } from './sourcebot_core';
+import { captureSupplierFromPhoto, attachCardBack, attachPersonPhoto, attachVoiceNote } from './sourcebot_core';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // WhatsApp Cloud API integration. Behind a feature flag (isWhatsAppEnabled):
@@ -241,7 +241,7 @@ interface WaMapping {
 // SourceBot multi-step session — parallel to sourcebot.ts SourceBotSession but
 // keyed by phone (wa_user_mappings.session) instead of telegram_chat_id.
 interface SbWaSession {
-  step?:            'awaiting_card_back' | 'awaiting_person_photo';
+  step?:            'awaiting_card_back' | 'awaiting_person_photo' | 'awaiting_voice_note';
   activeCompanyId?: string;
 }
 
@@ -340,6 +340,11 @@ async function routeToSourceBot(msg: WaInboundMessage, mapping: WaMapping, env: 
       await sendWhatsAppText(mapping.phone, `👤 Send a photo of the person, booth, or signage.`, env);
       return;
     }
+    if (id.startsWith('sb_voice:')) {
+      await saveSbSession(mapping.phone, { step: 'awaiting_voice_note', activeCompanyId: id.slice('sb_voice:'.length) }, env);
+      await sendWhatsAppText(mapping.phone, `🎤 Hold the mic and record a voice note about this supplier — price, MOQ, lead time, anything you want to remember.`, env);
+      return;
+    }
     if (id === 'sb_done') {
       await saveSbSession(mapping.phone, {}, env);
       await sendWhatsAppText(mapping.phone, `✅ Done. Send another card photo to capture the next supplier.`, env);
@@ -347,8 +352,8 @@ async function routeToSourceBot(msg: WaInboundMessage, mapping: WaMapping, env: 
     }
   }
 
-  // 2. Image during a multi-step extension flow.
-  if (msg.type === 'image' && session.step && session.activeCompanyId) {
+  // 2a. Image during a card-back / person-photo extension flow.
+  if (msg.type === 'image' && (session.step === 'awaiting_card_back' || session.step === 'awaiting_person_photo') && session.activeCompanyId) {
     const mediaId = msg.image?.id;
     if (!mediaId) { await sendWhatsAppText(mapping.phone, `Couldn't read that photo. Try sending it again.`, env); return; }
     const media = await fetchWhatsAppMedia(mediaId, env);
@@ -365,6 +370,28 @@ async function routeToSourceBot(msg: WaInboundMessage, mapping: WaMapping, env: 
 
     // Reset to free state — next image will be a brand-new supplier capture.
     await saveSbSession(mapping.phone, {}, env);
+    return;
+  }
+
+  // 2b. Voice/audio. Two routes:
+  //     - explicit 'awaiting_voice_note' step (the user tapped the 💬 button)
+  //     - free-form audio while activeCompanyId is set (the user just sends a
+  //       voice note after the supplier capture — natural behaviour on WA).
+  if (msg.type === 'audio' && session.activeCompanyId) {
+    const mediaId = msg.audio?.id;
+    if (!mediaId) { await sendWhatsAppText(mapping.phone, `Couldn't read that audio. Try sending it again.`, env); return; }
+    const media = await fetchWhatsAppMedia(mediaId, env);
+    if (!media) { await sendWhatsAppText(mapping.phone, `Couldn't download that audio. Try again.`, env); return; }
+
+    await attachVoiceNote({
+      companyId:    session.activeCompanyId,
+      buyerId:      mapping.buyer_id,
+      channel:      'whatsapp',
+      media:        { kind: 'r2_key', key: media.r2Key, mimeType: media.mimeType },
+      reply:        { channel: 'whatsapp', phone: mapping.phone },
+    }, env);
+
+    await saveSbSession(mapping.phone, { activeCompanyId: session.activeCompanyId }, env);
     return;
   }
 
@@ -401,13 +428,16 @@ async function routeToSourceBot(msg: WaInboundMessage, mapping: WaMapping, env: 
   if (result.ok && result.companyId) {
     await saveSbSession(mapping.phone, { activeCompanyId: result.companyId }, env);
     try {
+      // WhatsApp caps interactive buttons at 3. Voice + card back + person
+      // photo are the high-leverage extras; the user implicitly "finishes" by
+      // sending a brand-new supplier card.
       await sendWhatsAppButtons(
         mapping.phone,
-        `Add more for *${result.contact?.company || 'this supplier'}*?`,
+        `Add more for *${result.contact?.company || 'this supplier'}*? Or send a new card to capture the next supplier.`,
         [
+          { id: `sb_voice:${result.companyId}`,  title: '💬 Voice note'   },
           { id: `sb_back:${result.companyId}`,   title: '📷 Card back'   },
-          { id: `sb_person:${result.companyId}`, title: '👤 Person photo' },
-          { id: 'sb_done',                       title: '✅ Done'          },
+          { id: `sb_person:${result.companyId}`, title: '👤 Person'      },
         ],
         env,
       );

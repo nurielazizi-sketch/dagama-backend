@@ -12,7 +12,7 @@ import { handleGoogleAuthStart, handleGoogleAuthCallback } from './google_auth';
 import { handleSourceBotWebhook, handleSourceBotSetupWebhook, handleSourceBotShowPassCron, handleAdminReset } from './sourcebot';
 import { handleDemoBotWebhook, handleDemoBotSetupWebhook, handleDemoBotDailySummaryCron } from './demobot';
 import { handleWhatsAppWebhook, isWhatsAppEnabled } from './whatsapp';
-import { handleWebUpload, handleListLeads, handleGetLead, handleListSuppliers, handleGetMyRole, handleSupplierExtension } from './web_capture';
+import { handleWebUpload, handleListLeads, handleGetLead, handleListSuppliers, handleGetMyRole, handleSupplierExtension, handleSupplierVoice } from './web_capture';
 import { processFunnelQueue } from './funnel';
 import { processDemobotQueue } from './db_emails';
 import { handleListShows, handleCreateShow, handleUpdateShow, handleDeleteShow, handleIssueFreelancerToken, handleMarkConversion } from './demobot_admin';
@@ -113,6 +113,10 @@ export default {
         const kind = m[2] === 'card-back' ? 'card_back' : 'person_photo';
         return addCors(await handleSupplierExtension(request, env, m[1], kind));
       }
+    }
+    {
+      const m = path.match(/^\/api\/suppliers\/([a-f0-9-]+)\/voice$/i);
+      if (m) return addCors(await handleSupplierVoice(request, env, m[1]));
     }
 
     // ── DemoBot (freelancer-facing @DaGamaShow) ───────────────────────────────
@@ -1130,8 +1134,75 @@ const DASHBOARD_PAGE = `<!DOCTYPE html>
         '<div style="margin-top:0.65rem;display:flex;gap:0.5rem;flex-wrap:wrap;">' +
           '<label style="' + btnStyle + '">📷 Card back<input type="file" accept="image/*" capture="environment" style="display:none;" onchange="uploadExtension(\'' + s.id + '\', \'card-back\', this)" /></label>' +
           '<label style="' + btnStyle + '">👤 Person photo<input type="file" accept="image/*" capture="environment" style="display:none;" onchange="uploadExtension(\'' + s.id + '\', \'person-photo\', this)" /></label>' +
+          '<button type="button" style="' + btnStyle + '" id="voice-btn-' + s.id + '" onclick="toggleVoice(\'' + s.id + '\')">💬 Voice note</button>' +
         '</div>' +
       '</div>';
+    }
+
+    // Per-supplier MediaRecorder state. Click to start, click again to stop +
+    // upload. Browsers default to webm/opus which Gemini transcribes fine.
+    const voiceState = {};
+    async function toggleVoice(companyId) {
+      const btn = document.getElementById('voice-btn-' + companyId);
+      const state = voiceState[companyId];
+      if (state && state.recorder && state.recorder.state === 'recording') {
+        state.recorder.stop();   // upload happens in onstop handler
+        return;
+      }
+      if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+        captureStatus.style.display = 'block';
+        captureStatus.textContent = '⚠️ Your browser doesn\\'t support mic recording.';
+        return;
+      }
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        const recorder = new MediaRecorder(stream);
+        const chunks = [];
+        const startTs = Date.now();
+        recorder.ondataavailable = e => { if (e.data.size > 0) chunks.push(e.data); };
+        recorder.onstop = async () => {
+          stream.getTracks().forEach(t => t.stop());
+          btn.textContent = '💬 Voice note';
+          btn.style.background = 'rgba(212,175,55,0.08)';
+          delete voiceState[companyId];
+          if (chunks.length === 0) return;
+          const blob = new Blob(chunks, { type: recorder.mimeType || 'audio/webm' });
+          const duration = (Date.now() - startTs) / 1000;
+          await uploadVoice(companyId, blob, duration);
+        };
+        recorder.start();
+        voiceState[companyId] = { recorder, chunks };
+        btn.textContent = '⏹ Stop recording';
+        btn.style.background = 'rgba(248,113,113,0.15)';
+      } catch (e) {
+        captureStatus.style.display = 'block';
+        captureStatus.textContent = '⚠️ Couldn\\'t start the mic. ' + (e && e.message ? e.message : '');
+      }
+    }
+
+    async function uploadVoice(companyId, blob, durationSec) {
+      captureStatus.style.display = 'block';
+      captureStatus.textContent = '📤 Uploading voice note…';
+      const fd = new FormData();
+      fd.append('audio', blob, 'voice.webm');
+      if (Number.isFinite(durationSec)) fd.append('duration', String(Math.round(durationSec)));
+      try {
+        const res = await fetch('/api/suppliers/' + companyId + '/voice', {
+          method: 'POST',
+          headers: { Authorization: 'Bearer ' + token },
+          body: fd,
+        });
+        const data = await res.json();
+        if (!res.ok) {
+          captureStatus.textContent = '⚠️ ' + (data.error || 'Voice upload failed.');
+          return;
+        }
+        const tail = [data.price, data.moq && 'MOQ ' + data.moq, data.leadTime, data.tone].filter(Boolean).join(' · ');
+        captureStatus.textContent = '✅ Voice note saved' + (tail ? ' — ' + tail : '');
+        loadList();
+      } catch (e) {
+        captureStatus.textContent = '⚠️ Network error.';
+      }
     }
 
     async function uploadExtension(companyId, kind, inputEl) {

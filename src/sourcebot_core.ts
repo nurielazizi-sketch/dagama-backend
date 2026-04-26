@@ -3,7 +3,7 @@
 import type { Env } from './types';
 import { extractContactFromImage } from './extract';
 import { getServiceAccountToken, createDriveFolder } from './google';
-import { appendSupplierRow, updateSupplierCardBack, updateSupplierPerson } from './sb_sheets';
+import { appendSupplierRow, updateSupplierCardBack, updateSupplierPerson, updateSupplierVoiceNote } from './sb_sheets';
 import { scheduleFunnelOnFirstScan, trackEvent } from './funnel';
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -387,6 +387,194 @@ async function attachExtensionPhoto(
   await sendReply(input.reply, replyText, env);
 
   return { ok: true, status: 'success', url, description: kind === 'person_photo' ? description : undefined };
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Phase 3: Voice notes attached to a supplier. Single Gemini call returns the
+// verbatim transcript + parsed price/MOQ/lead-time/tone keywords. We persist
+// to sb_voice_notes and re-aggregate column U (Voice Note) on the sheet so all
+// transcripts for the supplier appear in one cell, timestamped.
+// ─────────────────────────────────────────────────────────────────────────────
+
+export interface VoiceCaptureInput {
+  companyId:     string;
+  buyerId:       string;
+  channel:       'whatsapp' | 'web';
+  media:
+    | { kind: 'r2_key'; key: string; mimeType?: string }
+    | { kind: 'bytes'; bytes: Uint8Array; mimeType: string };
+  durationSec?:  number;          // optional metadata (WA gives this)
+  reply: ReplyTarget;
+}
+
+export interface VoiceCaptureResult {
+  ok:           boolean;
+  status:       'success' | 'no_supplier' | 'storage_failed' | 'transcribe_failed' | 'empty_transcript' | 'error';
+  transcript?:  string;
+  language?:    string;
+  price?:       string;
+  moq?:         string;
+  leadTime?:    string;
+  tone?:        string;
+  error?:       string;
+}
+
+export async function attachVoiceNote(input: VoiceCaptureInput, env: Env): Promise<VoiceCaptureResult> {
+  const company = await env.DB.prepare(
+    `SELECT id, name, show_name, sheet_row, buyer_id FROM sb_companies WHERE id = ? AND buyer_id = ?`
+  ).bind(input.companyId, input.buyerId).first<{ id: string; name: string; show_name: string; sheet_row: number | null; buyer_id: string }>();
+  if (!company) {
+    await sendReply(input.reply, `Supplier not found.`, env);
+    return { ok: false, status: 'no_supplier' };
+  }
+
+  // Read bytes (web → already in memory; WA → r2 cache).
+  let buffer:   ArrayBuffer;
+  let mimeType: string;
+  try {
+    if (input.media.kind === 'bytes') {
+      const u8 = input.media.bytes;
+      const ab = new ArrayBuffer(u8.byteLength);
+      new Uint8Array(ab).set(u8);
+      buffer   = ab;
+      mimeType = input.media.mimeType || 'audio/ogg';
+    } else {
+      const obj = await env.R2_BUCKET.get(input.media.key);
+      if (!obj) throw new Error(`R2 object missing: ${input.media.key}`);
+      buffer   = await obj.arrayBuffer();
+      mimeType = input.media.mimeType ?? 'audio/ogg';
+    }
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    console.error('[sourcebot_core] voice media read failed', { companyId: company.id, error: msg });
+    return { ok: false, status: 'storage_failed', error: msg };
+  }
+
+  await sendReply(input.reply, `🎤 Transcribing…`, env);
+
+  // Gemini transcribe + extract.
+  let extracted: VoiceExtraction;
+  try {
+    extracted = await transcribeAndExtract(arrayBufferToBase64(buffer), mimeType, env);
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    console.error('[sourcebot_core] voice transcribe failed', { companyId: company.id, error: msg });
+    await sendReply(input.reply, `⚠️ Couldn't transcribe that voice note. Try again with a clearer recording.`, env);
+    return { ok: false, status: 'transcribe_failed', error: msg };
+  }
+
+  if (!extracted.transcript || !extracted.transcript.trim()) {
+    await sendReply(input.reply, `⚠️ I couldn't make out any speech in that voice note.`, env);
+    return { ok: false, status: 'empty_transcript' };
+  }
+
+  // Persist + aggregate.
+  await env.DB.prepare(
+    `INSERT INTO sb_voice_notes
+       (company_id, buyer_id, show_name, transcript, language, duration_seconds,
+        extracted_price, extracted_moq, extracted_lead_time, extracted_tone)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+  ).bind(
+    company.id, company.buyer_id, company.show_name,
+    extracted.transcript, extracted.language || null,
+    input.durationSec ?? null,
+    extracted.price || null, extracted.moq || null, extracted.lead_time || null, extracted.tone || null,
+  ).run();
+
+  if (company.sheet_row) {
+    try {
+      const all = await env.DB.prepare(
+        `SELECT transcript, created_at FROM sb_voice_notes WHERE company_id = ? ORDER BY created_at`
+      ).bind(company.id).all<{ transcript: string; created_at: string }>();
+      const aggregated = all.results.map(v => `[${v.created_at}] ${v.transcript}`).join('\n\n');
+
+      const sheet = await env.DB.prepare(
+        `SELECT sheet_id FROM sb_buyer_shows WHERE buyer_id = ? AND show_name = ?`
+      ).bind(company.buyer_id, company.show_name).first<{ sheet_id: string }>();
+      if (sheet?.sheet_id) {
+        const tok = await getServiceAccountToken(env);
+        await updateSupplierVoiceNote(sheet.sheet_id, company.sheet_row, aggregated, tok);
+      }
+    } catch (e) {
+      console.error('[sourcebot_core] sheet voice update failed', e);
+    }
+  }
+
+  // Confirmation reply (parity with sourcebot.ts:2581 minus the inline buttons).
+  const extras: string[] = [];
+  if (extracted.price)     extras.push(`💰 ${extracted.price}`);
+  if (extracted.moq)       extras.push(`📊 MOQ ${extracted.moq}`);
+  if (extracted.lead_time) extras.push(`⏱ ${extracted.lead_time}`);
+  if (extracted.tone)      extras.push(`🎭 ${extracted.tone}`);
+  await sendReply(
+    input.reply,
+    `✅ Voice note saved for *${company.name}*\n\n` +
+    `_"${extracted.transcript.slice(0, 280)}${extracted.transcript.length > 280 ? '…' : ''}"_` +
+    (extras.length ? `\n\n${extras.join(' · ')}` : ''),
+    env,
+  );
+
+  return {
+    ok:         true,
+    status:     'success',
+    transcript: extracted.transcript,
+    language:   extracted.language,
+    price:      extracted.price,
+    moq:        extracted.moq,
+    leadTime:   extracted.lead_time,
+    tone:       extracted.tone,
+  };
+}
+
+interface VoiceExtraction {
+  transcript: string;
+  language:   string;
+  price:      string;
+  moq:        string;
+  lead_time:  string;
+  tone:       string;
+}
+
+// Single Gemini call — copy of sourcebot.ts:2934 with mime_type parameterised
+// so non-Telegram callers can pass audio/webm, audio/mp4, audio/aac, etc.
+async function transcribeAndExtract(base64: string, mimeType: string, env: Env): Promise<VoiceExtraction> {
+  const prompt =
+    `You are processing a voice memo a buyer recorded about a supplier at a trade show. ` +
+    `Transcribe the audio verbatim in the original language (do not translate). Then scan the ` +
+    `transcript for price, minimum order quantity, lead time, and overall tone. ` +
+    `Return ONLY a JSON object with these exact fields:\n` +
+    `- transcript (verbatim, full)\n` +
+    `- language (best-effort 2-letter code, e.g. "en", "zh", "es"; empty if unsure)\n` +
+    `- price (NORMALIZED to standard money format with currency symbol and decimals — e.g. "$5.20" not "$5 and 20 cents", "€12.50" not "twelve fifty euros". Empty if no price mentioned.)\n` +
+    `- moq (number with units, e.g. "5,000 pcs", "1 pallet". Empty if not mentioned.)\n` +
+    `- lead_time (e.g. "30 days", "4 weeks". Empty if not mentioned.)\n` +
+    `- tone (one of: positive, neutral, negative, enthusiastic, skeptical; empty if unclear)`;
+
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${env.GEMINI_API_KEY}`;
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      contents: [{ parts: [
+        { text: prompt },
+        { inline_data: { mime_type: mimeType, data: base64 } },
+      ] }],
+      generationConfig: { responseMimeType: 'application/json' },
+    }),
+  });
+  const data = await res.json() as { candidates?: Array<{ content?: { parts?: Array<{ text?: string }> } }>; error?: { message?: string } };
+  if (!data.candidates?.length) throw new Error(`Gemini voice failed: ${data.error?.message ?? JSON.stringify(data)}`);
+
+  const raw = data.candidates[0]?.content?.parts?.[0]?.text ?? '{}';
+  const parsed = JSON.parse(raw.replace(/```json|```/g, '').trim()) as Partial<VoiceExtraction>;
+  return {
+    transcript: parsed.transcript ?? '',
+    language:   parsed.language   ?? '',
+    price:      parsed.price      ?? '',
+    moq:        parsed.moq        ?? '',
+    lead_time:  parsed.lead_time  ?? '',
+    tone:       parsed.tone       ?? '',
+  };
 }
 
 // Gemini one-liner — same prompt as sourcebot.ts:2218.
