@@ -49,6 +49,7 @@ crons = ["0 * * * *"]
 ENVIRONMENT = "production"
 ORIGIN = "https://heydagama.com"
 SHARED_DRIVE_ID = "0AKPcQEYiY_9IUk9PVA"
+TELEGRAM_BOT_USERNAME_DEMO = "DaGaMaDemoBot"
 
 [[env.production.d1_databases]]
 binding = "DB"
@@ -71,7 +72,9 @@ queue = "dagama-card-queue"
 binding = "CARD_QUEUE"
 
 # Production secrets (set via CLI: wrangler secret put NAME --env production)
-# - TELEGRAM_BOT_TOKEN
+# - TELEGRAM_BOT_TOKEN                    (BoothBot)
+# - TELEGRAM_BOT_TOKEN_SOURCE             (SourceBot)
+# - TELEGRAM_BOT_TOKEN_DEMO               (DemoBot @DaGamaShow — freelancer-facing)
 # - GEMINI_API_KEY
 # - GCV_API_KEY                          (Google Cloud Vision API key for DOCUMENT_TEXT_DETECTION OCR)
 # - WEBHOOK_SECRET
@@ -80,11 +83,15 @@ binding = "CARD_QUEUE"
 # - STRIPE_PRICE_SINGLE_SHOW              (Stripe price ID for $49 one-time)
 # - STRIPE_PRICE_3_SHOW_PACK              (Stripe price ID for $129 one-time)
 # - STRIPE_PRICE_TEAM_PLAN                (Stripe price ID for $79/month recurring)
+# - STRIPE_PRICE_ORGANIZER_PLAN           (Stripe price ID for $299/month — DemoBot referral tier)
 # - GOOGLE_SERVICE_ACCOUNT_EMAIL          (service account email from GCP)
 # - GOOGLE_SERVICE_ACCOUNT_PRIVATE_KEY    (private key PEM from service account JSON, \n-escaped)
 # - GMAIL_CLIENT_ID                       (GCP OAuth 2.0 Client → Web Application)
 # - GMAIL_CLIENT_SECRET                   (GCP OAuth 2.0 Client)
 # - GOOGLE_SERVICE_ACCOUNT_TOKEN          (pre-refreshed OAuth2 Bearer token for Drive/Sheets)
+# - DAGAMA_NOREPLY_REFRESH_TOKEN          (Gmail OAuth refresh token for transactional sender)
+# - DAGAMA_NOREPLY_FROM_EMAIL             (e.g. noreply@heydagama.com)
+# - DEMOBOT_ADMIN_TOKEN                   (Bearer token for /api/demobot/admin/* + shows_catalog endpoints)
 # ── WhatsApp Cloud API (Meta) ──────────────────────────────────────────────────
 # All five required to activate the channel. When unset, the webhook returns 503
 # and outbound sends are no-ops (see src/whatsapp.ts isWhatsAppEnabled).

@@ -9,7 +9,9 @@
     "build": "tsc",
     "type-check": "tsc --noEmit",
     "format": "prettier --write 'src/**/*.ts'",
-    "lint": "eslint src/**/*.ts"
+    "lint": "eslint src/**/*.ts",
+    "docs": "node scripts/regen-docs.mjs",
+    "docs:check": "node scripts/regen-docs.mjs --check"
   },
   "keywords": [
     "dagama",

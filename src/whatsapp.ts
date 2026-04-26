@@ -1,6 +1,7 @@
 /// <reference types="@cloudflare/workers-types" />
 
 import type { Env } from './types';
+import { routeToDemoBot, tryClaimAsDemoBot } from './demobot_wa';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // WhatsApp Cloud API integration. Behind a feature flag (isWhatsAppEnabled):
@@ -193,8 +194,8 @@ async function handleInboundMessage(msg: WaInboundMessage, value: WaChangeValue,
   ).bind(msg.from, profileName).run();
 
   const mapping = await env.DB.prepare(
-    `SELECT id, phone, user_id, buyer_id, bot_role, session FROM wa_user_mappings WHERE phone = ? LIMIT 1`
-  ).bind(msg.from).first<{ id: string; phone: string; user_id: string | null; buyer_id: string | null; bot_role: string; session: string | null }>();
+    `SELECT id, phone, user_id, buyer_id, bot_role, session, display_name FROM wa_user_mappings WHERE phone = ? LIMIT 1`
+  ).bind(msg.from).first<{ id: string; phone: string; user_id: string | null; buyer_id: string | null; bot_role: string; session: string | null; display_name: string | null }>();
 
   if (!mapping) {
     console.error('[whatsapp] failed to load mapping after upsert', { phone: msg.from });
@@ -203,9 +204,11 @@ async function handleInboundMessage(msg: WaInboundMessage, value: WaChangeValue,
 
   // Route. The actual BoothBot/SourceBot WhatsApp pipelines are not yet wired —
   // for now we acknowledge with a placeholder so flipping the channel on for
-  // testing produces visible output.
+  // testing produces visible output. DemoBot is fully wired (demobot_wa.ts).
   try {
-    if (mapping.bot_role === 'sourcebot') {
+    if (mapping.bot_role === 'demobot') {
+      await routeToDemoBot(msg, mapping, env);
+    } else if (mapping.bot_role === 'sourcebot') {
       await routeToSourceBot(msg, mapping, env);
     } else if (mapping.bot_role === 'boothbot') {
       await routeToBoothBot(msg, mapping, env);
@@ -234,11 +237,19 @@ async function routeToSourceBot(msg: WaInboundMessage, mapping: { phone: string 
   await sendWhatsAppText(mapping.phone, '📥 SourceBot received your message. (WhatsApp pipeline coming online — captured for processing.)', env);
 }
 
-async function handleUnassignedMessage(msg: WaInboundMessage, mapping: { phone: string; bot_role: string }, env: Env): Promise<void> {
+async function handleUnassignedMessage(msg: WaInboundMessage, mapping: { id: string; phone: string; bot_role: string; user_id: string | null; buyer_id: string | null; session: string | null; display_name: string | null }, env: Env): Promise<void> {
   // Deep-link onboarding: "join <token>" — exact match to onboarding_tokens.token.
   // Telegram uses /start <token>; on WhatsApp the user pastes the join phrase from
   // the registration confirmation page.
   const text = msg.type === 'text' ? msg.text?.body?.trim() ?? '' : '';
+
+  // 1. DemoBot freelancer flow first — magic words ("demo" / "freelancer") or
+  //    "join demo_<token>" flip the mapping to bot_role='demobot' and start
+  //    self-serve registration. Returns true if claimed.
+  if (text && await tryClaimAsDemoBot(text, mapping, env)) return;
+
+  // 2. Buyer/exhibitor "join <token>" — uses onboarding_tokens.bot_role to decide
+  //    boothbot vs sourcebot and binds the WA mapping accordingly.
   const joinMatch = text.match(/^join\s+([A-Za-z0-9_-]+)$/i);
   if (joinMatch) {
     const token = joinMatch[1];
@@ -256,7 +267,7 @@ async function handleUnassignedMessage(msg: WaInboundMessage, mapping: { phone: 
 
   await sendWhatsAppText(
     mapping.phone,
-    `👋 Welcome to DaGama. To start, sign up at ${env.ORIGIN} — you'll get a join code that activates this chat.`,
+    `👋 Welcome to DaGama. To start, sign up at ${env.ORIGIN} — you'll get a join code that activates this chat.\n\nIf you're a freelancer, just reply "demo" to register.`,
     env,
   );
 }

@@ -9,9 +9,12 @@ import { handleProcessCard, type ProcessCardJob } from './queue';
 import { handleShowPassCron } from './telegram';
 import { handleOnboard, handleOnboardingStatus } from './onboarding';
 import { handleGoogleAuthStart, handleGoogleAuthCallback } from './google_auth';
-import { handleSourceBotWebhook, handleSourceBotSetupWebhook, handleSourceBotShowPassCron } from './sourcebot';
+import { handleSourceBotWebhook, handleSourceBotSetupWebhook, handleSourceBotShowPassCron, handleAdminReset } from './sourcebot';
+import { handleDemoBotWebhook, handleDemoBotSetupWebhook, handleDemoBotDailySummaryCron } from './demobot';
 import { handleWhatsAppWebhook, isWhatsAppEnabled } from './whatsapp';
 import { processFunnelQueue } from './funnel';
+import { processDemobotQueue } from './db_emails';
+import { handleListShows, handleCreateShow, handleUpdateShow, handleDeleteShow, handleIssueFreelancerToken, handleMarkConversion } from './demobot_admin';
 import type { Env } from './types';
 
 const CORS_HEADERS = {
@@ -30,6 +33,14 @@ export default {
         console.log(`[funnel] sent=${result.sent} failed=${result.failed} skipped=${result.skipped}`);
       }
     } catch (e) { console.error('[funnel] cron failed:', e); }
+    try {
+      const r = await processDemobotQueue(env);
+      if (r.sent || r.failed || r.skipped) {
+        console.log(`[demobot] queue sent=${r.sent} failed=${r.failed} skipped=${r.skipped}`);
+      }
+    } catch (e) { console.error('[demobot] queue cron failed:', e); }
+    try { await handleDemoBotDailySummaryCron(env); }
+    catch (e) { console.error('[demobot] daily summary cron failed:', e); }
   },
 
   async queue(batch: MessageBatch<ProcessCardJob>, env: Env): Promise<void> {
@@ -79,11 +90,29 @@ export default {
     if (path === '/api/auth/google/callback') return handleGoogleAuthCallback(request, env);
     if (path === '/api/sourcebot/webhook')   return handleSourceBotWebhook(request, env);
     if (path === '/api/sourcebot/setup')     return addCors(await handleSourceBotSetupWebhook(request, env));
+    if (path === '/api/sourcebot/admin/reset-buyer') return addCors(await handleAdminReset(request, env));
 
     // ── WhatsApp Cloud API (Meta) ─────────────────────────────────────────────
     // GET = subscribe-handshake (hub.challenge echo). POST = inbound events.
     // Returns 503 until all WHATSAPP_* secrets are set (see isWhatsAppEnabled).
     if (path === '/api/whatsapp/webhook')    return handleWhatsAppWebhook(request, env);
+
+    // ── DemoBot (freelancer-facing @DaGamaShow) ───────────────────────────────
+    if (path === '/api/demobot/webhook')                  return handleDemoBotWebhook(request, env);
+    if (path === '/api/demobot/setup')                    return addCors(await handleDemoBotSetupWebhook(request, env));
+    if (path === '/api/demobot/admin/freelancer-token')   return addCors(await handleIssueFreelancerToken(request, env));
+    if (path === '/api/demobot/admin/conversion')         return addCors(await handleMarkConversion(request, env));
+
+    // ── shows_catalog (public read, admin mutations) ──────────────────────────
+    if (path === '/api/shows-catalog' && request.method === 'GET')  return addCors(await handleListShows(request, env));
+    if (path === '/api/shows-catalog' && request.method === 'POST') return addCors(await handleCreateShow(request, env));
+    {
+      const m = path.match(/^\/api\/shows-catalog\/([a-z0-9-]+)$/i);
+      if (m) {
+        if (request.method === 'PUT')    return addCors(await handleUpdateShow(request, env, m[1]));
+        if (request.method === 'DELETE') return addCors(await handleDeleteShow(request, env, m[1]));
+      }
+    }
 
     // Internal R2 pass-through — used so CF image transforms can fetch objects
     // from our private bucket via a URL on this worker's zone.

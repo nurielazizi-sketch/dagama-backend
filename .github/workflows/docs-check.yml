@@ -1,0 +1,27 @@
+name: docs-check
+
+# Pull-request guard: fails CI if the structural docs are out of sync
+# with source. Run `npm run docs` locally and commit the diff to fix.
+#
+# This is intentionally separate from regen-docs.yml — it doesn't push,
+# only flags. The daily cron is what auto-fixes drift.
+
+on:
+  pull_request:
+    paths:
+      - 'migrations/**'
+      - 'src/index.ts'
+      - 'scripts/regen-docs.mjs'
+      - 'docs/SCHEMA.md'
+      - 'docs/API.md'
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: Verify docs are in sync
+        run: npm run docs:check

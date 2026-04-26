@@ -3,7 +3,7 @@
 const SHEETS_API = 'https://sheets.googleapis.com/v4/spreadsheets';
 const DRIVE_API  = 'https://www.googleapis.com/drive/v3/files';
 
-// SourceBot 30-column sheet schema (per master doc).
+// SourceBot 31-column sheet schema (per master doc + Folder link).
 // Order matters — column letters in helpers below depend on this layout.
 //   A=Timestamp · B=Company · C=Contact Name · D=Title · E=Email · F=Phone
 //   G=Phone Country · H=Website · I=LinkedIn · J=Industry · K=Company Size
@@ -11,7 +11,7 @@ const DRIVE_API  = 'https://www.googleapis.com/drive/v3/files';
 //   P=Products · Q=Price Range · R=Avg Lead Time · S=Interest Level · T=Notes
 //   U=Voice Note · V=Email Sent · W=Email Sent At · X=Email Subject · Y=Email Status
 //   Z=Reply Received · AA=Reply Content · AB=Person Photo · AC=Person Description
-//   AD=Last Updated
+//   AD=Last Updated · AE=Folder
 export const SB_SHEET_HEADERS = [
   'Timestamp', 'Company', 'Contact Name', 'Title', 'Email',
   'Phone', 'Phone Country', 'Website', 'LinkedIn', 'Industry',
@@ -19,6 +19,7 @@ export const SB_SHEET_HEADERS = [
   'Products', 'Price Range', 'Avg Lead Time', 'Interest Level', 'Notes',
   'Voice Note', 'Email Sent', 'Email Sent At', 'Email Subject', 'Email Status',
   'Reply Received', 'Reply Content', 'Person Photo', 'Person Description', 'Last Updated',
+  'Folder',
 ];
 
 export interface SbSupplierRow {
@@ -38,6 +39,7 @@ export interface SbSupplierRow {
   cardFrontUrl?:       string;
   cardBackUrl?:        string;
   notes?:              string;
+  folderUrl?:          string;  // Drive folder URL for this supplier — surfaces as a HYPERLINK in col AE
 }
 
 // SourceBot "Products" tab — one row per product so each has its own image,
@@ -117,10 +119,15 @@ export async function createSourceBotSheet(
         { autoResizeDimensions: { dimensions: { sheetId: 0, dimension: 'COLUMNS', startIndex: 0, endIndex: SB_SHEET_HEADERS.length } } },
         ...(productsSheetId !== null ? [
           { updateSheetProperties: { properties: { sheetId: productsSheetId, gridProperties: { frozenRowCount: 1, rowCount: 1000, columnCount: SB_PRODUCT_HEADERS.length } }, fields: 'gridProperties.frozenRowCount,gridProperties.rowCount,gridProperties.columnCount' } },
-          // Set a sensible default row height so image previews fit
-          { updateDimensionProperties: { range: { sheetId: productsSheetId, dimension: 'ROWS', startIndex: 1, endIndex: 1000 }, properties: { pixelSize: 110 }, fields: 'pixelSize' } },
-          // Image column wide enough for a thumbnail
+          // Row height 130 so the IMAGE() preview renders crisply.
+          { updateDimensionProperties: { range: { sheetId: productsSheetId, dimension: 'ROWS', startIndex: 1, endIndex: 1000 }, properties: { pixelSize: 130 }, fields: 'pixelSize' } },
+          // Image column wider for a thumbnail; description column wider so the
+          // wrapped text has somewhere to live.
           { updateDimensionProperties: { range: { sheetId: productsSheetId, dimension: 'COLUMNS', startIndex: 3, endIndex: 4 }, properties: { pixelSize: 160 }, fields: 'pixelSize' } },
+          { updateDimensionProperties: { range: { sheetId: productsSheetId, dimension: 'COLUMNS', startIndex: 4, endIndex: 5 }, properties: { pixelSize: 320 }, fields: 'pixelSize' } },
+          // Wrap description (col E) so long Gemini output / voice transcripts
+          // don't overflow into the next column.
+          { repeatCell: { range: { sheetId: productsSheetId, startRowIndex: 1, endRowIndex: 1000, startColumnIndex: 4, endColumnIndex: 5 }, cell: { userEnteredFormat: { wrapStrategy: 'WRAP', verticalAlignment: 'TOP' } }, fields: 'userEnteredFormat.wrapStrategy,userEnteredFormat.verticalAlignment' } },
         ] : []),
       ],
     }),
@@ -165,8 +172,10 @@ export async function ensureProductsTab(sheetId: string, token: string): Promise
       body: JSON.stringify({
         requests: [
           { updateSheetProperties: { properties: { sheetId: productsSheetId, gridProperties: { frozenRowCount: 1 } }, fields: 'gridProperties.frozenRowCount' } },
-          { updateDimensionProperties: { range: { sheetId: productsSheetId, dimension: 'ROWS', startIndex: 1, endIndex: 1000 }, properties: { pixelSize: 110 }, fields: 'pixelSize' } },
+          { updateDimensionProperties: { range: { sheetId: productsSheetId, dimension: 'ROWS', startIndex: 1, endIndex: 1000 }, properties: { pixelSize: 130 }, fields: 'pixelSize' } },
           { updateDimensionProperties: { range: { sheetId: productsSheetId, dimension: 'COLUMNS', startIndex: 3, endIndex: 4 }, properties: { pixelSize: 160 }, fields: 'pixelSize' } },
+          { updateDimensionProperties: { range: { sheetId: productsSheetId, dimension: 'COLUMNS', startIndex: 4, endIndex: 5 }, properties: { pixelSize: 320 }, fields: 'pixelSize' } },
+          { repeatCell: { range: { sheetId: productsSheetId, startRowIndex: 1, endRowIndex: 1000, startColumnIndex: 4, endColumnIndex: 5 }, cell: { userEnteredFormat: { wrapStrategy: 'WRAP', verticalAlignment: 'TOP' } }, fields: 'userEnteredFormat.wrapStrategy,userEnteredFormat.verticalAlignment' } },
         ],
       }),
     });
@@ -292,6 +301,7 @@ export async function appendSupplierRow(
     '',                            // AB: Person Photo
     '',                            // AC: Person Description
     new Date().toISOString(),     // AD: Last Updated
+    '',                            // AE: Folder — written via formula below
   ];
 
   const appendRes = await fetch(
@@ -306,12 +316,19 @@ export async function appendSupplierRow(
   const rowMatch = (appendData.updates?.updatedRange ?? '').match(/![A-Z]+(\d+):/);
   const rowIndex = rowMatch ? parseInt(rowMatch[1], 10) : 2;
 
-  // Render the card front photo as IMAGE() in column N for inline preview.
+  // Render the card front photo as IMAGE() in column N + Folder hyperlink in AE.
   if (row.cardFrontUrl) {
     await fetch(`${SHEETS_API}/${sheetId}/values/N${rowIndex}?valueInputOption=USER_ENTERED`, {
       method: 'PUT',
       headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
       body: JSON.stringify({ range: `N${rowIndex}`, values: [[`=IMAGE("${toSheetsImageUrl(row.cardFrontUrl)}")`]] }),
+    });
+  }
+  if (row.folderUrl) {
+    await fetch(`${SHEETS_API}/${sheetId}/values/AE${rowIndex}?valueInputOption=USER_ENTERED`, {
+      method: 'PUT',
+      headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ values: [[`=HYPERLINK("${row.folderUrl}","Open folder")`]] }),
     });
   }
 
@@ -391,6 +408,54 @@ export async function updateSupplierVoiceNote(
       body: JSON.stringify({ range: `U${rowIndex}`, values: [[voiceText]] }),
     },
   );
+}
+
+// Update the Interest Level column (S) on an existing supplier row.
+export async function updateSupplierInterest(
+  sheetId: string,
+  rowIndex: number,
+  level: 'hot' | 'warm' | 'cold',
+  token: string,
+): Promise<void> {
+  const label = level === 'hot' ? '🔥 Hot' : level === 'warm' ? '🌤️ Warm' : '❄️ Cold';
+  await fetch(
+    `${SHEETS_API}/${sheetId}/values/S${rowIndex}?valueInputOption=USER_ENTERED`,
+    {
+      method: 'PUT',
+      headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ values: [[label]] }),
+    },
+  );
+}
+
+// Strikethrough an entire row (used for soft-delete UX so users can see the row
+// is in "trash" state without us actually wiping the data — eases recovery).
+export async function strikethroughRow(
+  sheetId: string,
+  sheetTab: 'Suppliers' | 'Products',
+  rowIndex: number,
+  on: boolean,
+  token: string,
+): Promise<void> {
+  // Need numeric sheetId for batchUpdate
+  const meta = await fetch(`${SHEETS_API}/${sheetId}?fields=sheets.properties(sheetId,title)`, {
+    headers: { Authorization: `Bearer ${token}` },
+  }).then(r => r.json()) as { sheets?: Array<{ properties?: { sheetId: number; title: string } }> };
+  const tab = meta.sheets?.find(s => s.properties?.title === sheetTab)?.properties?.sheetId;
+  if (tab === undefined) return;
+  await fetch(`${SHEETS_API}/${sheetId}:batchUpdate`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      requests: [{
+        repeatCell: {
+          range: { sheetId: tab, startRowIndex: rowIndex - 1, endRowIndex: rowIndex },
+          cell: { userEnteredFormat: { textFormat: { strikethrough: on } } },
+          fields: 'userEnteredFormat.textFormat.strikethrough',
+        },
+      }],
+    }),
+  });
 }
 
 // Update the Products / Price Range / Avg Lead Time columns (P, Q, R) on an existing supplier row.

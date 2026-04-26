@@ -218,6 +218,125 @@ async function uploadDocAndExportPdf(args: UploadArgs): Promise<GeneratedPdf | n
   };
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// DemoBot prospect profile PDF — one per scanned card. Uploaded into the root
+// of the prospect's Drive folder. Uses Digital Ledger styling but rendered
+// light-on-dark only translates poorly through Google Docs export, so we render
+// dark-text-on-white with a violet accent stripe for legibility.
+// ─────────────────────────────────────────────────────────────────────────────
+
+export async function generateProspectPdf(prospectId: string, env: Env): Promise<GeneratedPdf | null> {
+  const p = await env.DB.prepare(
+    `SELECT id, drive_folder_id, prospect_name, prospect_title, prospect_email, phone,
+            company, website, linkedin, address, detected_country, industry,
+            person_photo_url, person_description, card_front_url, card_back_url,
+            voice_note_transcript, website_summary_json, show_name_raw, scanned_at
+       FROM demobot_prospects WHERE id = ?`
+  ).bind(prospectId).first<{
+    id: string; drive_folder_id: string | null; prospect_name: string | null; prospect_title: string | null;
+    prospect_email: string; phone: string | null; company: string | null; website: string | null;
+    linkedin: string | null; address: string | null; detected_country: string | null; industry: string | null;
+    person_photo_url: string | null; person_description: string | null;
+    card_front_url: string | null; card_back_url: string | null;
+    voice_note_transcript: string | null; website_summary_json: string | null;
+    show_name_raw: string | null; scanned_at: number;
+  }>();
+  if (!p?.drive_folder_id) return null;
+
+  let websiteFields: Record<string, string> | null = null;
+  if (p.website_summary_json) {
+    try { websiteFields = JSON.parse(p.website_summary_json) as Record<string, string>; } catch { websiteFields = null; }
+  }
+
+  const monthYear = new Date(p.scanned_at * 1000).toLocaleString('en-US', { month: 'long', year: 'numeric' });
+  const html = renderProspectHtml(p, websiteFields, monthYear);
+
+  return uploadDocAndExportPdf({
+    html,
+    docName: `${p.company ?? 'Prospect'} — DaGama profile`,
+    pdfName: `${safe(p.company ?? 'prospect')}_Profile_${safe(monthYear)}.pdf`,
+    parentFolderId: p.drive_folder_id,
+    env,
+  });
+}
+
+function renderProspectHtml(
+  p: {
+    prospect_name: string | null; prospect_title: string | null; prospect_email: string;
+    phone: string | null; company: string | null; website: string | null; linkedin: string | null;
+    address: string | null; detected_country: string | null; industry: string | null;
+    person_photo_url: string | null; person_description: string | null;
+    card_front_url: string | null; card_back_url: string | null;
+    voice_note_transcript: string | null; show_name_raw: string | null;
+  },
+  websiteFields: Record<string, string> | null,
+  monthYear: string,
+): string {
+  const v = '#8B5CF6';
+  const ink = '#0D0D0D';
+  const muted = '#475569';
+  const line = '#E2E8F0';
+
+  const websiteSection = websiteFields ? Object.entries(websiteFields)
+    .filter(([, val]) => val && typeof val === 'string' && val !== 'Not found on website.')
+    .map(([k, val]) => `<tr><td style="padding:6px 12px 6px 0;color:${muted};vertical-align:top;width:160px;">${escapeHtml(humanize(k))}</td><td style="padding:6px 0;">${escapeHtml(String(val))}</td></tr>`)
+    .join('') : '';
+
+  return `<!doctype html><html><head><meta charset="utf-8"><title>${escapeHtml(p.company ?? 'Prospect')} — DaGama</title>
+<style>
+body{font-family:Arial,Helvetica,sans-serif;color:${ink};max-width:760px;margin:0 auto;padding:24px;}
+h1{font-size:28px;margin:0 0 4px 0;}
+h2{font-size:14px;letter-spacing:0.18em;text-transform:uppercase;color:${v};margin:32px 0 8px 0;border-top:2px solid ${v};padding-top:16px;}
+.eyebrow{font-size:11px;letter-spacing:0.2em;text-transform:uppercase;color:${v};margin-bottom:8px;}
+.kv{color:${muted};}
+table.contact{border-collapse:collapse;width:100%;margin-top:8px;}
+table.contact td{padding:6px 12px 6px 0;vertical-align:top;}
+img{max-width:280px;border-radius:6px;margin:6px 8px 0 0;}
+.cards{display:flex;gap:8px;margin-top:8px;}
+.note{background:#F8FAFC;border-left:3px solid ${v};padding:12px 16px;color:${ink};margin:12px 0;}
+.footer{margin-top:48px;padding-top:16px;border-top:1px solid ${line};color:${muted};font-size:11px;}
+</style></head><body>
+<div class="eyebrow">DaGama · SourceBot</div>
+<h1>${escapeHtml(p.company ?? 'Prospect')}</h1>
+<p class="kv">${escapeHtml(p.prospect_name ?? '')}${p.prospect_title ? ' — ' + escapeHtml(p.prospect_title) : ''}${p.show_name_raw ? ' · captured at ' + escapeHtml(p.show_name_raw) : ''}</p>
+
+<h2>Contact</h2>
+<table class="contact">
+  <tr><td style="width:140px;color:${muted};">Email</td><td>${escapeHtml(p.prospect_email)}</td></tr>
+  ${p.phone     ? `<tr><td style="color:${muted};">Phone</td><td>${escapeHtml(p.phone)}</td></tr>` : ''}
+  ${p.website   ? `<tr><td style="color:${muted};">Website</td><td>${escapeHtml(p.website)}</td></tr>` : ''}
+  ${p.linkedin  ? `<tr><td style="color:${muted};">LinkedIn</td><td>${escapeHtml(p.linkedin)}</td></tr>` : ''}
+  ${p.address   ? `<tr><td style="color:${muted};">Address</td><td>${escapeHtml(p.address)}</td></tr>` : ''}
+  ${p.detected_country ? `<tr><td style="color:${muted};">Country</td><td>${escapeHtml(p.detected_country)}</td></tr>` : ''}
+  ${p.industry  ? `<tr><td style="color:${muted};">Industry</td><td>${escapeHtml(p.industry)}</td></tr>` : ''}
+</table>
+
+${(p.card_front_url || p.card_back_url) ? `<h2>Business card</h2>
+<div class="cards">
+  ${p.card_front_url ? `<img src="${imgSrc(p.card_front_url)}" alt="Card front">` : ''}
+  ${p.card_back_url  ? `<img src="${imgSrc(p.card_back_url)}"  alt="Card back">`  : ''}
+</div>` : ''}
+
+${p.person_photo_url ? `<h2>In person</h2>
+<img src="${imgSrc(p.person_photo_url)}" alt="Person photo">
+${p.person_description ? `<p class="kv">${escapeHtml(p.person_description)}</p>` : ''}` : ''}
+
+${websiteSection ? `<h2>Company intel</h2>
+<table class="contact">${websiteSection}</table>` : ''}
+
+${p.voice_note_transcript ? `<h2>Voice note</h2>
+<div class="note">${escapeHtml(p.voice_note_transcript)}</div>` : ''}
+
+<div class="footer">
+  Generated ${escapeHtml(monthYear)} · DaGama SourceBot · heydagama.com
+</div>
+</body></html>`;
+}
+
+function humanize(key: string): string {
+  return key.replace(/([a-z])([A-Z])/g, '$1 $2').replace(/^./, c => c.toUpperCase());
+}
+
 // ── helpers ──────────────────────────────────────────────────────────────────
 
 function safe(s: string): string { return s.replace(/[^a-z0-9]+/gi, '_').slice(0, 60); }

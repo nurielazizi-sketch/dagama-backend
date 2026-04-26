@@ -1,0 +1,61 @@
+name: regen-docs
+
+# Daily auto-update of structural docs (SCHEMA.md migrations table + API.md
+# route table). Runs at 21:00 UTC ≈ midnight Asia/Jerusalem in DST / 23:00
+# in winter — close enough for "end of day".
+#
+# Also runs on every push to main and on demand via the Actions tab.
+#
+# What it does:
+#   1. Checks out main with a token that can push back.
+#   2. Runs `npm run docs` (deterministic regeneration from migrations/ + src/index.ts).
+#   3. If anything changed, commits and pushes back to main with [skip ci]
+#      so we don't kick off another run.
+
+on:
+  schedule:
+    - cron: '0 21 * * *'   # 21:00 UTC daily
+  push:
+    branches: [main]
+    paths:
+      - 'migrations/**'
+      - 'src/index.ts'
+      - 'scripts/regen-docs.mjs'
+  workflow_dispatch:        # manual trigger from the Actions tab
+
+permissions:
+  contents: write           # needed to push the auto-update commit
+
+concurrency:
+  group: regen-docs
+  cancel-in-progress: false
+
+jobs:
+  regen:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Regenerate docs
+        run: node scripts/regen-docs.mjs
+
+      - name: Commit if changed
+        run: |
+          if [[ -z "$(git status --porcelain docs/)" ]]; then
+            echo "No doc changes."
+            exit 0
+          fi
+          git config user.name  "dagama-docbot"
+          git config user.email "noreply@heydagama.com"
+          git add docs/
+          git commit -m "docs: daily auto-regen [skip ci]
+
+          Regenerated SCHEMA.md migration index + API.md route table from source."
+          git push

@@ -92,6 +92,17 @@ MIGRATIONS=(
   010_sb_products.sql
   011_sb_voice_notes.sql
   012_sb_emails_sent.sql
+  013_sb_per_supplier_folder.sql
+  014_sb_subfolders_corrections.sql
+  015_sb_show_metadata_plans.sql
+  016_funnel_events.sql
+  017_referrals_language.sql
+  018_interest_soft_delete.sql
+  019_sb_tg_updates_seen.sql
+  020_demobot.sql
+  021_whatsapp.sql
+  022_demobot_self_serve.sql
+  023_demobot_whatsapp.sql
 )
 
 for m in "${MIGRATIONS[@]}"; do
@@ -136,12 +147,25 @@ step "registering SourceBot webhook"
 RESP=$(curl -fsS -X POST "$ORIGIN/api/sourcebot/setup" \
   -H 'Content-Type: application/json' \
   -d "{\"url\":\"$ORIGIN\"}" 2>&1) || {
-    echo "$(red '✘') webhook registration failed:"
+    echo "$(red '✘') sourcebot webhook registration failed:"
     echo "$RESP" | sed 's/^/    /'
     exit 1
   }
-echo "$(green '✓') webhook registered"
+echo "$(green '✓') sourcebot webhook registered"
 echo "    $RESP"
+
+# ── 6. Register DemoBot webhook (only if token is set) ───────────────────────
+if echo "$SECRET_LIST" | grep -q '"TELEGRAM_BOT_TOKEN_DEMO"'; then
+  step "registering DemoBot webhook"
+  RESP=$(curl -fsS -X POST "$ORIGIN/api/demobot/setup" 2>&1) || {
+    echo "$(yellow '⚠') demobot webhook registration failed (worker may not have picked up the route yet):"
+    echo "$RESP" | sed 's/^/    /'
+  }
+  echo "$(green '✓') demobot webhook registered"
+  echo "    $RESP"
+else
+  echo "$(yellow '⚠') TELEGRAM_BOT_TOKEN_DEMO not set — skipping DemoBot webhook registration"
+fi
 
 echo
 echo "$(green '✅ deploy complete')  env=$ENV"

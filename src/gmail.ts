@@ -174,7 +174,8 @@ export async function sendGmailEmail(
   chatId: number,
   to: string,
   rawEmailText: string,
-  env: Env
+  env: Env,
+  htmlBody?: string,
 ): Promise<SendEmailResult> {
   const accessToken  = await getValidAccessToken(chatId, env);
   const tokenRow     = await getGmailToken(chatId, env);
@@ -185,7 +186,7 @@ export async function sendGmailEmail(
   const subject = lines[0].replace(/^subject:\s*/i, '').trim();
   const body    = lines.slice(1).join('\n').trim();
 
-  const mimeMessage = buildMimeMessage({ from: fromAddress, to, subject, body });
+  const mimeMessage = buildMimeMessage({ from: fromAddress, to, subject, body, htmlBody });
 
   const res = await fetch(GMAIL_SEND_URL, {
     method: 'POST',
@@ -213,17 +214,46 @@ function buildMimeMessage(params: {
   from: string;
   to: string;
   subject: string;
-  body: string;
+  body: string;       // text/plain fallback
+  htmlBody?: string;  // optional text/html alternative
 }): string {
-  const raw = [
-    `From: ${params.from}`,
-    `To: ${params.to}`,
-    `Subject: ${params.subject}`,
-    'MIME-Version: 1.0',
-    'Content-Type: text/plain; charset="UTF-8"',
-    '',
-    params.body,
-  ].join('\r\n');
+  let raw: string;
+  if (params.htmlBody) {
+    // multipart/alternative — Gmail clients prefer the HTML part; plain-text
+    // clients (and spam filters that prefer text) fall back to params.body.
+    const boundary = `=_dagama_${Math.random().toString(36).slice(2, 10)}`;
+    raw = [
+      `From: ${params.from}`,
+      `To: ${params.to}`,
+      `Subject: ${params.subject}`,
+      'MIME-Version: 1.0',
+      `Content-Type: multipart/alternative; boundary="${boundary}"`,
+      '',
+      `--${boundary}`,
+      'Content-Type: text/plain; charset="UTF-8"',
+      'Content-Transfer-Encoding: 7bit',
+      '',
+      params.body,
+      '',
+      `--${boundary}`,
+      'Content-Type: text/html; charset="UTF-8"',
+      'Content-Transfer-Encoding: 7bit',
+      '',
+      params.htmlBody,
+      '',
+      `--${boundary}--`,
+    ].join('\r\n');
+  } else {
+    raw = [
+      `From: ${params.from}`,
+      `To: ${params.to}`,
+      `Subject: ${params.subject}`,
+      'MIME-Version: 1.0',
+      'Content-Type: text/plain; charset="UTF-8"',
+      '',
+      params.body,
+    ].join('\r\n');
+  }
 
   const bytes  = new TextEncoder().encode(raw);
   const binary = Array.from(bytes).map(b => String.fromCharCode(b)).join('');

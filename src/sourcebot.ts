@@ -2,12 +2,12 @@
 
 import type { Env } from './types';
 import { consumeOnboardingToken } from './onboarding';
-import { getServiceAccountToken, createDriveFolder } from './google';
+import { getServiceAccountToken, createDriveFolder, shareDriveItem } from './google';
 import { scheduleFunnelOnFirstScan, trackEvent } from './funnel';
 import { generateSupplierPdf, generateShowPdf } from './pdf';
-import { appendSupplierRow, updateSupplierProducts, updateSupplierVoiceNote, updateSupplierEmailStatus, appendProductRow, updateProductRow, ensureProductsTab, updateSupplierCardBack, updateSupplierPerson } from './sb_sheets';
+import { appendSupplierRow, updateSupplierProducts, updateSupplierVoiceNote, updateSupplierEmailStatus, appendProductRow, updateProductRow, ensureProductsTab, updateSupplierCardBack, updateSupplierPerson, createSourceBotSheet, updateSupplierInterest, strikethroughRow } from './sb_sheets';
 import { buildGmailAuthUrl, getGmailToken, getValidAccessToken, sendGmailEmail } from './gmail';
-import { ocrThenExtract } from './extract';
+import { extractContactFromImage } from './extract';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // SourceBot Telegram webhook handler.
@@ -62,7 +62,7 @@ interface SourceBotSession {
   step: SourceBotStep;
   activeCompanyId?: string;
   activeProductId?: string;
-  activeEmailDraft?: { draftId: string; companyId: string; recipient: string; subject: string; body: string };
+  activeEmailDraft?: { draftId: string; companyId: string; recipient: string; subject: string; body: string; html?: string };
 }
 
 export async function handleSourceBotWebhook(request: Request, env: Env): Promise<Response> {
@@ -76,6 +76,17 @@ export async function handleSourceBotWebhook(request: Request, env: Env): Promis
 
   let update: TgUpdate;
   try { update = await request.json() as TgUpdate; } catch { return new Response('Bad request', { status: 400 }); }
+
+  // Dedupe by update_id — Telegram retries the webhook on slow responses, which
+  // would cause /start (and every other action) to fire twice. update_id is
+  // monotonically unique per bot, so an INSERT OR IGNORE conflict means we've
+  // already processed this update.
+  if (typeof update.update_id === 'number') {
+    const r = await env.DB.prepare(
+      `INSERT OR IGNORE INTO sb_tg_updates_seen (update_id, seen_at) VALUES (?, ?)`
+    ).bind(update.update_id, Math.floor(Date.now() / 1000)).run();
+    if ((r.meta.changes ?? 0) === 0) return new Response('OK (dedup)', { status: 200 });
+  }
 
   if (update.message)        await handleMessage(update.message, env);
   else if (update.callback_query) await handleCallback(update.callback_query, env);
@@ -163,6 +174,27 @@ async function handleMessage(msg: TgMessage, env: Env): Promise<void> {
     return;
   }
   if (text === '/share')                                   { await cmdShare(chatId, buyer, env); return; }
+  if (text === '/undo')                                    { await cmdUndo(chatId, buyer, env); return; }
+
+  // ── Unknown slash command: suggest the nearest known one ──
+  // Catches typos like /langauge → /language, /produkts → /products. We only
+  // intercept here if the text *starts* with a slash so free-form messages
+  // (and replies) still flow through to the rest of the dispatch.
+  if (text.startsWith('/')) {
+    const suggestion = nearestKnownCommand(text);
+    if (suggestion) {
+      await sendButtons(chatId,
+        `🤔 I don't know *${escapeMd(text.split(/\s/)[0])}*. Did you mean *${suggestion}*?`,
+        [[{ text: `✅ Yes, run ${suggestion}`, callback_data: `runcmd:${suggestion}` }],
+         [{ text: '❌ No, never mind',         callback_data: 'cmd_dismiss' }]],
+        env, true);
+    } else {
+      await send(chatId,
+        `🤔 I don't know that command. Try /help for the full list.`,
+        env);
+    }
+    return;
+  }
 
   // ── Reply-to-message corrections ──
   // If the user is replying to a confirmation message we previously sent, look
@@ -170,6 +202,15 @@ async function handleMessage(msg: TgMessage, env: Env): Promise<void> {
   if (msg.reply_to_message && text) {
     const handled = await handleCorrectionReply(chatId, msg.reply_to_message.message_id, text, buyer, env);
     if (handled) return;
+    // Reply pointed at a message we no longer track. Tell the user instead of
+    // silently falling through to the generic "send a card" prompt.
+    await send(chatId,
+      `🤔 I couldn't match that reply to a saved item. Try:\n` +
+      `• /supplier <name> — to update a supplier\n` +
+      `• /products <name> — to see and update products\n` +
+      `• Send a new photo to capture something fresh`,
+      env);
+    return;
   }
 
   // ── Step machine: in-flow handling for the product capture sequence ──
@@ -213,7 +254,7 @@ async function handleMessage(msg: TgMessage, env: Env): Promise<void> {
       await handlePersonPhoto(chatId, msg.photo, session, buyer, env);
       return;
     }
-    await send(chatId, `👤 Please send a *photo of the person*, or /cancel.`, env, true);
+    await send(chatId, `📷 Please send a photo (person, booth, signage…), or /cancel.`, env, true);
     return;
   }
   if (session.step === 'awaiting_voice_note') {
@@ -272,8 +313,23 @@ async function handleCallback(cb: TgCallbackQuery, env: Env): Promise<void> {
     body: JSON.stringify({ callback_query_id: cb.id, text: toastFor(data) }),
   });
 
-  // Strip the keyboard so the user can't double-tap
-  if (cb.message) {
+  // Strip the keyboard ONLY for terminal actions — leave it for "Hot/Warm/Cold",
+  // "Card back", "Person photo", "Add details", etc. so the user can keep
+  // tapping the same supplier confirmation message for follow-up actions.
+  const TERMINAL_CALLBACKS = new Set([
+    'done_capturing', 'new_supplier',
+    'blast_send', 'blast_cancel',
+    'email_send', 'email_discard',
+    'cmd_dismiss',
+  ]);
+  const isTerminal =
+    TERMINAL_CALLBACKS.has(data) ||
+    data.startsWith('blast_send:')   ||
+    data.startsWith('email_send:')   ||
+    data.startsWith('runcmd:')       ||
+    data.startsWith('undo_delete_supplier:') ||
+    data.startsWith('undo_delete_product:');
+  if (cb.message && isTerminal) {
     await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN_SOURCE}/editMessageReplyMarkup`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -315,7 +371,7 @@ async function handleCallback(cb: TgCallbackQuery, env: Env): Promise<void> {
   if (data.startsWith('person_photo:')) {
     const companyId = data.slice('person_photo:'.length);
     await setSession(chatId, { step: 'awaiting_person_photo', activeCompanyId: companyId }, env);
-    await send(chatId, `👤 Send a *photo of the person* (e.g. them at the booth). I'll attach it to this contact.`, env, true);
+    await send(chatId, `📷 Send a *photo of the person, the booth, signage, or anything else* you want to remember about this supplier. I'll describe it and attach it to this contact.`, env, true);
     return;
   }
   if (data === 'skip_field') {
@@ -345,6 +401,54 @@ async function handleCallback(cb: TgCallbackQuery, env: Env): Promise<void> {
     await send(chatId, `❌ Bulk send cancelled.`, env);
     return;
   }
+  if (data.startsWith('interest:')) {
+    const [, level, companyId] = data.split(':');
+    if (!level || !companyId) return;
+    const buyer = await getBuyerForChat(chatId, env);
+    if (!buyer) return;
+    await setInterestLevel(chatId, companyId, level as 'hot' | 'warm' | 'cold', buyer, env);
+    return;
+  }
+  if (data.startsWith('delete_supplier:')) {
+    const companyId = data.slice('delete_supplier:'.length);
+    const buyer = await getBuyerForChat(chatId, env);
+    if (!buyer) return;
+    await softDeleteSupplier(chatId, companyId, buyer, env);
+    return;
+  }
+  if (data.startsWith('delete_product:')) {
+    const productId = data.slice('delete_product:'.length);
+    const buyer = await getBuyerForChat(chatId, env);
+    if (!buyer) return;
+    await softDeleteProduct(chatId, productId, buyer, env);
+    return;
+  }
+  if (data.startsWith('undo_delete_supplier:')) {
+    const companyId = data.slice('undo_delete_supplier:'.length);
+    const buyer = await getBuyerForChat(chatId, env);
+    if (!buyer) return;
+    await undoSoftDeleteSupplier(chatId, companyId, buyer, env);
+    return;
+  }
+  if (data === 'cmd_dismiss') {
+    await send(chatId, `Got it.`, env);
+    return;
+  }
+  if (data.startsWith('runcmd:')) {
+    const cmd = data.slice('runcmd:'.length);
+    if (KNOWN_COMMANDS.includes(cmd)) {
+      // Re-enter handleMessage with a synthetic /cmd so the original dispatch fires.
+      await handleMessage({ message_id: 0, chat: { id: chatId, type: 'private' }, text: cmd }, env);
+    }
+    return;
+  }
+  if (data.startsWith('undo_delete_product:')) {
+    const productId = data.slice('undo_delete_product:'.length);
+    const buyer = await getBuyerForChat(chatId, env);
+    if (!buyer) return;
+    await undoSoftDeleteProduct(chatId, productId, buyer, env);
+    return;
+  }
 }
 
 async function runBlast(chatId: number, showName: string, buyer: { buyerId: string }, env: Env): Promise<void> {
@@ -353,6 +457,7 @@ async function runBlast(chatId: number, showName: string, buyer: { buyerId: stri
        FROM sb_companies c JOIN sb_contacts co ON co.company_id = c.id
        LEFT JOIN sb_emails_sent es ON es.company_id = c.id AND es.status = 'sent'
       WHERE c.buyer_id = ? AND c.show_name = ?
+        AND c.deleted_at IS NULL AND co.deleted_at IS NULL
         AND co.email IS NOT NULL AND co.email != ''
         AND es.id IS NULL
       GROUP BY c.id, c.name
@@ -417,10 +522,16 @@ function toastFor(data: string): string {
 async function cmdStart(chatId: number, firstName: string, env: Env): Promise<void> {
   const buyer = await getBuyerForChat(chatId, env);
   if (buyer) {
+    const sheet = await env.DB.prepare(
+      `SELECT sheet_url FROM sb_buyer_shows WHERE buyer_id = ? AND status IN ('active','grace')
+        ORDER BY created_at DESC LIMIT 1`
+    ).bind(buyer.buyerId).first<{ sheet_url: string | null }>();
     await send(chatId,
       `👋 Welcome back, ${firstName}!\n\n` +
-      `📸 Send me a supplier's business card photo and I'll save them to your sheet.`,
-      env);
+      `📸 Send a supplier's business card photo to capture them, or 📦 a product photo to attach it to your last supplier.\n\n` +
+      `Type /help for the full command list` +
+      (sheet?.sheet_url ? ` · 📊 [Open your Sheet](${sheet.sheet_url})` : '') + `.`,
+      env, true);
     return;
   }
   await send(chatId,
@@ -457,11 +568,29 @@ async function cmdStartWithToken(chatId: number, firstName: string, token: strin
      ON CONFLICT(telegram_chat_id) DO UPDATE SET buyer_id = excluded.buyer_id`
   ).bind(buyer.id, chatId).run();
 
+  // Pull the buyer's sheet so we can deep-link them straight to it.
+  const sheet = await env.DB.prepare(
+    `SELECT sheet_url FROM sb_buyer_shows WHERE buyer_id = ? ORDER BY created_at DESC LIMIT 1`
+  ).bind(buyer.id).first<{ sheet_url: string | null }>();
+
   await send(chatId,
-    `✅ Connected, ${firstName}!\n\n` +
-    `📸 Send a supplier's business card photo to start capturing leads. ` +
-    `I'll extract their contact info and write it straight to your Google Sheet.`,
-    env);
+    `✅ *Connected, ${firstName}!* I'm DaGama SourceBot — your trade-show companion.\n\n` +
+    `*What I do:*\n` +
+    `📇 *Capture suppliers* — send me a photo of a business card and I'll extract name, title, email, phone, website, LinkedIn, address, and country into your Sheet.\n` +
+    `📦 *Capture products* — send a product photo right after a card and I'll attach it to that supplier with an image, name, and AI-written description.\n` +
+    `💬 *Voice + text notes* — reply to any photo with text or a voice note and I'll pull out price, MOQ, lead time, colors, materials, and add them to the row.\n` +
+    `✏️ *Fix mistakes* — reply to any of my confirmations with a correction (e.g. "phone is +1 415 555 1234") and I'll update the field.\n` +
+    `🔥 *Rank interest* — tap Hot / Warm / Cold on a supplier so you remember the best leads.\n` +
+    `📧 *AI follow-ups* — /email <supplier> drafts and sends a personal email from your Gmail. /blast sends one to every supplier you haven't contacted.\n` +
+    `📑 *PDFs* — /pdf <supplier> for a one-pager, /pdfshow for a full-show recap.\n` +
+    `🔍 */find <text>* searches everything · */compare <product>* AI-ranks suppliers · */summary* recaps the show.\n\n` +
+    `*Quick start:*\n` +
+    `1. Send the next supplier's *business card photo* 📸\n` +
+    `2. Send their *product photos* 📦 right after\n` +
+    `3. *Reply* with details — by voice or text 🎤\n\n` +
+    `Use /help anytime for the full command list` +
+    (sheet?.sheet_url ? ` · 📊 [Open your Sheet](${sheet.sheet_url})` : '') + `.`,
+    env, true);
 }
 
 async function cmdHelp(chatId: number, env: Env): Promise<void> {
@@ -511,19 +640,20 @@ async function cmdFind(chatId: number, query: string, buyer: { buyerId: string }
     `SELECT type, company_id, company_name, context FROM (
        SELECT 'company' AS type, c.id AS company_id, c.name AS company_name, '' AS context
          FROM sb_companies c
-         WHERE c.buyer_id = ? AND c.name LIKE ?
+         WHERE c.buyer_id = ? AND c.deleted_at IS NULL AND c.name LIKE ?
        UNION ALL
        SELECT 'contact', co.company_id, c.name, COALESCE(co.name,'') || (CASE WHEN co.email IS NOT NULL THEN ' · ' || co.email ELSE '' END)
          FROM sb_contacts co JOIN sb_companies c ON c.id = co.company_id
-         WHERE co.buyer_id = ? AND (co.name LIKE ? OR co.email LIKE ? OR co.phone LIKE ?)
+         WHERE co.buyer_id = ? AND co.deleted_at IS NULL AND c.deleted_at IS NULL
+           AND (co.name LIKE ? OR co.email LIKE ? OR co.phone LIKE ?)
        UNION ALL
        SELECT 'product', p.company_id, c.name, p.name || (CASE WHEN p.price IS NOT NULL THEN ' · ' || p.price ELSE '' END)
          FROM sb_products p JOIN sb_companies c ON c.id = p.company_id
-         WHERE p.buyer_id = ? AND p.name LIKE ?
+         WHERE p.buyer_id = ? AND p.deleted_at IS NULL AND c.deleted_at IS NULL AND p.name LIKE ?
        UNION ALL
        SELECT 'voice', v.company_id, c.name, substr(v.transcript, 1, 120)
          FROM sb_voice_notes v JOIN sb_companies c ON c.id = v.company_id
-         WHERE v.buyer_id = ? AND v.transcript LIKE ?
+         WHERE v.buyer_id = ? AND c.deleted_at IS NULL AND v.transcript LIKE ?
      )
      LIMIT 15`
   ).bind(
@@ -558,7 +688,7 @@ async function cmdCompare(chatId: number, query: string, buyer: { buyerId: strin
   const matches = await env.DB.prepare(
     `SELECT p.name AS product, p.price, p.moq, p.lead_time, p.notes, c.name AS supplier, c.website
        FROM sb_products p JOIN sb_companies c ON c.id = p.company_id
-      WHERE p.buyer_id = ? AND p.name LIKE ?
+      WHERE p.buyer_id = ? AND p.deleted_at IS NULL AND c.deleted_at IS NULL AND p.name LIKE ?
       ORDER BY p.created_at DESC
       LIMIT 30`
   ).bind(buyer.buyerId, like).all<{ product: string | null; price: string | null; moq: string | null; lead_time: string | null; notes: string | null; supplier: string; website: string | null }>();
@@ -646,7 +776,7 @@ async function cmdEmail(chatId: number, query: string, buyer: { buyerId: string 
   // 1. Find the supplier (latest match if multiple)
   const company = await env.DB.prepare(
     `SELECT id, name, show_name, sheet_row FROM sb_companies
-       WHERE buyer_id = ? AND name LIKE ? ORDER BY created_at DESC LIMIT 1`
+       WHERE buyer_id = ? AND deleted_at IS NULL AND name LIKE ? ORDER BY created_at DESC LIMIT 1`
   ).bind(buyer.buyerId, `%${query}%`).first<{ id: string; name: string; show_name: string; sheet_row: number | null }>();
   if (!company) {
     await send(chatId, `🔍 No supplier matching *${query}*. Try /find first.`, env, true);
@@ -656,7 +786,7 @@ async function cmdEmail(chatId: number, query: string, buyer: { buyerId: string 
   // 2. Find a contact with an email
   const contact = await env.DB.prepare(
     `SELECT name, title, email FROM sb_contacts
-       WHERE company_id = ? AND email IS NOT NULL AND email != ''
+       WHERE company_id = ? AND deleted_at IS NULL AND email IS NOT NULL AND email != ''
        ORDER BY created_at LIMIT 1`
   ).bind(company.id).first<{ name: string | null; title: string | null; email: string }>();
   if (!contact) {
@@ -677,7 +807,7 @@ async function cmdEmail(chatId: number, query: string, buyer: { buyerId: string 
 
   // 4. Build the draft context
   const products = await env.DB.prepare(
-    `SELECT name, price, moq, lead_time FROM sb_products WHERE company_id = ? ORDER BY created_at LIMIT 6`
+    `SELECT name, price, moq, lead_time FROM sb_products WHERE company_id = ? AND deleted_at IS NULL ORDER BY created_at LIMIT 6`
   ).bind(company.id).all<{ name: string | null; price: string | null; moq: string | null; lead_time: string | null }>();
   const voiceNotes = await env.DB.prepare(
     `SELECT transcript FROM sb_voice_notes WHERE company_id = ? ORDER BY created_at LIMIT 3`
@@ -706,7 +836,7 @@ async function cmdEmail(chatId: number, query: string, buyer: { buyerId: string 
   const session = await getSession(chatId, env);
   await setSession(chatId, {
     ...session,
-    activeEmailDraft: { draftId, companyId: company.id, recipient: contact.email, subject: draft.subject, body: draft.body },
+    activeEmailDraft: { draftId, companyId: company.id, recipient: contact.email, subject: draft.subject, body: draft.body, html: draft.html },
   }, env);
 
   const preview =
@@ -738,7 +868,7 @@ async function sendDraftedEmail(chatId: number, draftId: string, buyer: { buyerI
   ).bind(draft.companyId).first<{ name: string; show_name: string; sheet_row: number | null }>();
 
   try {
-    const result = await sendGmailEmail(chatId, draft.recipient, rawEmailText, env);
+    const result = await sendGmailEmail(chatId, draft.recipient, rawEmailText, env, draft.html);
     const sentAt = result.sentAt;
 
     // Log to D1
@@ -788,9 +918,10 @@ interface DraftContext {
   voiceNotes: string[];
 }
 
-async function draftFollowUpEmail(ctx: DraftContext, env: Env): Promise<{ subject: string; body: string }> {
+async function draftFollowUpEmail(ctx: DraftContext, env: Env): Promise<{ subject: string; body: string; html: string }> {
   const prompt =
-    `You are drafting a short, professional follow-up email from a B2B buyer to a supplier they met at a trade show. ` +
+    `You are drafting a professional follow-up email from a B2B buyer to a supplier they met at a trade show. ` +
+    `It must read like it was written by a person — warm but businesslike, no marketing fluff, no ALL CAPS, no exclamation points. ` +
     `Context:\n` +
     `- Show: ${ctx.showName}\n` +
     `- Supplier: ${ctx.company}\n` +
@@ -798,8 +929,15 @@ async function draftFollowUpEmail(ctx: DraftContext, env: Env): Promise<{ subjec
     (ctx.products.length    ? `- Products discussed: ${ctx.products.join('; ')}\n`             : '') +
     (ctx.voiceNotes.length  ? `- Buyer's notes: ${ctx.voiceNotes.join(' | ')}\n`               : '') +
     `\nReturn ONLY a JSON object with these exact fields:\n` +
-    `- subject (concise, 60 chars max)\n` +
-    `- body (4-7 sentences, plain text, no markdown). Open by referencing the show. Mention 1-2 specific products if known. Ask a clear next-step question (samples, pricing sheet, MOQ confirmation). Sign off neutrally. Don't fabricate prices or terms.`;
+    `- subject: concise, 60 chars max. No emojis. Start with "Following up — {Show}" or "Re: {product}" style.\n` +
+    `- greeting: one short line, e.g. "Hi {firstName},". Use the contact's first name if available; "Hi there," otherwise. End with a comma.\n` +
+    `- intro: ONE paragraph, 1-2 sentences, referencing the show by name and where you met (booth, conversation).\n` +
+    `- discussed_intro: a single short sentence introducing the product list, e.g. "I'm especially interested in:" — empty string if no products.\n` +
+    `- products: array of strings, one per product discussed (use the names from "Products discussed" — keep them as-is). Empty array if no products.\n` +
+    `- ask: ONE paragraph, 1-2 sentences asking a clear next step (samples, pricing sheet, MOQ confirmation, lead times). Don't fabricate prices.\n` +
+    `- closing: a polite sign-off line ending with a comma, e.g. "Best regards,".\n` +
+    `- signature_name: empty string — the buyer's signature is appended downstream.\n` +
+    `Don't include greetings/closings inside intro/ask. Don't repeat the same idea twice.`;
 
   const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${env.GEMINI_API_KEY}`;
   const res = await fetch(url, {
@@ -811,10 +949,59 @@ async function draftFollowUpEmail(ctx: DraftContext, env: Env): Promise<{ subjec
     }),
   });
   const data = await res.json() as { candidates?: Array<{ content?: { parts?: Array<{ text?: string }> } }> };
-  if (!data.candidates?.length) return { subject: '', body: '' };
+  if (!data.candidates?.length) return { subject: '', body: '', html: '' };
   const raw = data.candidates[0]?.content?.parts?.[0]?.text ?? '{}';
-  const parsed = JSON.parse(raw.replace(/```json|```/g, '').trim()) as { subject?: string; body?: string };
-  return { subject: parsed.subject ?? '', body: parsed.body ?? '' };
+  const parsed = JSON.parse(raw.replace(/```json|```/g, '').trim()) as {
+    subject?: string; greeting?: string; intro?: string;
+    discussed_intro?: string; products?: string[]; ask?: string; closing?: string;
+  };
+
+  const subject  = parsed.subject  ?? '';
+  const greeting = parsed.greeting ?? 'Hi there,';
+  const intro    = parsed.intro    ?? '';
+  const discussedIntro = parsed.discussed_intro ?? '';
+  const products = Array.isArray(parsed.products) ? parsed.products.filter(Boolean) : [];
+  const ask      = parsed.ask      ?? '';
+  const closing  = parsed.closing  ?? 'Best regards,';
+
+  const body = renderEmailPlain({ greeting, intro, discussedIntro, products, ask, closing });
+  const html = renderEmailHtml({ greeting, intro, discussedIntro, products, ask, closing });
+  return { subject, body, html };
+}
+
+interface EmailParts {
+  greeting: string; intro: string; discussedIntro: string;
+  products: string[]; ask: string; closing: string;
+}
+
+function renderEmailPlain(p: EmailParts): string {
+  const productLines = p.products.length
+    ? '\n' + p.discussedIntro + '\n' + p.products.map(name => `  - ${name}`).join('\n') + '\n'
+    : '';
+  return [p.greeting, '', p.intro, productLines, p.ask, '', p.closing]
+    .filter(s => s !== undefined)
+    .join('\n')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+}
+
+function renderEmailHtml(p: EmailParts): string {
+  const esc = (s: string) => s
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+  const productHtml = p.products.length
+    ? `<p style="margin:16px 0 6px;">${esc(p.discussedIntro)}</p>` +
+      `<ul style="margin:0 0 16px;padding-left:22px;">` +
+      p.products.map(name => `<li style="margin:4px 0;">${esc(name)}</li>`).join('') +
+      `</ul>`
+    : '';
+  return `<!DOCTYPE html><html><body style="font-family:-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;font-size:15px;line-height:1.55;color:#222;max-width:560px;">
+<p style="margin:0 0 16px;">${esc(p.greeting)}</p>
+<p style="margin:0 0 16px;">${esc(p.intro)}</p>
+${productHtml}
+<p style="margin:0 0 16px;">${esc(p.ask)}</p>
+<p style="margin:24px 0 0;">${esc(p.closing)}</p>
+</body></html>`;
 }
 
 // ── /pending — products missing price or MOQ (per spec) ─────────────────────
@@ -832,6 +1019,7 @@ async function cmdPending(chatId: number, buyer: { buyerId: string }, env: Env):
        FROM sb_products p
        JOIN sb_companies c ON c.id = p.company_id
       WHERE p.buyer_id = ? AND p.show_name = ?
+        AND p.deleted_at IS NULL AND c.deleted_at IS NULL
         AND ((p.price IS NULL OR p.price = '') OR (p.moq IS NULL OR p.moq = ''))
       ORDER BY p.created_at DESC
       LIMIT 30`
@@ -870,6 +1058,7 @@ async function cmdFollowups(chatId: number, buyer: { buyerId: string }, env: Env
        JOIN sb_contacts co ON co.company_id = c.id
        LEFT JOIN sb_emails_sent es ON es.company_id = c.id AND es.status = 'sent'
       WHERE c.buyer_id = ? AND c.show_name = ?
+        AND c.deleted_at IS NULL AND co.deleted_at IS NULL
         AND co.email IS NOT NULL AND co.email != ''
         AND es.id IS NULL
       GROUP BY c.id, c.name
@@ -899,16 +1088,16 @@ async function cmdSupplier(chatId: number, query: string, buyer: { buyerId: stri
   if (!pass) { await send(chatId, `No active show found.`, env); return; }
 
   const where = query
-    ? `c.buyer_id = ? AND c.show_name = ? AND lower(c.name) LIKE lower(?)`
-    : `c.buyer_id = ? AND c.show_name = ?`;
+    ? `c.buyer_id = ? AND c.show_name = ? AND c.deleted_at IS NULL AND lower(c.name) LIKE lower(?)`
+    : `c.buyer_id = ? AND c.show_name = ? AND c.deleted_at IS NULL`;
   const binds: (string | number)[] = query
     ? [buyer.buyerId, pass.show_name, `%${query}%`]
     : [buyer.buyerId, pass.show_name];
 
   const rows = await env.DB.prepare(
     `SELECT c.id, c.name,
-            (SELECT COUNT(*) FROM sb_products p WHERE p.company_id = c.id) AS product_count,
-            (SELECT MIN(co.email) FROM sb_contacts co WHERE co.company_id = c.id) AS email
+            (SELECT COUNT(*) FROM sb_products p WHERE p.company_id = c.id AND p.deleted_at IS NULL) AS product_count,
+            (SELECT MIN(co.email) FROM sb_contacts co WHERE co.company_id = c.id AND co.deleted_at IS NULL) AS email
        FROM sb_companies c
       WHERE ${where}
       ORDER BY c.created_at DESC
@@ -944,8 +1133,8 @@ async function cmdProducts(chatId: number, query: string, buyer: { buyerId: stri
   if (!pass) { await send(chatId, `No active show found.`, env); return; }
 
   const where = query
-    ? `p.buyer_id = ? AND p.show_name = ? AND (lower(p.name) LIKE lower(?) OR lower(c.name) LIKE lower(?))`
-    : `p.buyer_id = ? AND p.show_name = ?`;
+    ? `p.buyer_id = ? AND p.show_name = ? AND p.deleted_at IS NULL AND c.deleted_at IS NULL AND (lower(p.name) LIKE lower(?) OR lower(c.name) LIKE lower(?))`
+    : `p.buyer_id = ? AND p.show_name = ? AND p.deleted_at IS NULL AND c.deleted_at IS NULL`;
   const binds: string[] = query
     ? [buyer.buyerId, pass.show_name, `%${query}%`, `%${query}%`]
     : [buyer.buyerId, pass.show_name];
@@ -1534,21 +1723,29 @@ async function handleSupplierCard(
   const imgRes = await fetch(`https://api.telegram.org/file/bot${env.TELEGRAM_BOT_TOKEN_SOURCE}/${filePath}`);
   const rawBuffer = await imgRes.arrayBuffer();
   const base64 = arrayBufferToBase64(rawBuffer);
+  const mimeType = filePath.endsWith('.png') ? 'image/png' : 'image/jpeg';
 
-  // 2. OCR + extraction (shared pipeline in src/extract.ts)
+  // 2. Gemini vision extraction in parallel with SA token mint — both are
+  //    needed before we can persist + upload, but they're independent network
+  //    calls, so kicking the token off early shaves ~200-500ms.
   let extracted: ExtractedContactLocal;
+  let saToken: string;
   try {
-    const result = await ocrThenExtract(base64, filePath.endsWith('.png') ? 'image/png' : 'image/jpeg', env);
+    const [vision, token] = await Promise.all([
+      extractContactFromImage(base64, mimeType, env),
+      getServiceAccountToken(env),
+    ]);
+    saToken = token;
     extracted = {
-      name:     result.contact.name,
-      title:    result.contact.title,
-      company:  result.contact.company,
-      email:    result.contact.email,
-      phone:    result.contact.phone,
-      website:  result.contact.website,
-      linkedin: result.contact.linkedin,
-      address:  result.contact.address,
-      country:  result.contact.country,
+      name:     vision.contact.name,
+      title:    vision.contact.title,
+      company:  vision.contact.company,
+      email:    vision.contact.email,
+      phone:    vision.contact.phone,
+      website:  vision.contact.website,
+      linkedin: vision.contact.linkedin,
+      address:  vision.contact.address,
+      country:  vision.contact.country,
     };
   } catch (e) {
     console.error('[sourcebot] extraction failed:', e);
@@ -1577,7 +1774,7 @@ async function handleSupplierCard(
   let folders: SupplierFolders | undefined;
   if (pass.drive_folder_id) {
     try {
-      folders = await getOrCreateSupplierFolders(companyId, companyName, pass.drive_folder_id, env);
+      folders = await getOrCreateSupplierFolders(companyId, companyName, pass.drive_folder_id, env, saToken);
     } catch (e) {
       console.error('[sourcebot] supplier folder create failed:', e);
     }
@@ -1588,8 +1785,7 @@ async function handleSupplierCard(
   try {
     const parent = folders?.cards ?? pass.drive_folder_id;
     if (parent) {
-      const tok = await getServiceAccountToken(env);
-      cardUrl = await uploadCardImage(rawBuffer, extracted.name || 'card', extracted.company, parent, tok);
+      cardUrl = await uploadCardImage(rawBuffer, extracted.name || 'card', extracted.company, parent, saToken);
     }
   } catch (e) {
     console.error('[sourcebot] card upload failed:', e);
@@ -1611,7 +1807,7 @@ async function handleSupplierCard(
 
   // 5. Append row to the buyer's Sheet + record sheet_row on the company so we can update later
   try {
-    const token = await getServiceAccountToken(env);
+    const folderUrl = folders?.parent ? `https://drive.google.com/drive/folders/${folders.parent}` : undefined;
     const { rowIndex } = await appendSupplierRow(pass.sheet_id, {
       timestamp:    new Date().toISOString(),
       company:      companyName,
@@ -1623,7 +1819,8 @@ async function handleSupplierCard(
       linkedin:     extracted.linkedin|| '',
       industry:     '',
       cardFrontUrl: cardUrl,
-    }, token);
+      folderUrl,
+    }, saToken);
 
     if (!existingCompany) {
       await env.DB.prepare(`UPDATE sb_companies SET sheet_row = ? WHERE id = ?`).bind(rowIndex, companyId).run();
@@ -1639,24 +1836,28 @@ async function handleSupplierCard(
 
   const preview =
     `✅ *Supplier saved*\n\n` +
-    `📛 *Name:* ${extracted.name    || '—'}\n` +
-    `💼 *Title:* ${extracted.title  || '—'}\n` +
-    `🏢 *Company:* ${companyName}\n` +
-    `📧 *Email:* ${extracted.email  || '—'}\n` +
-    `📞 *Phone:* ${extracted.phone  || '—'}\n` +
-    (extracted.country  ? `🌍 *Country:* ${extracted.country}\n`   : '') +
-    (extracted.website  ? `🌐 *Website:* ${extracted.website}\n`   : '') +
-    (extracted.linkedin ? `🔗 *LinkedIn:* ${extracted.linkedin}\n` : '') +
-    (extracted.address  ? `📍 *Address:* ${extracted.address}\n`   : '') +
+    `📛 *Name:* ${escapeMd(extracted.name)    || '—'}\n` +
+    `💼 *Title:* ${escapeMd(extracted.title)  || '—'}\n` +
+    `🏢 *Company:* ${escapeMd(companyName)}\n` +
+    `📧 *Email:* ${escapeMd(extracted.email)  || '—'}\n` +
+    `📞 *Phone:* ${escapeMd(extracted.phone)  || '—'}\n` +
+    (extracted.country  ? `🌍 *Country:* ${escapeMd(extracted.country)}\n`   : '') +
+    (extracted.website  ? `🌐 *Website:* ${escapeMd(extracted.website)}\n`   : '') +
+    (extracted.linkedin ? `🔗 *LinkedIn:* ${escapeMd(extracted.linkedin)}\n` : '') +
+    (extracted.address  ? `📍 *Address:* ${escapeMd(extracted.address)}\n`   : '') +
     `\n_Reply to this message to fix any field._\n` +
     `\n📦 *Send product photos* to attach them to this supplier — or tap below.`;
 
   const { messageId } = await sendButtons(chatId,
     preview,
     [
+      [{ text: '🔥 Hot',  callback_data: `interest:hot:${companyId}` },
+       { text: '🌤️ Warm', callback_data: `interest:warm:${companyId}` },
+       { text: '❄️ Cold', callback_data: `interest:cold:${companyId}` }],
       [{ text: '📷 Scan back of card',  callback_data: `card_back:${companyId}` },
-       { text: '👤 Person photo',       callback_data: `person_photo:${companyId}` }],
+       { text: '👤 Person / Booth',     callback_data: `person_photo:${companyId}` }],
       [{ text: '💬 Add details',         callback_data: `add_voice:${companyId}` }],
+      [{ text: '🗑️ Delete supplier',     callback_data: `delete_supplier:${companyId}` }],
       [{ text: '📷 New supplier card',  callback_data: 'new_supplier' }],
       [{ text: '✅ Done',                callback_data: 'done_capturing' }],
     ],
@@ -2014,7 +2215,7 @@ async function handlePersonPhoto(
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         contents: [{ parts: [
-          { text: 'Describe this person in ONE short line (e.g. "Tall man in blue suit, glasses, holding a sample"). Return only the description, no preface.' },
+          { text: 'Describe this image in ONE short line. It might be the supplier rep, a booth, signage, a product display, or a setup shot. Examples: "Man in blue suit holding a brochure" / "Booth #B12 with red banner reading ACME Lighting" / "Showroom wall of LED panels". Return only the description, no preface.' },
           { inline_data: { mime_type: filePath.endsWith('.png') ? 'image/png' : 'image/jpeg', data: base64 } },
         ] }],
       }),
@@ -2053,7 +2254,7 @@ async function handlePersonPhoto(
   // Resume product-photo mode
   await setSession(chatId, { step: 'awaiting_product_photo', activeCompanyId: session.activeCompanyId }, env);
   await send(chatId,
-    `✅ Person photo saved.` + (personDescription ? `\n_${personDescription}_` : '') +
+    `✅ Photo saved.` + (personDescription ? `\n_${escapeMd(personDescription)}_` : '') +
     `\n\n📦 Send product photos, or tap below.`, env, true);
 }
 
@@ -2085,13 +2286,20 @@ async function handleProductPhoto(
   const imgRes = await fetch(`https://api.telegram.org/file/bot${env.TELEGRAM_BOT_TOKEN_SOURCE}/${filePath}`);
   const rawBuffer = await imgRes.arrayBuffer();
   const base64 = arrayBufferToBase64(rawBuffer);
+  const mimeType = filePath.endsWith('.png') ? 'image/png' : 'image/jpeg';
 
-  // Classify + extract in one call. If Gemini decides this is actually a business card,
-  // transparently exit product mode and hand off to the supplier-capture flow.
+  // Classify + extract in one call, in parallel with SA token mint. If Gemini
+  // decides this is actually a business card, transparently exit product mode
+  // and hand off to the supplier-capture flow.
   let productName = 'Product';
   let productDesc = '';
+  let saToken = '';
   try {
-    const fields = await extractProductFromImage(base64, filePath.endsWith('.png') ? 'image/png' : 'image/jpeg', env);
+    const [fields, token] = await Promise.all([
+      extractProductFromImage(base64, mimeType, env),
+      getServiceAccountToken(env),
+    ]);
+    saToken = token;
     if (fields.type === 'business_card') {
       await setSession(chatId, { step: 'idle' }, env);
       await send(chatId, `📷 That looks like a business card — capturing as a new supplier.`, env);
@@ -2103,6 +2311,9 @@ async function handleProductPhoto(
   } catch (e) {
     console.error('[sourcebot] product extract failed:', e);
   }
+  if (!saToken) {
+    try { saToken = await getServiceAccountToken(env); } catch (e) { console.error('[sourcebot] SA token fetch failed:', e); }
+  }
 
   // Get the show context for the active company
   const company = await env.DB.prepare(
@@ -2113,10 +2324,9 @@ async function handleProductPhoto(
   // Upload product photo to the supplier's Products/ subfolder.
   let imageUrl: string | undefined;
   try {
-    const folders = await getSupplierFoldersById(session.activeCompanyId, env, company.show_name, buyer);
-    if (folders) {
-      const token = await getServiceAccountToken(env);
-      imageUrl = await uploadCardImage(rawBuffer, productName, '', folders.products, token);
+    const folders = await getSupplierFoldersById(session.activeCompanyId, env, company.show_name, buyer, saToken);
+    if (folders && saToken) {
+      imageUrl = await uploadCardImage(rawBuffer, productName, '', folders.products, saToken);
     }
   } catch (e) {
     console.error('[sourcebot] product drive upload failed:', e);
@@ -2134,9 +2344,8 @@ async function handleProductPhoto(
     const sheet = await env.DB.prepare(
       `SELECT sheet_id FROM sb_buyer_shows WHERE buyer_id = ? AND show_name = ?`
     ).bind(buyer.buyerId, company.show_name).first<{ sheet_id: string }>();
-    if (sheet?.sheet_id) {
-      const tok = await getServiceAccountToken(env);
-      await ensureProductsTab(sheet.sheet_id, tok);
+    if (sheet?.sheet_id && saToken) {
+      await ensureProductsTab(sheet.sheet_id, saToken);
       const supplierName = await env.DB.prepare(`SELECT name FROM sb_companies WHERE id = ?`).bind(session.activeCompanyId).first<{ name: string }>();
       const { rowIndex } = await appendProductRow(sheet.sheet_id, {
         timestamp:   new Date().toISOString(),
@@ -2144,7 +2353,7 @@ async function handleProductPhoto(
         productName,
         imageUrl,
         description: productDesc,
-      }, tok);
+      }, saToken);
       await env.DB.prepare(`UPDATE sb_products SET sheet_row = ? WHERE id = ?`).bind(rowIndex, product.id).run();
 
       // Also keep the supplier's Products column (P) up to date as a quick at-a-glance summary.
@@ -2152,7 +2361,7 @@ async function handleProductPhoto(
       if (supplier?.sheet_row) {
         const all = await env.DB.prepare(`SELECT name FROM sb_products WHERE company_id = ? ORDER BY created_at`).bind(session.activeCompanyId).all<{ name: string }>();
         const productsText = all.results.map(p => `• ${p.name ?? '—'}`).join('\n');
-        await updateSupplierProducts(sheet.sheet_id, supplier.sheet_row, { productsText, priceRange: '', avgLeadTime: '' }, tok);
+        await updateSupplierProducts(sheet.sheet_id, supplier.sheet_row, { productsText, priceRange: '', avgLeadTime: '' }, saToken);
       }
     }
   } catch (e) { console.error('[sourcebot] products tab append failed:', e); }
@@ -2168,18 +2377,29 @@ async function handleProductPhoto(
   // Send the photo back as a confirmation with force_reply — the reply preview
   // shows this photo, so the user knows which product they're adding details to.
   const caption =
-    `✅ *${productName}*` +
-    (productDesc ? `\n_${productDesc}_` : '') +
+    `✅ *${escapeMd(productName)}*` +
+    (productDesc ? `\n_${escapeMd(productDesc)}_` : '') +
     `\n\n💬 *Reply* with price, MOQ, lead time, or notes — or send the next product photo. Tap /done to finish.`;
   let messageId: number | null = null;
   try {
     ({ messageId } = await sendPhotoForceReply(chatId, photo.file_id, caption, env, true));
   } catch (e) {
     console.error('[sourcebot] sendPhotoForceReply failed, falling back to text:', e);
-    await sendForceReply(chatId, caption, env, true);
+  }
+  if (!messageId) {
+    // Photo upload or markdown parse failed — fall back to a plain text force-reply
+    // so the user can still reply, and so we still capture the message_id for the
+    // confirmation_message_id mapping.
+    const plain =
+      `✅ ${productName}` +
+      (productDesc ? `\n${productDesc}` : '') +
+      `\n\n💬 Reply with price, MOQ, lead time, or notes — or send the next product photo. Tap /done to finish.`;
+    ({ messageId } = await sendForceReply(chatId, plain, env, false));
   }
   if (messageId) {
     await env.DB.prepare(`UPDATE sb_products SET confirmation_message_id = ? WHERE id = ?`).bind(messageId, product.id).run();
+  } else {
+    console.warn(`[sourcebot] product ${product.id} captured but no confirmation_message_id stored — replies won't link back`);
   }
 
   await trackEvent(env, { buyerId: buyer.buyerId, eventName: 'product_captured', properties: { product: productName, show: company.show_name } });
@@ -2517,6 +2737,7 @@ async function getOrCreateSupplierFolders(
   companyName: string,
   showFolderId: string,
   env: Env,
+  prefetchedToken?: string,
 ): Promise<SupplierFolders> {
   const row = await env.DB.prepare(
     `SELECT cards_folder_id, cards_subfolder_id, products_subfolder_id FROM sb_companies WHERE id = ?`
@@ -2526,7 +2747,7 @@ async function getOrCreateSupplierFolders(
   let cards    = row?.cards_subfolder_id    ?? '';
   let products = row?.products_subfolder_id ?? '';
 
-  const tok = await getServiceAccountToken(env);
+  const tok = prefetchedToken ?? await getServiceAccountToken(env);
 
   if (!parent) {
     const month = new Date().toLocaleString('en-US', { month: 'long', year: 'numeric' });
@@ -2557,6 +2778,7 @@ async function getSupplierFoldersById(
   env: Env,
   showName: string,
   buyer: { buyerId: string },
+  prefetchedToken?: string,
 ): Promise<SupplierFolders | undefined> {
   const c = await env.DB.prepare(
     `SELECT name, cards_folder_id, cards_subfolder_id, products_subfolder_id FROM sb_companies WHERE id = ?`
@@ -2572,7 +2794,7 @@ async function getSupplierFoldersById(
   ).bind(buyer.buyerId, showName).first<{ drive_folder_id: string | null }>();
   if (!pass?.drive_folder_id) return undefined;
 
-  return getOrCreateSupplierFolders(companyId, c.name, pass.drive_folder_id, env);
+  return getOrCreateSupplierFolders(companyId, c.name, pass.drive_folder_id, env, prefetchedToken);
 }
 
 async function applyProductDetails(
@@ -2860,8 +3082,8 @@ async function send(chatId: number, text: string, env: Env, markdown = false): P
 // Send a message that triggers Telegram's "reply to this message" UI on the
 // user's keyboard — they can then type or hold-to-record a voice note and the
 // app submits it as a reply automatically.
-async function sendForceReply(chatId: number, text: string, env: Env, markdown = false): Promise<void> {
-  await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN_SOURCE}/sendMessage`, {
+async function sendForceReply(chatId: number, text: string, env: Env, markdown = false): Promise<{ messageId: number | null }> {
+  const r = await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN_SOURCE}/sendMessage`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
@@ -2871,6 +3093,61 @@ async function sendForceReply(chatId: number, text: string, env: Env, markdown =
       reply_markup: { force_reply: true, input_field_placeholder: 'Type details or hold 🎤 for a voice note' },
     }),
   });
+  try {
+    const d = await r.json() as { result?: { message_id?: number } };
+    return { messageId: d.result?.message_id ?? null };
+  } catch { return { messageId: null }; }
+}
+
+// Escape Telegram Markdown (legacy "Markdown" mode) special chars so user-supplied
+// names/descriptions don't break the parser and force a Telegram reject.
+function escapeMd(s: string | null | undefined): string {
+  if (!s) return '';
+  return s.replace(/([_*`\[\]])/g, '\\$1');
+}
+
+// All slash commands the bot recognizes. Order doesn't matter — used for
+// fuzzy "did you mean" matching.
+const KNOWN_COMMANDS = [
+  '/start', '/help', '/menu', '/cancel', '/done',
+  '/summary', '/find', '/compare', '/email', '/connectgmail',
+  '/pending', '/followups', '/supplier', '/products',
+  '/shows', '/switch', '/allshows', '/upgrade', '/pay', '/newshow',
+  '/pdf', '/pdfshow', '/blast', '/clear', '/tutorial', '/language', '/share', '/undo',
+];
+
+// Levenshtein distance between two strings — small implementation for the
+// fuzzy command suggestion. We compare just the command part (first /token).
+function levenshtein(a: string, b: string): number {
+  if (a === b) return 0;
+  if (!a.length) return b.length;
+  if (!b.length) return a.length;
+  let prev = Array.from({ length: b.length + 1 }, (_, i) => i);
+  let curr = new Array(b.length + 1).fill(0) as number[];
+  for (let i = 1; i <= a.length; i++) {
+    curr[0] = i;
+    for (let j = 1; j <= b.length; j++) {
+      const cost = a[i - 1] === b[j - 1] ? 0 : 1;
+      curr[j] = Math.min(curr[j - 1] + 1, prev[j] + 1, prev[j - 1] + cost);
+    }
+    [prev, curr] = [curr, prev];
+  }
+  return prev[b.length];
+}
+
+// Returns the closest known command if the user's input is a near-miss
+// (Levenshtein ≤ 2), otherwise null.
+function nearestKnownCommand(input: string): string | null {
+  const cmd = input.split(/\s/)[0].toLowerCase();
+  if (KNOWN_COMMANDS.includes(cmd)) return null;  // exact hit (different branch handled it)
+  let best: string | null = null;
+  let bestDist = Infinity;
+  for (const k of KNOWN_COMMANDS) {
+    const d = levenshtein(cmd, k);
+    if (d < bestDist) { bestDist = d; best = k; }
+  }
+  // Threshold: 2 is generous enough for /langauge → /language without false-positives.
+  return best && bestDist <= 2 ? best : null;
 }
 
 // Send a photo back with a caption + force_reply UI, so the reply preview shows
@@ -3011,6 +3288,20 @@ export async function handleSourceBotShowPassCron(env: Env): Promise<void> {
     }
     await env.DB.prepare(`UPDATE sb_buyer_shows SET lock_msg_sent = 1 WHERE id = ?`).bind(p.id).run();
   }
+
+  // 4. Hard-purge soft-deleted rows whose 24h grace has elapsed.
+  try {
+    const purged = await purgeExpiredSoftDeletes(env);
+    if (purged.companies + purged.products + purged.contacts > 0) {
+      console.log(`[sourcebot] purged soft-deletes — companies=${purged.companies} contacts=${purged.contacts} products=${purged.products}`);
+    }
+  } catch (e) { console.error('[sourcebot] soft-delete purge failed:', e); }
+
+  // 5. Trim old webhook-dedup rows (keep 1h of history — Telegram retries
+  //    happen within minutes, never more than that).
+  try {
+    await env.DB.prepare(`DELETE FROM sb_tg_updates_seen WHERE seen_at < ?`).bind(now - 3600).run();
+  } catch (e) { console.error('[sourcebot] update_id dedup trim failed:', e); }
 }
 
 async function chatIdForBuyer(buyerId: string, env: Env): Promise<number | null> {
@@ -3018,6 +3309,299 @@ async function chatIdForBuyer(buyerId: string, env: Env): Promise<number | null>
     `SELECT telegram_chat_id FROM sb_buyers_telegram WHERE buyer_id = ? LIMIT 1`
   ).bind(buyerId).first<{ telegram_chat_id: number }>();
   return row?.telegram_chat_id ?? null;
+}
+
+// ── /undo: soft-delete the most recent capture (product first, supplier if none) ──
+
+async function cmdUndo(chatId: number, buyer: { buyerId: string }, env: Env): Promise<void> {
+  const lastProduct = await env.DB.prepare(
+    `SELECT id FROM sb_products
+      WHERE buyer_id = ? AND deleted_at IS NULL
+      ORDER BY created_at DESC LIMIT 1`
+  ).bind(buyer.buyerId).first<{ id: string }>();
+  if (lastProduct) { await softDeleteProduct(chatId, lastProduct.id, buyer, env); return; }
+
+  const lastCompany = await env.DB.prepare(
+    `SELECT id FROM sb_companies
+      WHERE buyer_id = ? AND deleted_at IS NULL
+      ORDER BY created_at DESC LIMIT 1`
+  ).bind(buyer.buyerId).first<{ id: string }>();
+  if (lastCompany) { await softDeleteSupplier(chatId, lastCompany.id, buyer, env); return; }
+
+  await send(chatId, `Nothing to undo.`, env);
+}
+
+// ── Interest level + soft-delete helpers ────────────────────────────────────
+
+async function setInterestLevel(
+  chatId: number,
+  companyId: string,
+  level: 'hot' | 'warm' | 'cold',
+  buyer: { buyerId: string },
+  env: Env,
+): Promise<void> {
+  const company = await env.DB.prepare(
+    `SELECT name, show_name, sheet_row FROM sb_companies WHERE id = ? AND buyer_id = ?`
+  ).bind(companyId, buyer.buyerId).first<{ name: string; show_name: string; sheet_row: number | null }>();
+  if (!company) { await send(chatId, `⚠️ Supplier not found.`, env); return; }
+
+  await env.DB.prepare(`UPDATE sb_companies SET interest_level = ? WHERE id = ?`).bind(level, companyId).run();
+
+  if (company.sheet_row) {
+    try {
+      const sheet = await env.DB.prepare(
+        `SELECT sheet_id FROM sb_buyer_shows WHERE buyer_id = ? AND show_name = ?`
+      ).bind(buyer.buyerId, company.show_name).first<{ sheet_id: string }>();
+      if (sheet?.sheet_id) {
+        const tok = await getServiceAccountToken(env);
+        await updateSupplierInterest(sheet.sheet_id, company.sheet_row, level, tok);
+      }
+    } catch (e) { console.error('[sourcebot] interest sheet update failed:', e); }
+  }
+
+  const label = level === 'hot' ? '🔥 Hot' : level === 'warm' ? '🌤️ Warm' : '❄️ Cold';
+  await send(chatId, `✅ ${escapeMd(company.name)} marked as *${label}*.`, env, true);
+}
+
+// Soft-delete = set deleted_at and strike through the sheet row. Hard purge
+// happens separately via a cron after the 24h grace window. Undo restores both.
+async function softDeleteSupplier(
+  chatId: number,
+  companyId: string,
+  buyer: { buyerId: string },
+  env: Env,
+): Promise<void> {
+  const company = await env.DB.prepare(
+    `SELECT name, show_name, sheet_row FROM sb_companies WHERE id = ? AND buyer_id = ?`
+  ).bind(companyId, buyer.buyerId).first<{ name: string; show_name: string; sheet_row: number | null }>();
+  if (!company) { await send(chatId, `⚠️ Supplier not found.`, env); return; }
+
+  const now = Math.floor(Date.now() / 1000);
+  await env.DB.batch([
+    env.DB.prepare(`UPDATE sb_companies SET deleted_at = ? WHERE id = ?`).bind(now, companyId),
+    env.DB.prepare(`UPDATE sb_contacts  SET deleted_at = ? WHERE company_id = ?`).bind(now, companyId),
+    env.DB.prepare(`UPDATE sb_products  SET deleted_at = ? WHERE company_id = ?`).bind(now, companyId),
+  ]);
+
+  if (company.sheet_row) {
+    try {
+      const sheet = await env.DB.prepare(
+        `SELECT sheet_id FROM sb_buyer_shows WHERE buyer_id = ? AND show_name = ?`
+      ).bind(buyer.buyerId, company.show_name).first<{ sheet_id: string }>();
+      if (sheet?.sheet_id) {
+        const tok = await getServiceAccountToken(env);
+        await strikethroughRow(sheet.sheet_id, 'Suppliers', company.sheet_row, true, tok);
+      }
+    } catch (e) { console.error('[sourcebot] supplier strikethrough failed:', e); }
+  }
+
+  await sendButtons(chatId,
+    `🗑️ Deleted *${escapeMd(company.name)}* — including all its products. You have 24h to undo.`,
+    [[{ text: '↩️ Undo', callback_data: `undo_delete_supplier:${companyId}` }]],
+    env, true);
+}
+
+async function undoSoftDeleteSupplier(
+  chatId: number,
+  companyId: string,
+  buyer: { buyerId: string },
+  env: Env,
+): Promise<void> {
+  const company = await env.DB.prepare(
+    `SELECT name, show_name, sheet_row FROM sb_companies WHERE id = ? AND buyer_id = ?`
+  ).bind(companyId, buyer.buyerId).first<{ name: string; show_name: string; sheet_row: number | null }>();
+  if (!company) { await send(chatId, `⚠️ Supplier not found.`, env); return; }
+
+  await env.DB.batch([
+    env.DB.prepare(`UPDATE sb_companies SET deleted_at = NULL WHERE id = ?`).bind(companyId),
+    env.DB.prepare(`UPDATE sb_contacts  SET deleted_at = NULL WHERE company_id = ?`).bind(companyId),
+    env.DB.prepare(`UPDATE sb_products  SET deleted_at = NULL WHERE company_id = ?`).bind(companyId),
+  ]);
+
+  if (company.sheet_row) {
+    try {
+      const sheet = await env.DB.prepare(
+        `SELECT sheet_id FROM sb_buyer_shows WHERE buyer_id = ? AND show_name = ?`
+      ).bind(buyer.buyerId, company.show_name).first<{ sheet_id: string }>();
+      if (sheet?.sheet_id) {
+        const tok = await getServiceAccountToken(env);
+        await strikethroughRow(sheet.sheet_id, 'Suppliers', company.sheet_row, false, tok);
+      }
+    } catch (e) { console.error('[sourcebot] supplier unstrike failed:', e); }
+  }
+
+  await send(chatId, `↩️ Restored *${escapeMd(company.name)}*.`, env, true);
+}
+
+async function softDeleteProduct(
+  chatId: number,
+  productId: string,
+  buyer: { buyerId: string },
+  env: Env,
+): Promise<void> {
+  const product = await env.DB.prepare(
+    `SELECT p.name, p.sheet_row, c.show_name FROM sb_products p JOIN sb_companies c ON c.id = p.company_id
+      WHERE p.id = ? AND p.buyer_id = ?`
+  ).bind(productId, buyer.buyerId).first<{ name: string; sheet_row: number | null; show_name: string }>();
+  if (!product) { await send(chatId, `⚠️ Product not found.`, env); return; }
+
+  const now = Math.floor(Date.now() / 1000);
+  await env.DB.prepare(`UPDATE sb_products SET deleted_at = ? WHERE id = ?`).bind(now, productId).run();
+
+  if (product.sheet_row) {
+    try {
+      const sheet = await env.DB.prepare(
+        `SELECT sheet_id FROM sb_buyer_shows WHERE buyer_id = ? AND show_name = ?`
+      ).bind(buyer.buyerId, product.show_name).first<{ sheet_id: string }>();
+      if (sheet?.sheet_id) {
+        const tok = await getServiceAccountToken(env);
+        await strikethroughRow(sheet.sheet_id, 'Products', product.sheet_row, true, tok);
+      }
+    } catch (e) { console.error('[sourcebot] product strikethrough failed:', e); }
+  }
+
+  await sendButtons(chatId,
+    `🗑️ Deleted *${escapeMd(product.name)}*. You have 24h to undo.`,
+    [[{ text: '↩️ Undo', callback_data: `undo_delete_product:${productId}` }]],
+    env, true);
+}
+
+async function undoSoftDeleteProduct(
+  chatId: number,
+  productId: string,
+  buyer: { buyerId: string },
+  env: Env,
+): Promise<void> {
+  const product = await env.DB.prepare(
+    `SELECT p.name, p.sheet_row, c.show_name FROM sb_products p JOIN sb_companies c ON c.id = p.company_id
+      WHERE p.id = ? AND p.buyer_id = ?`
+  ).bind(productId, buyer.buyerId).first<{ name: string; sheet_row: number | null; show_name: string }>();
+  if (!product) { await send(chatId, `⚠️ Product not found.`, env); return; }
+
+  await env.DB.prepare(`UPDATE sb_products SET deleted_at = NULL WHERE id = ?`).bind(productId).run();
+
+  if (product.sheet_row) {
+    try {
+      const sheet = await env.DB.prepare(
+        `SELECT sheet_id FROM sb_buyer_shows WHERE buyer_id = ? AND show_name = ?`
+      ).bind(buyer.buyerId, product.show_name).first<{ sheet_id: string }>();
+      if (sheet?.sheet_id) {
+        const tok = await getServiceAccountToken(env);
+        await strikethroughRow(sheet.sheet_id, 'Products', product.sheet_row, false, tok);
+      }
+    } catch (e) { console.error('[sourcebot] product unstrike failed:', e); }
+  }
+
+  await send(chatId, `↩️ Restored *${escapeMd(product.name)}*.`, env, true);
+}
+
+// Hard-purge any rows soft-deleted >24h ago. Wired into the existing cron in
+// handleSourceBotShowPassCron so we don't add another scheduled trigger.
+async function purgeExpiredSoftDeletes(env: Env): Promise<{ companies: number; products: number; contacts: number }> {
+  const cutoff = Math.floor(Date.now() / 1000) - 86_400;  // 24h
+  const r1 = await env.DB.prepare(`DELETE FROM sb_products  WHERE deleted_at IS NOT NULL AND deleted_at < ?`).bind(cutoff).run();
+  const r2 = await env.DB.prepare(`DELETE FROM sb_contacts  WHERE deleted_at IS NOT NULL AND deleted_at < ?`).bind(cutoff).run();
+  const r3 = await env.DB.prepare(`DELETE FROM sb_companies WHERE deleted_at IS NOT NULL AND deleted_at < ?`).bind(cutoff).run();
+  return {
+    products:  r1.meta.changes ?? 0,
+    contacts:  r2.meta.changes ?? 0,
+    companies: r3.meta.changes ?? 0,
+  };
+}
+
+// ── One-shot admin reset: wipes a buyer's Drive + D1 and re-provisions ──────
+//
+// POST /api/sourcebot/admin/reset-buyer
+//   X-Admin-Secret: <env.WEBHOOK_SECRET>
+//   { "email": "buyer@example.com" }
+//
+// This trashes every Drive folder/sheet referenced by the buyer's shows,
+// creates a fresh folder + sheet inside the Shared Drive, deletes every
+// per-buyer D1 row, and inserts a single placeholder show pointing at the
+// new sheet so /newshow can inherit from it.
+export async function handleAdminReset(request: Request, env: Env): Promise<Response> {
+  if (request.method !== 'POST') return new Response('Method not allowed', { status: 405 });
+  const secret = request.headers.get('x-admin-secret') ?? '';
+  if (!secret || secret !== env.WEBHOOK_SECRET) return new Response('Unauthorized', { status: 401 });
+  if (!env.SHARED_DRIVE_ID) return new Response(JSON.stringify({ error: 'SHARED_DRIVE_ID not set' }), { status: 503, headers: { 'Content-Type': 'application/json' } });
+
+  let body: { email?: string };
+  try { body = await request.json() as typeof body; } catch { return new Response('Bad request', { status: 400 }); }
+  if (!body.email) return new Response(JSON.stringify({ error: 'email required' }), { status: 400, headers: { 'Content-Type': 'application/json' } });
+
+  const buyer = await env.DB.prepare(`SELECT id, name FROM sb_buyers WHERE email = ? LIMIT 1`).bind(body.email).first<{ id: string; name: string }>();
+  if (!buyer) return new Response(JSON.stringify({ error: 'buyer not found' }), { status: 404, headers: { 'Content-Type': 'application/json' } });
+
+  const tok = await getServiceAccountToken(env);
+
+  // 1. Trash every distinct Drive folder/sheet referenced by this buyer.
+  const refs = await env.DB.prepare(
+    `SELECT DISTINCT drive_folder_id, sheet_id FROM sb_buyer_shows WHERE buyer_id = ?`
+  ).bind(buyer.id).all<{ drive_folder_id: string | null; sheet_id: string | null }>();
+
+  const trashed: string[] = [];
+  const failed: Array<{ id: string; error: string }> = [];
+  const seen = new Set<string>();
+  for (const row of refs.results ?? []) {
+    for (const id of [row.drive_folder_id, row.sheet_id]) {
+      if (!id || seen.has(id)) continue;
+      seen.add(id);
+      const res = await fetch(`https://www.googleapis.com/drive/v3/files/${id}?supportsAllDrives=true`, {
+        method: 'DELETE',
+        headers: { Authorization: `Bearer ${tok}` },
+      });
+      if (res.ok || res.status === 404) trashed.push(id);
+      else failed.push({ id, error: `${res.status} ${await res.text()}` });
+    }
+  }
+
+  // 2. Provision a fresh folder + sheet.
+  const folder = await createDriveFolder(`DaGama — ${buyer.name} (${body.email})`, env.SHARED_DRIVE_ID, tok);
+  const sheet  = await createSourceBotSheet('Setup', folder.id, tok);
+  await shareDriveItem(folder.id, body.email, tok, 'writer', false);
+
+  // 3. Wipe every per-buyer D1 table.
+  const wipeStmts = [
+    env.DB.prepare(`DELETE FROM sb_companies WHERE buyer_id = ?`).bind(buyer.id),
+    env.DB.prepare(`DELETE FROM sb_contacts WHERE buyer_id = ?`).bind(buyer.id),
+    env.DB.prepare(`DELETE FROM sb_products WHERE buyer_id = ?`).bind(buyer.id),
+    env.DB.prepare(`DELETE FROM sb_voice_notes WHERE buyer_id = ?`).bind(buyer.id),
+    env.DB.prepare(`DELETE FROM sb_emails_sent WHERE buyer_id = ?`).bind(buyer.id),
+    env.DB.prepare(`DELETE FROM email_queue WHERE buyer_id = ?`).bind(buyer.id),
+    env.DB.prepare(`DELETE FROM events WHERE buyer_id = ?`).bind(buyer.id),
+    env.DB.prepare(`DELETE FROM sb_buyer_shows WHERE buyer_id = ?`).bind(buyer.id),
+  ];
+  await env.DB.batch(wipeStmts);
+
+  // 4. Insert one placeholder show pointing at the fresh assets so future
+  //    /newshow inheritance works. The buyer can rename it via the bot.
+  const now = Math.floor(Date.now() / 1000);
+  const passExpiresAt  = now + 60 * 60 * 24 * 365; // 1y
+  const gracePeriodEnd = passExpiresAt;
+  await env.DB.prepare(
+    `INSERT INTO sb_buyer_shows
+       (buyer_id, show_name, status, sheet_id, sheet_url, drive_folder_id, drive_folder_url, pass_expires_at, grace_period_end)
+     VALUES (?, 'Setup', 'active', ?, ?, ?, ?, ?, ?)`
+  ).bind(buyer.id, sheet.sheetId, sheet.sheetUrl, folder.id, folder.url, passExpiresAt, gracePeriodEnd).run();
+
+  // 5. Reset buyer pointers + Telegram session.
+  await env.DB.prepare(
+    `UPDATE sb_buyers SET active_show_id = NULL, active_company_id = NULL, current_show_id = NULL, updated_at = datetime('now') WHERE id = ?`
+  ).bind(buyer.id).run();
+  await env.DB.prepare(
+    `UPDATE sb_buyers_telegram SET session = '{"step":"idle"}' WHERE buyer_id = ?`
+  ).bind(buyer.id).run();
+
+  return new Response(JSON.stringify({
+    ok: true,
+    buyer_id: buyer.id,
+    new_sheet_id: sheet.sheetId,
+    new_sheet_url: sheet.sheetUrl,
+    new_folder_id: folder.id,
+    new_folder_url: folder.url,
+    trashed_drive_ids: trashed,
+    drive_failures: failed,
+  }), { headers: { 'Content-Type': 'application/json' } });
 }
 
 // ── Webhook setup helper (call once: POST /api/sourcebot/setup with {url}) ───

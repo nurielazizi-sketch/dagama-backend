@@ -4,8 +4,10 @@ export interface Env {
   DB: D1Database;
   TELEGRAM_BOT_TOKEN: string;                       // BoothBot
   TELEGRAM_BOT_TOKEN_SOURCE?: string;               // SourceBot — optional until set
+  TELEGRAM_BOT_TOKEN_DEMO?: string;                 // DemoBot (@DaGamaShow) — freelancer-facing
   TELEGRAM_BOT_USERNAME_BOOTH?: string;             // for deep links (defaults if absent)
   TELEGRAM_BOT_USERNAME_SOURCE?: string;
+  TELEGRAM_BOT_USERNAME_DEMO?: string;              // defaults to "DaGamaShow"
   WHATSAPP_BOT_NUMBER?: string;                     // e.g. "+1415..." — empty = "coming soon"
   // ── WhatsApp Cloud API (Meta) ─────────────────────────────────────────────
   // All five must be set together for the channel to activate. If any are
@@ -27,6 +29,7 @@ export interface Env {
   STRIPE_PRICE_SINGLE_SHOW: string;
   STRIPE_PRICE_3_SHOW_PACK: string;
   STRIPE_PRICE_TEAM_PLAN: string;
+  STRIPE_PRICE_ORGANIZER_PLAN?: string;             // $299/mo — referenced by DemoBot referral commission tier
   GOOGLE_SERVICE_ACCOUNT_EMAIL: string;
   GOOGLE_SERVICE_ACCOUNT_PRIVATE_KEY: string;
   // Shared Drive ID where service-account-owned folders/sheets/photos live.
@@ -41,6 +44,9 @@ export interface Env {
   // is OAuth'd, store the refresh token + from-address here. Until then, sendWelcomeEmail logs.
   DAGAMA_NOREPLY_REFRESH_TOKEN?: string;
   DAGAMA_NOREPLY_FROM_EMAIL?: string;
+  // Bearer token gating /api/demobot/admin/* + /api/shows-catalog mutations.
+  // Optional in dev (admin endpoints reject if unset). Set in production via wrangler secret.
+  DEMOBOT_ADMIN_TOKEN?: string;
   R2_BUCKET: R2Bucket;
   CARD_QUEUE: Queue;
 }
