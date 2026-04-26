@@ -2,6 +2,7 @@
 
 import type { Env } from './types';
 import { routeToDemoBot, tryClaimAsDemoBot } from './demobot_wa';
+import { handleCardCapture, resolveActiveShow } from './capture';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // WhatsApp Cloud API integration. Behind a feature flag (isWhatsAppEnabled):
@@ -223,13 +224,63 @@ async function handleInboundMessage(msg: WaInboundMessage, value: WaChangeValue,
   }
 }
 
-// Stubs — the actual BoothBot/SourceBot WhatsApp dispatchers attach here once
-// we extract the channel-agnostic message handling out of telegram.ts /
-// sourcebot.ts. Until then, these acknowledge so the round trip is testable.
+// BoothBot WhatsApp router. For image messages we call the channel-agnostic
+// capture pipeline (capture.ts). All other types get a help nudge for now.
+// SourceBot stays stubbed in this phase — its multi-step session needs more
+// scaffolding before WhatsApp can carry it.
 
-async function routeToBoothBot(msg: WaInboundMessage, mapping: { phone: string }, env: Env): Promise<void> {
+interface WaMapping {
+  phone:    string;
+  user_id:  string | null;
+  buyer_id: string | null;
+  bot_role: string;
+}
+
+async function routeToBoothBot(msg: WaInboundMessage, mapping: WaMapping, env: Env): Promise<void> {
   console.log('[whatsapp][boothbot] inbound', { phone: mapping.phone, type: msg.type, wamid: msg.id });
-  await sendWhatsAppText(mapping.phone, '📥 BoothBot received your message. (WhatsApp pipeline coming online — captured for processing.)', env);
+
+  if (!mapping.user_id) {
+    // Mapping should always have user_id when bot_role='boothbot' (set during
+    // join-token consumption). Defensive log + nudge.
+    console.error('[whatsapp][boothbot] missing user_id on mapping', { phone: mapping.phone });
+    await sendWhatsAppText(mapping.phone, `Your account isn't fully linked yet. Please open ${env.ORIGIN} and finish onboarding.`, env);
+    return;
+  }
+
+  if (msg.type !== 'image') {
+    await sendWhatsAppText(
+      mapping.phone,
+      `📸 Send a photo of a business card and I'll extract the contact details into your sheet.`,
+      env,
+    );
+    return;
+  }
+
+  // Resolve which show this capture belongs to. We fall back to a generic
+  // bucket if onboarding wasn't completed (rare — user_id implies onboarding).
+  const showName = (await resolveActiveShow(mapping.user_id, env)) ?? 'WhatsApp Captures';
+
+  // Pull the media bytes (auth'd graph call, cached in R2 by media_id).
+  const mediaId = msg.image?.id;
+  if (!mediaId) {
+    await sendWhatsAppText(mapping.phone, `Couldn't read that photo. Try sending it again.`, env);
+    return;
+  }
+  const media = await fetchWhatsAppMedia(mediaId, env);
+  if (!media) {
+    await sendWhatsAppText(mapping.phone, `Couldn't download that photo. Try sending it again.`, env);
+    return;
+  }
+
+  await handleCardCapture({
+    userId:   mapping.user_id,
+    showName,
+    botRole:  'boothbot',
+    channel:  'whatsapp',
+    media:    { kind: 'r2_key', key: media.r2Key, mimeType: media.mimeType },
+    caption:  msg.image?.caption,
+    reply:    { channel: 'whatsapp', phone: mapping.phone },
+  }, env);
 }
 
 async function routeToSourceBot(msg: WaInboundMessage, mapping: { phone: string }, env: Env): Promise<void> {
