@@ -3,7 +3,15 @@
 import type { Env } from './types';
 import { requireAuth } from './auth';
 import { handleCardCapture, resolveActiveShow } from './capture';
-import { captureSupplierFromPhoto, resolveBuyerForUser, attachCardBack, attachPersonPhoto, attachVoiceNote } from './sourcebot_core';
+import {
+  captureSupplierFromPhoto,
+  resolveBuyerForUser,
+  attachCardBack,
+  attachPersonPhoto,
+  attachVoiceNote,
+  attachProductFromPhoto,
+  updateProductDetails,
+} from './sourcebot_core';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Web capture endpoints — third channel alongside Telegram + WhatsApp.
@@ -387,6 +395,94 @@ export async function handleSupplierVoice(request: Request, env: Env, companyId:
     leadTime:   result.leadTime,
     tone:       result.tone,
   });
+}
+
+// ── POST /api/suppliers/:id/products ─────────────────────────────────────────
+// Multipart upload of a product photo against an existing supplier. Returns
+// the new productId so the dashboard can immediately PATCH details against it.
+
+export async function handleSupplierProduct(request: Request, env: Env, companyId: string): Promise<Response> {
+  if (request.method !== 'POST') return new Response('Method not allowed', { status: 405 });
+
+  const auth = await requireAuth(request, env);
+  if (auth instanceof Response) return auth;
+
+  const buyer = await resolveBuyerForUser(auth.userId, env);
+  if (!buyer) return jsonResponse({ error: 'SourceBot account required' }, 403);
+
+  const ct = request.headers.get('content-type') ?? '';
+  if (!ct.toLowerCase().includes('multipart/form-data')) {
+    return jsonResponse({ error: 'Expected multipart/form-data' }, 415);
+  }
+
+  let form: FormData;
+  try { form = await request.formData(); }
+  catch { return jsonResponse({ error: 'Invalid multipart body' }, 400); }
+
+  const photo = form.get('photo');
+  if (photo == null || typeof photo === 'string') return jsonResponse({ error: 'Missing "photo" file field' }, 400);
+  const photoBlob = photo as Blob & { name?: string };
+  if (photoBlob.size === 0)              return jsonResponse({ error: 'Empty file' }, 400);
+  if (photoBlob.size > MAX_UPLOAD_BYTES) return jsonResponse({ error: `File too large (max ${MAX_UPLOAD_BYTES} bytes)` }, 413);
+  const mimeType = (photoBlob.type || '').toLowerCase();
+  if (!mimeType.startsWith('image/'))    return jsonResponse({ error: 'Only image uploads accepted' }, 415);
+
+  const bytes = new Uint8Array(await photoBlob.arrayBuffer());
+  const result = await attachProductFromPhoto({
+    companyId,
+    buyerId: buyer.buyerId,
+    channel: 'web',
+    media:   { kind: 'bytes', bytes, mimeType },
+    reply:   { channel: 'web' },
+  }, env);
+
+  if (!result.ok) {
+    const code = result.status === 'no_supplier' ? 404
+               : result.status === 'reclassified_as_card' ? 409
+               : 500;
+    return jsonResponse({ error: result.error ?? result.status, status: result.status }, code);
+  }
+  return jsonResponse({
+    status:      result.status,
+    productId:   result.productId,
+    productName: result.productName,
+    description: result.description,
+    imageUrl:    result.imageUrl,
+  });
+}
+
+// ── PATCH /api/products/:id ──────────────────────────────────────────────────
+// JSON body: { price?, moq?, leadTime?, tone?, notes? }. Notes are appended
+// (cumulative) per applyProductDetails in sourcebot.ts; other fields overwrite
+// when non-empty.
+
+export async function handleUpdateProduct(request: Request, env: Env, productId: string): Promise<Response> {
+  if (request.method !== 'PATCH' && request.method !== 'POST') return new Response('Method not allowed', { status: 405 });
+
+  const auth = await requireAuth(request, env);
+  if (auth instanceof Response) return auth;
+
+  const buyer = await resolveBuyerForUser(auth.userId, env);
+  if (!buyer) return jsonResponse({ error: 'SourceBot account required' }, 403);
+
+  let body: { price?: string; moq?: string; leadTime?: string; tone?: string; notes?: string };
+  try { body = await request.json() as typeof body; }
+  catch { return jsonResponse({ error: 'Invalid JSON' }, 400); }
+
+  const result = await updateProductDetails({
+    productId,
+    buyerId:  buyer.buyerId,
+    price:    body.price,
+    moq:      body.moq,
+    leadTime: body.leadTime,
+    tone:     body.tone,
+    notes:    body.notes,
+  }, env);
+
+  if (!result.ok) {
+    return jsonResponse({ error: result.error ?? result.status, status: result.status }, result.status === 'no_product' ? 404 : 500);
+  }
+  return jsonResponse({ status: 'success' });
 }
 
 // ── GET /api/me/role ─────────────────────────────────────────────────────────

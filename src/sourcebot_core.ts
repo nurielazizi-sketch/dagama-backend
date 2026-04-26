@@ -3,7 +3,16 @@
 import type { Env } from './types';
 import { extractContactFromImage } from './extract';
 import { getServiceAccountToken, createDriveFolder } from './google';
-import { appendSupplierRow, updateSupplierCardBack, updateSupplierPerson, updateSupplierVoiceNote } from './sb_sheets';
+import {
+  appendSupplierRow,
+  updateSupplierCardBack,
+  updateSupplierPerson,
+  updateSupplierVoiceNote,
+  appendProductRow,
+  updateProductRow,
+  ensureProductsTab,
+  updateSupplierProducts,
+} from './sb_sheets';
 import { scheduleFunnelOnFirstScan, trackEvent } from './funnel';
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -593,6 +602,287 @@ async function describePersonImage(buffer: ArrayBuffer, mimeType: string, env: E
   });
   const d = await r.json() as { candidates?: Array<{ content?: { parts?: Array<{ text?: string }> } }> };
   return (d.candidates?.[0]?.content?.parts?.[0]?.text ?? '').trim().split('\n')[0] ?? '';
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Phase 4: Products. A product is captured against an active supplier.
+//   - attachProductFromPhoto() — upload photo, classify (card vs product),
+//     save sb_products row, append a Products-tab row, refresh column P on
+//     the Suppliers tab with the aggregated bullet list.
+//   - updateProductDetails()    — set/refresh price / MOQ / lead time / notes
+//     for an existing product (UPDATE sb_products + UPDATE the product row).
+//   - parseProductDetailsText() — Gemini structure-extraction over a free-form
+//     reply (price, MOQ, lead time, tone) so a WA text reply can fill fields.
+// ─────────────────────────────────────────────────────────────────────────────
+
+export interface ProductCaptureInput {
+  companyId: string;
+  buyerId:   string;
+  channel:   'whatsapp' | 'web';
+  media:
+    | { kind: 'r2_key'; key: string; mimeType?: string }
+    | { kind: 'bytes'; bytes: Uint8Array; mimeType: string };
+  reply: ReplyTarget;
+}
+
+export interface ProductCaptureResult {
+  ok:           boolean;
+  status:       'success' | 'reclassified_as_card' | 'no_supplier' | 'storage_failed' | 'upload_failed' | 'error';
+  productId?:   string;
+  productName?: string;
+  description?: string;
+  imageUrl?:    string;
+  error?:       string;
+}
+
+export async function attachProductFromPhoto(input: ProductCaptureInput, env: Env): Promise<ProductCaptureResult> {
+  const company = await env.DB.prepare(
+    `SELECT id, name, show_name, sheet_row, buyer_id FROM sb_companies WHERE id = ? AND buyer_id = ?`
+  ).bind(input.companyId, input.buyerId).first<{ id: string; name: string; show_name: string; sheet_row: number | null; buyer_id: string }>();
+  if (!company) {
+    await sendReply(input.reply, `Supplier not found.`, env);
+    return { ok: false, status: 'no_supplier' };
+  }
+
+  // Read bytes (web → memory; WA → r2 cache).
+  let buffer:   ArrayBuffer;
+  let mimeType: string;
+  try {
+    if (input.media.kind === 'bytes') {
+      const u8 = input.media.bytes;
+      const ab = new ArrayBuffer(u8.byteLength);
+      new Uint8Array(ab).set(u8);
+      buffer   = ab;
+      mimeType = input.media.mimeType;
+    } else {
+      const obj = await env.R2_BUCKET.get(input.media.key);
+      if (!obj) throw new Error(`R2 object missing: ${input.media.key}`);
+      buffer   = await obj.arrayBuffer();
+      mimeType = input.media.mimeType ?? 'image/jpeg';
+    }
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    console.error('[sourcebot_core] product media read failed', { companyId: company.id, error: msg });
+    return { ok: false, status: 'storage_failed', error: msg };
+  }
+
+  await sendReply(input.reply, `🔍 Reading the product…`, env);
+
+  // Classify: business_card → caller should re-route to capture (we surface
+  // status='reclassified_as_card' so the caller can decide).
+  const base64 = arrayBufferToBase64(buffer);
+  let productName = 'Product';
+  let productDesc = '';
+  try {
+    const fields = await classifyProductImage(base64, mimeType, env);
+    if (fields.type === 'business_card') {
+      return {
+        ok:     false,
+        status: 'reclassified_as_card',
+        // No reply here — caller decides whether to re-run as supplier capture.
+      };
+    }
+    productName = fields.name || 'Product';
+    productDesc = fields.description || '';
+  } catch (e) {
+    console.error('[sourcebot_core] product classify failed', e);
+  }
+
+  // Upload to per-supplier Products/ subfolder.
+  let imageUrl: string | undefined;
+  let saToken:  string | undefined;
+  try {
+    saToken = await getServiceAccountToken(env);
+    const folders = await getSupplierFoldersById(company.id, env, company.show_name, { buyerId: company.buyer_id }, saToken);
+    if (folders) imageUrl = await uploadCardImage(buffer, productName, '', folders.products, saToken);
+  } catch (e) {
+    console.error('[sourcebot_core] product drive upload failed', e);
+  }
+
+  // Insert sb_products row.
+  const product = await env.DB.prepare(
+    `INSERT INTO sb_products (company_id, buyer_id, show_name, name, description, image_url)
+     VALUES (?, ?, ?, ?, ?, ?) RETURNING id`
+  ).bind(company.id, company.buyer_id, company.show_name, productName, productDesc || null, imageUrl || null).first<{ id: string }>();
+  if (!product?.id) {
+    await sendReply(input.reply, `❌ Failed to save the product.`, env);
+    return { ok: false, status: 'error', error: 'product_insert_failed' };
+  }
+
+  // Append Products-tab row + refresh supplier aggregate (column P).
+  try {
+    if (!saToken) saToken = await getServiceAccountToken(env);
+    const sheet = await env.DB.prepare(
+      `SELECT sheet_id FROM sb_buyer_shows WHERE buyer_id = ? AND show_name = ?`
+    ).bind(company.buyer_id, company.show_name).first<{ sheet_id: string }>();
+    if (sheet?.sheet_id) {
+      await ensureProductsTab(sheet.sheet_id, saToken);
+      const { rowIndex } = await appendProductRow(sheet.sheet_id, {
+        timestamp:   new Date().toISOString(),
+        supplier:    company.name,
+        productName,
+        imageUrl,
+        description: productDesc,
+      }, saToken);
+      await env.DB.prepare(`UPDATE sb_products SET sheet_row = ? WHERE id = ?`).bind(rowIndex, product.id).run();
+
+      if (company.sheet_row) {
+        const all = await env.DB.prepare(
+          `SELECT name FROM sb_products WHERE company_id = ? ORDER BY created_at`
+        ).bind(company.id).all<{ name: string }>();
+        const productsText = all.results.map(p => `• ${p.name ?? '—'}`).join('\n');
+        await updateSupplierProducts(sheet.sheet_id, company.sheet_row, { productsText, priceRange: '', avgLeadTime: '' }, saToken);
+      }
+    }
+  } catch (e) {
+    console.error('[sourcebot_core] product sheet append failed', e);
+  }
+
+  await sendReply(
+    input.reply,
+    `✅ *${productName}* saved${productDesc ? `\n_${productDesc}_` : ''}\n\nReply with price, MOQ, lead time, or notes — or send the next product photo.`,
+    env,
+  );
+
+  await trackEvent(env, {
+    buyerId:    company.buyer_id,
+    eventName:  'product_captured',
+    properties: { product: productName, show: company.show_name, channel: input.channel },
+  });
+
+  return { ok: true, status: 'success', productId: product.id, productName, description: productDesc, imageUrl };
+}
+
+// ── Product details: structured fields + free-text parse ─────────────────────
+
+export interface ProductDetailsInput {
+  productId:  string;
+  buyerId:    string;
+  price?:     string;
+  moq?:       string;
+  leadTime?:  string;
+  tone?:      string;
+  notes?:     string;       // appended (cumulative); blank = no change
+}
+
+export interface ProductDetailsResult {
+  ok:     boolean;
+  status: 'success' | 'no_product' | 'error';
+  error?: string;
+}
+
+// Update an existing product's details. Mirrors sourcebot.ts:applyProductDetails.
+export async function updateProductDetails(input: ProductDetailsInput, env: Env): Promise<ProductDetailsResult> {
+  const product = await env.DB.prepare(
+    `SELECT p.id, p.company_id, p.sheet_row, p.name, c.buyer_id, c.show_name, c.sheet_row AS company_sheet_row
+       FROM sb_products p JOIN sb_companies c ON c.id = p.company_id
+      WHERE p.id = ? AND c.buyer_id = ?`
+  ).bind(input.productId, input.buyerId).first<{ id: string; company_id: string; sheet_row: number | null; name: string; buyer_id: string; show_name: string; company_sheet_row: number | null }>();
+  if (!product) return { ok: false, status: 'no_product' };
+
+  // COALESCE with NULLIF so empty fields don't clobber existing values.
+  await env.DB.prepare(
+    `UPDATE sb_products
+        SET price       = COALESCE(NULLIF(?, ''), price),
+            moq         = COALESCE(NULLIF(?, ''), moq),
+            lead_time   = COALESCE(NULLIF(?, ''), lead_time),
+            description = CASE
+              WHEN ? = '' OR ? IS NULL THEN description
+              WHEN description IS NULL OR description = '' THEN ?
+              ELSE description || char(10) || ?
+            END
+      WHERE id = ?`
+  ).bind(
+    input.price ?? '', input.moq ?? '', input.leadTime ?? '',
+    input.notes ?? '', input.notes ?? null,
+    input.notes ?? '', input.notes ?? '',
+    product.id,
+  ).run();
+
+  try {
+    const tok = await getServiceAccountToken(env);
+    const sheet = await env.DB.prepare(
+      `SELECT sheet_id FROM sb_buyer_shows WHERE buyer_id = ? AND show_name = ?`
+    ).bind(product.buyer_id, product.show_name).first<{ sheet_id: string }>();
+    if (sheet?.sheet_id && product.sheet_row) {
+      const refreshed = await env.DB.prepare(
+        `SELECT description, price, moq, lead_time FROM sb_products WHERE id = ?`
+      ).bind(product.id).first<{ description: string | null; price: string | null; moq: string | null; lead_time: string | null }>();
+      await updateProductRow(sheet.sheet_id, product.sheet_row, {
+        description: refreshed?.description ?? '',
+        price:       refreshed?.price       ?? '',
+        moq:         refreshed?.moq         ?? '',
+        leadTime:    refreshed?.lead_time   ?? '',
+        tone:        input.tone             ?? '',
+        notes:       input.notes            ?? '',
+      }, tok);
+    }
+  } catch (e) {
+    console.error('[sourcebot_core] product details sheet update failed', e);
+  }
+
+  return { ok: true, status: 'success' };
+}
+
+// Gemini structure-extraction over a free-text reply, mirrors sourcebot.ts:2906.
+export async function parseProductDetailsText(text: string, env: Env): Promise<{ price: string; moq: string; lead_time: string; tone: string }> {
+  const prompt =
+    `Read the following note a buyer wrote about a supplier at a trade show. ` +
+    `Pull out: price, minimum order quantity (MOQ), lead time, and overall tone. ` +
+    `Return ONLY JSON with these fields:\n` +
+    `- price (NORMALIZED to standard money format with currency symbol and decimals — e.g. "$5.20" not "$5 and 20 cents", "€12.50" not "twelve fifty euros". Empty if not mentioned.)\n` +
+    `- moq (number with units, e.g. "5,000 pcs", "1 pallet". Empty if not mentioned.)\n` +
+    `- lead_time (e.g. "30 days", "4 weeks". Empty if not mentioned.)\n` +
+    `- tone (one of: positive, neutral, negative, enthusiastic, skeptical; empty if unclear)\n\n` +
+    `NOTE:\n${text}`;
+
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${env.GEMINI_API_KEY}`;
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      contents: [{ parts: [{ text: prompt }] }],
+      generationConfig: { responseMimeType: 'application/json' },
+    }),
+  });
+  const data = await res.json() as { candidates?: Array<{ content?: { parts?: Array<{ text?: string }> } }> };
+  if (!data.candidates?.length) return { price: '', moq: '', lead_time: '', tone: '' };
+  const raw = data.candidates[0]?.content?.parts?.[0]?.text ?? '{}';
+  const parsed = JSON.parse(raw.replace(/```json|```/g, '').trim()) as Partial<{ price: string; moq: string; lead_time: string; tone: string }>;
+  return {
+    price:     parsed.price     ?? '',
+    moq:       parsed.moq       ?? '',
+    lead_time: parsed.lead_time ?? '',
+    tone:      parsed.tone      ?? '',
+  };
+}
+
+// Card-vs-product classifier — copy of sourcebot.ts:2977.
+async function classifyProductImage(base64: string, mimeType: string, env: Env): Promise<{ type: 'business_card' | 'product'; name: string; description: string }> {
+  const prompt =
+    `You are looking at a photo a sourcing buyer just took at a trade show. ` +
+    `Decide which kind of photo it is: ` +
+    `(a) "business_card" — a printed business/contact card (rectangular card, contact details, company logo with email/phone). ` +
+    `(b) "product" — a physical product, SKU, sample, or packaging on a booth. ` +
+    `Return ONLY JSON: {type: "business_card" | "product", name: string, description: string}. ` +
+    `If type is "product", name = short product name (1-6 words), description = one-line description. ` +
+    `If type is "business_card", set name and description to empty strings. ` +
+    `When unsure between the two, prefer "business_card" only when the photo clearly shows a small rectangular card with multiple lines of contact-like text.`;
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${env.GEMINI_API_KEY}`;
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      contents: [{ parts: [{ text: prompt }, { inline_data: { mime_type: mimeType, data: base64 } }] }],
+      generationConfig: { responseMimeType: 'application/json' },
+    }),
+  });
+  const data = await res.json() as { candidates?: Array<{ content?: { parts?: Array<{ text?: string }> } }> };
+  if (!data.candidates?.length) return { type: 'product', name: '', description: '' };
+  const raw = data.candidates[0]?.content?.parts?.[0]?.text ?? '{}';
+  const parsed = JSON.parse(raw.replace(/```json|```/g, '').trim()) as { type?: string; name?: string; description?: string };
+  const type = parsed.type === 'business_card' ? 'business_card' : 'product';
+  return { type, name: parsed.name ?? '', description: parsed.description ?? '' };
 }
 
 // ── Resolve buyer helper (for callers that only have user_id) ────────────────

@@ -12,7 +12,7 @@ import { handleGoogleAuthStart, handleGoogleAuthCallback } from './google_auth';
 import { handleSourceBotWebhook, handleSourceBotSetupWebhook, handleSourceBotShowPassCron, handleAdminReset } from './sourcebot';
 import { handleDemoBotWebhook, handleDemoBotSetupWebhook, handleDemoBotDailySummaryCron } from './demobot';
 import { handleWhatsAppWebhook, isWhatsAppEnabled } from './whatsapp';
-import { handleWebUpload, handleListLeads, handleGetLead, handleListSuppliers, handleGetMyRole, handleSupplierExtension, handleSupplierVoice } from './web_capture';
+import { handleWebUpload, handleListLeads, handleGetLead, handleListSuppliers, handleGetMyRole, handleSupplierExtension, handleSupplierVoice, handleSupplierProduct, handleUpdateProduct } from './web_capture';
 import { processFunnelQueue } from './funnel';
 import { processDemobotQueue } from './db_emails';
 import { handleListShows, handleCreateShow, handleUpdateShow, handleDeleteShow, handleIssueFreelancerToken, handleMarkConversion } from './demobot_admin';
@@ -117,6 +117,14 @@ export default {
     {
       const m = path.match(/^\/api\/suppliers\/([a-f0-9-]+)\/voice$/i);
       if (m) return addCors(await handleSupplierVoice(request, env, m[1]));
+    }
+    {
+      const m = path.match(/^\/api\/suppliers\/([a-f0-9-]+)\/products$/i);
+      if (m) return addCors(await handleSupplierProduct(request, env, m[1]));
+    }
+    {
+      const m = path.match(/^\/api\/products\/([a-f0-9-]+)$/i);
+      if (m) return addCors(await handleUpdateProduct(request, env, m[1]));
     }
 
     // ── DemoBot (freelancer-facing @DaGamaShow) ───────────────────────────────
@@ -1135,8 +1143,79 @@ const DASHBOARD_PAGE = `<!DOCTYPE html>
           '<label style="' + btnStyle + '">📷 Card back<input type="file" accept="image/*" capture="environment" style="display:none;" onchange="uploadExtension(\'' + s.id + '\', \'card-back\', this)" /></label>' +
           '<label style="' + btnStyle + '">👤 Person photo<input type="file" accept="image/*" capture="environment" style="display:none;" onchange="uploadExtension(\'' + s.id + '\', \'person-photo\', this)" /></label>' +
           '<button type="button" style="' + btnStyle + '" id="voice-btn-' + s.id + '" onclick="toggleVoice(\'' + s.id + '\')">💬 Voice note</button>' +
+          '<label style="' + btnStyle + '">📦 Add product<input type="file" accept="image/*" capture="environment" style="display:none;" onchange="uploadProduct(\'' + s.id + '\', this)" /></label>' +
         '</div>' +
+        '<div id="product-form-' + s.id + '" style="display:none;margin-top:0.65rem;background:rgba(15,20,25,0.5);border:1px solid rgba(212,175,55,0.15);border-radius:8px;padding:0.75rem;"></div>' +
       '</div>';
+    }
+
+    async function uploadProduct(companyId, inputEl) {
+      const file = inputEl.files && inputEl.files[0];
+      if (!file) return;
+      inputEl.value = '';
+      captureStatus.style.display = 'block';
+      captureStatus.textContent = '📤 Uploading product photo…';
+      const fd = new FormData();
+      fd.append('photo', file);
+      try {
+        const res = await fetch('/api/suppliers/' + companyId + '/products', {
+          method: 'POST',
+          headers: { Authorization: 'Bearer ' + token },
+          body: fd,
+        });
+        const data = await res.json();
+        if (!res.ok) {
+          if (data.status === 'reclassified_as_card') {
+            captureStatus.textContent = '⚠️ That looked like a business card, not a product. Use the main capture button to add a new supplier.';
+          } else {
+            captureStatus.textContent = '⚠️ ' + (data.error || 'Product upload failed.');
+          }
+          return;
+        }
+        captureStatus.textContent = '✅ Product saved' + (data.productName ? ' — ' + data.productName : '') + '. Add details below.';
+        renderProductForm(companyId, data.productId, data.productName);
+        loadList();
+      } catch (e) {
+        captureStatus.textContent = '⚠️ Network error.';
+      }
+    }
+
+    function renderProductForm(companyId, productId, productName) {
+      const wrap = document.getElementById('product-form-' + companyId);
+      if (!wrap) return;
+      wrap.style.display = 'block';
+      wrap.innerHTML =
+        '<div style="font-size:0.85rem;color:#94A3B8;margin-bottom:0.5rem;">📦 ' + (productName || 'Product') + ' — add details:</div>' +
+        '<div style="display:grid;grid-template-columns:1fr 1fr;gap:0.4rem;">' +
+          '<input id="pf-' + productId + '-price"     placeholder="Price (e.g. $5.20)"       style="padding:0.5rem;background:rgba(51,65,85,0.5);border:1px solid rgba(212,175,55,0.15);border-radius:6px;color:#F5F5F5;font-family:inherit;font-size:0.85rem;" />' +
+          '<input id="pf-' + productId + '-moq"       placeholder="MOQ (e.g. 500 pcs)"        style="padding:0.5rem;background:rgba(51,65,85,0.5);border:1px solid rgba(212,175,55,0.15);border-radius:6px;color:#F5F5F5;font-family:inherit;font-size:0.85rem;" />' +
+          '<input id="pf-' + productId + '-leadtime"  placeholder="Lead time (e.g. 30 days)"  style="padding:0.5rem;background:rgba(51,65,85,0.5);border:1px solid rgba(212,175,55,0.15);border-radius:6px;color:#F5F5F5;font-family:inherit;font-size:0.85rem;" />' +
+          '<input id="pf-' + productId + '-notes"     placeholder="Notes"                     style="padding:0.5rem;background:rgba(51,65,85,0.5);border:1px solid rgba(212,175,55,0.15);border-radius:6px;color:#F5F5F5;font-family:inherit;font-size:0.85rem;" />' +
+        '</div>' +
+        '<button type="button" style="' + 'background:rgba(212,175,55,0.08);border:1px solid rgba(212,175,55,0.2);color:#D4AF37;border-radius:8px;padding:0.4rem 0.9rem;font-size:0.8rem;font-family:inherit;cursor:pointer;margin-top:0.5rem;' + '" onclick="saveProduct(\'' + companyId + '\', \'' + productId + '\')">Save details</button>';
+    }
+
+    async function saveProduct(companyId, productId) {
+      const body = {
+        price:    document.getElementById('pf-' + productId + '-price').value.trim(),
+        moq:      document.getElementById('pf-' + productId + '-moq').value.trim(),
+        leadTime: document.getElementById('pf-' + productId + '-leadtime').value.trim(),
+        notes:    document.getElementById('pf-' + productId + '-notes').value.trim(),
+      };
+      try {
+        const res = await fetch('/api/products/' + productId, {
+          method: 'PATCH',
+          headers: { Authorization: 'Bearer ' + token, 'Content-Type': 'application/json' },
+          body: JSON.stringify(body),
+        });
+        const data = await res.json();
+        if (!res.ok) { captureStatus.textContent = '⚠️ ' + (data.error || 'Save failed.'); return; }
+        const wrap = document.getElementById('product-form-' + companyId);
+        if (wrap) wrap.style.display = 'none';
+        captureStatus.textContent = '✅ Product details saved.';
+      } catch {
+        captureStatus.textContent = '⚠️ Network error.';
+      }
     }
 
     // Per-supplier MediaRecorder state. Click to start, click again to stop +

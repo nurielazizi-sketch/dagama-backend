@@ -3,7 +3,15 @@
 import type { Env } from './types';
 import { routeToDemoBot, tryClaimAsDemoBot } from './demobot_wa';
 import { handleCardCapture, resolveActiveShow } from './capture';
-import { captureSupplierFromPhoto, attachCardBack, attachPersonPhoto, attachVoiceNote } from './sourcebot_core';
+import {
+  captureSupplierFromPhoto,
+  attachCardBack,
+  attachPersonPhoto,
+  attachVoiceNote,
+  attachProductFromPhoto,
+  updateProductDetails,
+  parseProductDetailsText,
+} from './sourcebot_core';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // WhatsApp Cloud API integration. Behind a feature flag (isWhatsAppEnabled):
@@ -243,6 +251,7 @@ interface WaMapping {
 interface SbWaSession {
   step?:            'awaiting_card_back' | 'awaiting_person_photo' | 'awaiting_voice_note';
   activeCompanyId?: string;
+  activeProductId?: string;     // last product captured — used for free-text detail replies
 }
 
 function parseSbSession(raw: string | null | undefined): SbWaSession {
@@ -395,7 +404,34 @@ async function routeToSourceBot(msg: WaInboundMessage, mapping: WaMapping, env: 
     return;
   }
 
-  // 3. New supplier capture (default for any image not in a step flow).
+  // 2c. Free-text reply during a product flow → parse + apply details.
+  if (msg.type === 'text' && session.activeProductId && session.activeCompanyId) {
+    const text = msg.text?.body?.trim() ?? '';
+    if (text) {
+      try {
+        const parsed = await parseProductDetailsText(text, env);
+        await updateProductDetails({
+          productId: session.activeProductId,
+          buyerId:   mapping.buyer_id,
+          price:     parsed.price,
+          moq:       parsed.moq,
+          leadTime:  parsed.lead_time,
+          tone:      parsed.tone,
+          notes:     text,
+        }, env);
+        const extras = [parsed.price, parsed.moq && `MOQ ${parsed.moq}`, parsed.lead_time, parsed.tone].filter(Boolean).join(' · ');
+        await sendWhatsAppText(mapping.phone, `✅ Added to product${extras ? ` — ${extras}` : ''}.`, env);
+      } catch (e) {
+        console.error('[whatsapp][sourcebot] product details parse failed', e);
+        await sendWhatsAppText(mapping.phone, `⚠️ Couldn't parse that. Try again with price/MOQ/lead time on separate lines.`, env);
+      }
+      return;
+    }
+  }
+
+  // 3. New supplier capture or product photo. If activeCompanyId is set, the
+  // image could be a product OR a brand-new business card — let Gemini decide
+  // (attachProductFromPhoto returns 'reclassified_as_card' on a card image).
   if (msg.type !== 'image') {
     await sendWhatsAppText(
       mapping.phone,
@@ -414,6 +450,24 @@ async function routeToSourceBot(msg: WaInboundMessage, mapping: WaMapping, env: 
   if (!media) {
     await sendWhatsAppText(mapping.phone, `Couldn't download that photo. Try sending it again.`, env);
     return;
+  }
+
+  if (session.activeCompanyId) {
+    const productResult = await attachProductFromPhoto({
+      companyId: session.activeCompanyId,
+      buyerId:   mapping.buyer_id,
+      channel:   'whatsapp',
+      media:     { kind: 'r2_key', key: media.r2Key, mimeType: media.mimeType },
+      reply:     { channel: 'whatsapp', phone: mapping.phone },
+    }, env);
+    if (productResult.ok && productResult.productId) {
+      // Stash the product id so the next text reply attaches details to it.
+      await saveSbSession(mapping.phone, { activeCompanyId: session.activeCompanyId, activeProductId: productResult.productId }, env);
+      return;
+    }
+    if (productResult.status !== 'reclassified_as_card') return;
+    // Fallthrough: image was a business card → fall into supplier capture.
+    await sendWhatsAppText(mapping.phone, `📷 That looks like a business card — capturing as a new supplier.`, env);
   }
 
   const result = await captureSupplierFromPhoto({
