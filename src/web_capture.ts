@@ -3,6 +3,7 @@
 import type { Env } from './types';
 import { requireAuth } from './auth';
 import { handleCardCapture, resolveActiveShow } from './capture';
+import { captureSupplierFromPhoto, resolveBuyerForUser } from './sourcebot_core';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Web capture endpoints — third channel alongside Telegram + WhatsApp.
@@ -59,20 +60,51 @@ export async function handleWebUpload(request: Request, env: Env): Promise<Respo
     return jsonResponse({ error: 'Only image uploads accepted' }, 415);
   }
 
+  const bytes = new Uint8Array(await photoBlob.arrayBuffer());
+  const notes = (form.get('notes') ?? '').toString() || undefined;
+
+  // Dispatch by bot role. Presence of an sb_buyers row → SourceBot user.
+  // Otherwise the user is on BoothBot (the default since BoothBot launch).
+  const buyer = await resolveBuyerForUser(auth.userId, env);
+  if (buyer) {
+    const result = await captureSupplierFromPhoto({
+      buyerId: buyer.buyerId,
+      channel: 'web',
+      media:   { kind: 'bytes', bytes, mimeType },
+      caption: notes,
+      reply:   { channel: 'web' },
+    }, env);
+    if (!result.ok) {
+      return jsonResponse({
+        error:  result.reason ?? result.error ?? 'Capture failed',
+        status: result.status,
+      }, statusForFailure(result.status));
+    }
+    return jsonResponse({
+      botRole:    'sourcebot',
+      companyId:  result.companyId,
+      status:     result.status,
+      rowIndex:   result.rowIndex,
+      sheetUrl:   result.sheetUrl,
+      showName:   result.showName,
+      contact:    result.contact,
+    });
+  }
+
+  // BoothBot path (existing).
   const showOverride = (form.get('show') ?? '').toString().trim();
   const resolved     = showOverride || await resolveActiveShow(auth.userId, env);
   if (!resolved) {
     return jsonResponse({ error: 'No active show. Finish onboarding or pass a "show" field.' }, 400);
   }
 
-  const bytes = new Uint8Array(await photoBlob.arrayBuffer());
   const result = await handleCardCapture({
     userId:   auth.userId,
     showName: resolved,
     botRole:  'boothbot',
     channel:  'web',
     media:    { kind: 'bytes', bytes, mimeType, filename: photoBlob.name },
-    caption:  (form.get('notes') ?? '').toString() || undefined,
+    caption:  notes,
     reply:    { channel: 'web' },
   }, env);
 
@@ -81,6 +113,7 @@ export async function handleWebUpload(request: Request, env: Env): Promise<Respo
   }
 
   return jsonResponse({
+    botRole:   'boothbot',
     leadId:    result.leadId,
     status:    result.status,
     rowIndex:  result.rowIndex,
@@ -88,6 +121,16 @@ export async function handleWebUpload(request: Request, env: Env): Promise<Respo
     showName:  resolved,
     contact:   result.contact,
   });
+}
+
+// HTTP status mapped from a SupplierCaptureResult.status — keeps the upload
+// endpoint honest (e.g. 402-ish for free-tier exhaustion vs 500 for real errors).
+function statusForFailure(status: string): number {
+  if (status === 'no_active_show')        return 400;
+  if (status === 'free_tier_exhausted')   return 402;
+  if (status === 'extraction_failed')     return 422;
+  if (status === 'sheet_failed')          return 502;
+  return 500;
 }
 
 // ── GET /api/leads ───────────────────────────────────────────────────────────
@@ -173,6 +216,67 @@ export async function handleGetLead(request: Request, env: Env, leadId: string):
   // Don't leak chat_id back to the web client.
   const { chat_id: _ignored, ...safe } = lead;
   return jsonResponse({ lead: safe });
+}
+
+// ── GET /api/suppliers ───────────────────────────────────────────────────────
+// SourceBot equivalent of /api/leads. Returns the authed buyer's most recent
+// suppliers (sb_companies), with the latest contact's info denormalised in.
+
+export async function handleListSuppliers(request: Request, env: Env): Promise<Response> {
+  if (request.method !== 'GET') return new Response('Method not allowed', { status: 405 });
+
+  const auth = await requireAuth(request, env);
+  if (auth instanceof Response) return auth;
+
+  const buyer = await resolveBuyerForUser(auth.userId, env);
+  if (!buyer) return jsonResponse({ suppliers: [], role: 'boothbot' });
+
+  const url = new URL(request.url);
+  const limit = clampInt(url.searchParams.get('limit'), 25, 1, 100);
+  const showFilter = url.searchParams.get('show');
+
+  const sql = showFilter
+    ? `SELECT c.id, c.name AS company, c.show_name, c.sheet_row, c.cards_folder_id,
+              c.created_at,
+              (SELECT name  FROM sb_contacts WHERE company_id = c.id ORDER BY created_at DESC LIMIT 1) AS contact_name,
+              (SELECT title FROM sb_contacts WHERE company_id = c.id ORDER BY created_at DESC LIMIT 1) AS title,
+              (SELECT email FROM sb_contacts WHERE company_id = c.id ORDER BY created_at DESC LIMIT 1) AS email,
+              (SELECT phone FROM sb_contacts WHERE company_id = c.id ORDER BY created_at DESC LIMIT 1) AS phone
+         FROM sb_companies c
+        WHERE c.buyer_id = ? AND c.show_name = ?
+        ORDER BY c.created_at DESC
+        LIMIT ?`
+    : `SELECT c.id, c.name AS company, c.show_name, c.sheet_row, c.cards_folder_id,
+              c.created_at,
+              (SELECT name  FROM sb_contacts WHERE company_id = c.id ORDER BY created_at DESC LIMIT 1) AS contact_name,
+              (SELECT title FROM sb_contacts WHERE company_id = c.id ORDER BY created_at DESC LIMIT 1) AS title,
+              (SELECT email FROM sb_contacts WHERE company_id = c.id ORDER BY created_at DESC LIMIT 1) AS email,
+              (SELECT phone FROM sb_contacts WHERE company_id = c.id ORDER BY created_at DESC LIMIT 1) AS phone
+         FROM sb_companies c
+        WHERE c.buyer_id = ?
+        ORDER BY c.created_at DESC
+        LIMIT ?`;
+
+  const stmt = showFilter
+    ? env.DB.prepare(sql).bind(buyer.buyerId, showFilter, limit)
+    : env.DB.prepare(sql).bind(buyer.buyerId, limit);
+
+  const rows = await stmt.all<Record<string, unknown>>();
+  return jsonResponse({ suppliers: rows.results, role: 'sourcebot' });
+}
+
+// ── GET /api/me/role ─────────────────────────────────────────────────────────
+// Lightweight signal so the dashboard can render BoothBot vs SourceBot UI
+// without making the user pick again.
+
+export async function handleGetMyRole(request: Request, env: Env): Promise<Response> {
+  if (request.method !== 'GET') return new Response('Method not allowed', { status: 405 });
+
+  const auth = await requireAuth(request, env);
+  if (auth instanceof Response) return auth;
+
+  const buyer = await resolveBuyerForUser(auth.userId, env);
+  return jsonResponse({ role: buyer ? 'sourcebot' : 'boothbot' });
 }
 
 // ── helpers ──────────────────────────────────────────────────────────────────

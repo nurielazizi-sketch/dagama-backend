@@ -3,6 +3,7 @@
 import type { Env } from './types';
 import { routeToDemoBot, tryClaimAsDemoBot } from './demobot_wa';
 import { handleCardCapture, resolveActiveShow } from './capture';
+import { captureSupplierFromPhoto } from './sourcebot_core';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // WhatsApp Cloud API integration. Behind a feature flag (isWhatsAppEnabled):
@@ -283,9 +284,51 @@ async function routeToBoothBot(msg: WaInboundMessage, mapping: WaMapping, env: E
   }, env);
 }
 
-async function routeToSourceBot(msg: WaInboundMessage, mapping: { phone: string }, env: Env): Promise<void> {
+// SourceBot WhatsApp router. Phase 1 supports the supplier-card capture leg
+// (front of card → sb_companies + sb_contacts + Suppliers sheet row + Drive
+// folder). Multi-step extensions (card back, person photo, voice notes,
+// products) come in subsequent phases — non-image inputs get a help nudge.
+
+async function routeToSourceBot(msg: WaInboundMessage, mapping: WaMapping, env: Env): Promise<void> {
   console.log('[whatsapp][sourcebot] inbound', { phone: mapping.phone, type: msg.type, wamid: msg.id });
-  await sendWhatsAppText(mapping.phone, '📥 SourceBot received your message. (WhatsApp pipeline coming online — captured for processing.)', env);
+
+  if (!mapping.buyer_id) {
+    console.error('[whatsapp][sourcebot] missing buyer_id on mapping', { phone: mapping.phone });
+    await sendWhatsAppText(
+      mapping.phone,
+      `Your account isn't fully linked yet. Please open ${env.ORIGIN} and finish onboarding.`,
+      env,
+    );
+    return;
+  }
+
+  if (msg.type !== 'image') {
+    await sendWhatsAppText(
+      mapping.phone,
+      `📸 Send a photo of a supplier's business card and I'll log it into your sheet.`,
+      env,
+    );
+    return;
+  }
+
+  const mediaId = msg.image?.id;
+  if (!mediaId) {
+    await sendWhatsAppText(mapping.phone, `Couldn't read that photo. Try sending it again.`, env);
+    return;
+  }
+  const media = await fetchWhatsAppMedia(mediaId, env);
+  if (!media) {
+    await sendWhatsAppText(mapping.phone, `Couldn't download that photo. Try sending it again.`, env);
+    return;
+  }
+
+  await captureSupplierFromPhoto({
+    buyerId:  mapping.buyer_id,
+    channel:  'whatsapp',
+    media:    { kind: 'r2_key', key: media.r2Key, mimeType: media.mimeType },
+    caption:  msg.image?.caption,
+    reply:    { channel: 'whatsapp', phone: mapping.phone },
+  }, env);
 }
 
 async function handleUnassignedMessage(msg: WaInboundMessage, mapping: { id: string; phone: string; bot_role: string; user_id: string | null; buyer_id: string | null; session: string | null; display_name: string | null }, env: Env): Promise<void> {

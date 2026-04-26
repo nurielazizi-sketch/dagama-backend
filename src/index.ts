@@ -12,7 +12,7 @@ import { handleGoogleAuthStart, handleGoogleAuthCallback } from './google_auth';
 import { handleSourceBotWebhook, handleSourceBotSetupWebhook, handleSourceBotShowPassCron, handleAdminReset } from './sourcebot';
 import { handleDemoBotWebhook, handleDemoBotSetupWebhook, handleDemoBotDailySummaryCron } from './demobot';
 import { handleWhatsAppWebhook, isWhatsAppEnabled } from './whatsapp';
-import { handleWebUpload, handleListLeads, handleGetLead } from './web_capture';
+import { handleWebUpload, handleListLeads, handleGetLead, handleListSuppliers, handleGetMyRole } from './web_capture';
 import { processFunnelQueue } from './funnel';
 import { processDemobotQueue } from './db_emails';
 import { handleListShows, handleCreateShow, handleUpdateShow, handleDeleteShow, handleIssueFreelancerToken, handleMarkConversion } from './demobot_admin';
@@ -101,6 +101,8 @@ export default {
     // ── Web capture (third channel) ───────────────────────────────────────────
     if (path === '/api/upload')              return addCors(await handleWebUpload(request, env));
     if (path === '/api/leads')               return addCors(await handleListLeads(request, env));
+    if (path === '/api/suppliers')           return addCors(await handleListSuppliers(request, env));
+    if (path === '/api/me/role')             return addCors(await handleGetMyRole(request, env));
     {
       const m = path.match(/^\/api\/leads\/([a-f0-9-]+)$/i);
       if (m) return addCors(await handleGetLead(request, env, m[1]));
@@ -807,7 +809,7 @@ const DASHBOARD_PAGE = `<!DOCTYPE html>
       </div>
     </div>
 
-    <div class="section-title">Capture a card <span class="badge badge-gold">Web</span></div>
+    <div class="section-title" data-capture-title>Capture a card <span class="badge badge-gold">Web</span></div>
     <div id="capture-box" style="background: linear-gradient(135deg, rgba(30,41,59,0.9), rgba(30,41,59,0.6)); border: 1px solid rgba(212,175,55,0.15); border-radius: 16px; padding: 1.5rem; margin-bottom: 1rem;">
       <div style="display:flex;flex-wrap:wrap;gap:0.75rem;align-items:center;">
         <input id="capture-show" type="text" placeholder="Show name (auto-filled)" style="flex:1;min-width:180px;padding:0.75rem;background:rgba(51,65,85,0.5);border:1px solid rgba(212,175,55,0.15);border-radius:8px;color:#F5F5F5;font-family:'Outfit',sans-serif;" />
@@ -818,7 +820,7 @@ const DASHBOARD_PAGE = `<!DOCTYPE html>
       <div id="capture-result" style="margin-top:1rem;display:none;"></div>
     </div>
 
-    <div class="section-title" style="margin-top:2rem;">Recent leads <span class="badge badge-green" id="leads-count">0</span></div>
+    <div class="section-title" style="margin-top:2rem;" data-list-title>Recent leads <span class="badge badge-green" id="leads-count">0</span></div>
     <div id="leads-box" class="empty-state">
       <div class="icon">📇</div>
       <p>No leads yet.<br>Use the camera button above, the Telegram bot, or WhatsApp once approved.</p>
@@ -957,11 +959,35 @@ const DASHBOARD_PAGE = `<!DOCTYPE html>
       }
     }
 
-    // ── Web capture (BoothBot via /api/upload) ────────────────────────────
+    // ── Web capture (BoothBot leads or SourceBot suppliers via /api/upload) ──
     const captureInput  = document.getElementById('capture-input');
     const captureStatus = document.getElementById('capture-status');
     const captureResult = document.getElementById('capture-result');
     const captureShow   = document.getElementById('capture-show');
+
+    // Detect role once on load and re-label the capture/list sections.
+    let userRole = 'boothbot';
+    fetch('/api/me/role', { headers: { Authorization: 'Bearer ' + token } })
+      .then(r => r.json())
+      .then(d => {
+        userRole = (d && d.role) || 'boothbot';
+        if (userRole === 'sourcebot') {
+          // SourceBot users capture suppliers, not leads.
+          const captureTitle = document.querySelector('[data-capture-title]');
+          if (captureTitle) captureTitle.textContent = 'Capture a supplier';
+          const listTitle = document.querySelector('[data-list-title]');
+          if (listTitle) listTitle.textContent = 'Recent suppliers';
+          const empty = document.getElementById('leads-box');
+          if (empty) {
+            empty.innerHTML = '<div class="icon">🏭</div><p>No suppliers yet.<br>Use the camera button above, the Telegram bot, or WhatsApp once approved.</p>';
+          }
+          // SourceBot doesn't pick a per-show sheet from the web — show is
+          // implicit from the buyer's active pass. Hide the show input.
+          if (captureShow) captureShow.style.display = 'none';
+        }
+        loadList();
+      })
+      .catch(() => loadList());
 
     captureInput.addEventListener('change', async (ev) => {
       const file = ev.target.files && ev.target.files[0];
@@ -996,12 +1022,16 @@ const DASHBOARD_PAGE = `<!DOCTYPE html>
         captureStatus.textContent = '🤖 Extracting card details…';
         renderCaptureResult(data);
 
-        // Poll until the lead reaches a terminal status.
-        if (data.leadId && data.status !== 'complete' && data.status !== 'image_failed') {
+        if (data.botRole === 'sourcebot') {
+          // SourceBot core does Phase 1 + 2 inline (DB + Drive + Sheet append),
+          // so a 'success' status is already terminal — no polling needed.
+          finalizeStatus(data.status === 'success' ? 'complete' : data.status);
+          loadList();
+        } else if (data.leadId && data.status !== 'complete' && data.status !== 'image_failed') {
           pollLead(data.leadId);
         } else {
           finalizeStatus(data.status);
-          loadLeads();
+          loadList();
         }
       } catch (e) {
         captureStatus.textContent = '⚠️ Network error. Please try again.';
@@ -1010,12 +1040,15 @@ const DASHBOARD_PAGE = `<!DOCTYPE html>
 
     function renderCaptureResult(data) {
       const c = data.contact || {};
+      // For SourceBot the headline is the company; the contact name is secondary.
+      const isSourceBot = data.botRole === 'sourcebot';
+      const headline = isSourceBot ? (c.company || c.name || 'Unknown') : (c.name || 'Unknown');
+      const sub      = isSourceBot ? (c.name && c.name !== headline ? c.name + (c.title ? ' · ' + c.title : '') : (c.title || '')) : ((c.title || '') + (c.title && c.company ? ' · ' : '') + (c.company || ''));
       captureResult.style.display = 'block';
       captureResult.innerHTML =
         '<div style="background:rgba(15,20,25,0.5);border:1px solid rgba(212,175,55,0.15);border-radius:8px;padding:1rem;">' +
-          '<div style="font-weight:600;font-size:1.05rem;color:#F5F5F5;margin-bottom:0.4rem;">' + (c.name || 'Unknown') + '</div>' +
-          (c.title   ? '<div style="color:#94A3B8;font-size:0.9rem;">' + c.title + '</div>'   : '') +
-          (c.company ? '<div style="color:#94A3B8;font-size:0.9rem;">' + c.company + '</div>' : '') +
+          '<div style="font-weight:600;font-size:1.05rem;color:#F5F5F5;margin-bottom:0.4rem;">' + headline + '</div>' +
+          (sub       ? '<div style="color:#94A3B8;font-size:0.9rem;">' + sub + '</div>' : '') +
           (c.email   ? '<div style="color:#D4AF37;font-size:0.9rem;margin-top:0.4rem;">📧 ' + c.email + '</div>' : '') +
           (c.phone   ? '<div style="color:#D4AF37;font-size:0.9rem;">📞 ' + c.phone + '</div>' : '') +
           (data.sheetUrl ? '<a href="' + data.sheetUrl + '" target="_blank" style="display:inline-block;margin-top:0.75rem;color:#4ade80;font-size:0.85rem;">Open sheet →</a>' : '') +
@@ -1030,7 +1063,7 @@ const DASHBOARD_PAGE = `<!DOCTYPE html>
           const res = await fetch('/api/leads/' + leadId, { headers: { Authorization: 'Bearer ' + token } });
           const data = await res.json();
           const s = data.lead && data.lead.status;
-          if (s === 'complete' || s === 'image_failed') { finalizeStatus(s); loadLeads(); return; }
+          if (s === 'complete' || s === 'image_failed') { finalizeStatus(s); loadList(); return; }
         } catch {}
         setTimeout(tick, 1500);
       };
@@ -1044,12 +1077,13 @@ const DASHBOARD_PAGE = `<!DOCTYPE html>
       else                                 captureStatus.textContent = '✅ Saved.';
     }
 
-    async function loadLeads() {
+    async function loadList() {
+      const url = userRole === 'sourcebot' ? '/api/suppliers?limit=10' : '/api/leads?limit=10';
       try {
-        const res = await fetch('/api/leads?limit=10', { headers: { Authorization: 'Bearer ' + token } });
+        const res = await fetch(url, { headers: { Authorization: 'Bearer ' + token } });
         if (!res.ok) return;
         const data = await res.json();
-        const rows = (data.leads || []);
+        const rows = (userRole === 'sourcebot' ? (data.suppliers || []) : (data.leads || []));
         document.getElementById('leads-count').textContent = rows.length;
         document.getElementById('stat-leads').textContent = rows.length;
         const box = document.getElementById('leads-box');
@@ -1060,19 +1094,31 @@ const DASHBOARD_PAGE = `<!DOCTYPE html>
         box.style.border = '1px solid rgba(212,175,55,0.15)';
         box.style.background = 'linear-gradient(135deg, rgba(30,41,59,0.9), rgba(30,41,59,0.6))';
         box.style.borderRadius = '16px';
-        box.innerHTML = rows.map(l =>
-          '<div style="display:flex;align-items:center;justify-content:space-between;padding:0.85rem 1.25rem;border-bottom:1px solid rgba(255,255,255,0.05);">' +
-            '<div>' +
-              '<div style="font-weight:600;color:#F5F5F5;">' + (l.name || 'Unknown') + (l.company ? ' <span style="color:#94A3B8;font-weight:400">· ' + l.company + '</span>' : '') + '</div>' +
-              '<div style="font-size:0.8rem;color:#94A3B8;margin-top:0.15rem;">' + (l.show_name || '') + ' · ' + new Date(l.created_at).toLocaleString() + '</div>' +
-            '</div>' +
-            '<span style="font-size:0.75rem;color:' + (l.status === 'complete' ? '#4ade80' : l.status === 'image_failed' ? '#f87171' : '#D4AF37') + ';text-transform:uppercase;letter-spacing:0.05em;">' + (l.status || '—') + '</span>' +
-          '</div>'
-        ).join('');
+        box.innerHTML = rows.map(r => userRole === 'sourcebot' ? renderSupplierRow(r) : renderLeadRow(r)).join('');
       } catch {}
     }
 
-    loadLeads();
+    function renderLeadRow(l) {
+      const colour = l.status === 'complete' ? '#4ade80' : l.status === 'image_failed' ? '#f87171' : '#D4AF37';
+      return '<div style="display:flex;align-items:center;justify-content:space-between;padding:0.85rem 1.25rem;border-bottom:1px solid rgba(255,255,255,0.05);">' +
+        '<div>' +
+          '<div style="font-weight:600;color:#F5F5F5;">' + (l.name || 'Unknown') + (l.company ? ' <span style="color:#94A3B8;font-weight:400">· ' + l.company + '</span>' : '') + '</div>' +
+          '<div style="font-size:0.8rem;color:#94A3B8;margin-top:0.15rem;">' + (l.show_name || '') + ' · ' + new Date(l.created_at).toLocaleString() + '</div>' +
+        '</div>' +
+        '<span style="font-size:0.75rem;color:' + colour + ';text-transform:uppercase;letter-spacing:0.05em;">' + (l.status || '—') + '</span>' +
+      '</div>';
+    }
+
+    function renderSupplierRow(s) {
+      const folderUrl = s.cards_folder_id ? 'https://drive.google.com/drive/folders/' + s.cards_folder_id : null;
+      return '<div style="display:flex;align-items:center;justify-content:space-between;padding:0.85rem 1.25rem;border-bottom:1px solid rgba(255,255,255,0.05);">' +
+        '<div>' +
+          '<div style="font-weight:600;color:#F5F5F5;">' + (s.company || 'Unknown') + (s.contact_name ? ' <span style="color:#94A3B8;font-weight:400">· ' + s.contact_name + '</span>' : '') + '</div>' +
+          '<div style="font-size:0.8rem;color:#94A3B8;margin-top:0.15rem;">' + (s.show_name || '') + ' · ' + new Date(s.created_at).toLocaleString() + (s.email ? ' · ' + s.email : '') + '</div>' +
+        '</div>' +
+        (folderUrl ? '<a href="' + folderUrl + '" target="_blank" style="font-size:0.75rem;color:#4ade80;text-transform:uppercase;letter-spacing:0.05em;text-decoration:none;">Folder →</a>' : '') +
+      '</div>';
+    }
 
     async function loadInsights() {
       const btn = document.getElementById('insights-btn');
