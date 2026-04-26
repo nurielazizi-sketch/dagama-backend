@@ -3,7 +3,7 @@
 import type { Env } from './types';
 import { requireAuth } from './auth';
 import { handleCardCapture, resolveActiveShow } from './capture';
-import { captureSupplierFromPhoto, resolveBuyerForUser } from './sourcebot_core';
+import { captureSupplierFromPhoto, resolveBuyerForUser, attachCardBack, attachPersonPhoto } from './sourcebot_core';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Web capture endpoints — third channel alongside Telegram + WhatsApp.
@@ -263,6 +263,66 @@ export async function handleListSuppliers(request: Request, env: Env): Promise<R
 
   const rows = await stmt.all<Record<string, unknown>>();
   return jsonResponse({ suppliers: rows.results, role: 'sourcebot' });
+}
+
+// ── POST /api/suppliers/:id/card-back  +  /api/suppliers/:id/person-photo ───
+// Multipart upload with a single 'photo' field. Authorised via JWT; the
+// supplier row's buyer_id must match the buyer linked to this user.
+
+export async function handleSupplierExtension(
+  request: Request,
+  env:     Env,
+  companyId: string,
+  kind:    'card_back' | 'person_photo',
+): Promise<Response> {
+  if (request.method !== 'POST') return new Response('Method not allowed', { status: 405 });
+
+  const auth = await requireAuth(request, env);
+  if (auth instanceof Response) return auth;
+
+  const buyer = await resolveBuyerForUser(auth.userId, env);
+  if (!buyer) return jsonResponse({ error: 'SourceBot account required' }, 403);
+
+  const ct = request.headers.get('content-type') ?? '';
+  if (!ct.toLowerCase().includes('multipart/form-data')) {
+    return jsonResponse({ error: 'Expected multipart/form-data' }, 415);
+  }
+
+  let form: FormData;
+  try { form = await request.formData(); }
+  catch (e) {
+    console.error('[web_capture] extension formData parse failed', e);
+    return jsonResponse({ error: 'Invalid multipart body' }, 400);
+  }
+
+  const photo = form.get('photo');
+  if (photo == null || typeof photo === 'string') {
+    return jsonResponse({ error: 'Missing "photo" file field' }, 400);
+  }
+  const photoBlob = photo as Blob & { name?: string };
+  if (photoBlob.size === 0)                       return jsonResponse({ error: 'Empty file' }, 400);
+  if (photoBlob.size > MAX_UPLOAD_BYTES)          return jsonResponse({ error: `File too large (max ${MAX_UPLOAD_BYTES} bytes)` }, 413);
+  const mimeType = (photoBlob.type || '').toLowerCase();
+  if (!mimeType.startsWith('image/'))             return jsonResponse({ error: 'Only image uploads accepted' }, 415);
+
+  const bytes = new Uint8Array(await photoBlob.arrayBuffer());
+  const fn = kind === 'card_back' ? attachCardBack : attachPersonPhoto;
+  const result = await fn({
+    companyId,
+    buyerId: buyer.buyerId,
+    channel: 'web',
+    media:   { kind: 'bytes', bytes, mimeType },
+    reply:   { channel: 'web' },
+  }, env);
+
+  if (!result.ok) {
+    return jsonResponse({ error: result.error ?? 'Upload failed', status: result.status }, result.status === 'no_supplier' ? 404 : 500);
+  }
+  return jsonResponse({
+    status:      result.status,
+    url:         result.url,
+    description: result.description,
+  });
 }
 
 // ── GET /api/me/role ─────────────────────────────────────────────────────────

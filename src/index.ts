@@ -12,7 +12,7 @@ import { handleGoogleAuthStart, handleGoogleAuthCallback } from './google_auth';
 import { handleSourceBotWebhook, handleSourceBotSetupWebhook, handleSourceBotShowPassCron, handleAdminReset } from './sourcebot';
 import { handleDemoBotWebhook, handleDemoBotSetupWebhook, handleDemoBotDailySummaryCron } from './demobot';
 import { handleWhatsAppWebhook, isWhatsAppEnabled } from './whatsapp';
-import { handleWebUpload, handleListLeads, handleGetLead, handleListSuppliers, handleGetMyRole } from './web_capture';
+import { handleWebUpload, handleListLeads, handleGetLead, handleListSuppliers, handleGetMyRole, handleSupplierExtension } from './web_capture';
 import { processFunnelQueue } from './funnel';
 import { processDemobotQueue } from './db_emails';
 import { handleListShows, handleCreateShow, handleUpdateShow, handleDeleteShow, handleIssueFreelancerToken, handleMarkConversion } from './demobot_admin';
@@ -106,6 +106,13 @@ export default {
     {
       const m = path.match(/^\/api\/leads\/([a-f0-9-]+)$/i);
       if (m) return addCors(await handleGetLead(request, env, m[1]));
+    }
+    {
+      const m = path.match(/^\/api\/suppliers\/([a-f0-9-]+)\/(card-back|person-photo)$/i);
+      if (m) {
+        const kind = m[2] === 'card-back' ? 'card_back' : 'person_photo';
+        return addCors(await handleSupplierExtension(request, env, m[1], kind));
+      }
     }
 
     // ── DemoBot (freelancer-facing @DaGamaShow) ───────────────────────────────
@@ -1111,13 +1118,48 @@ const DASHBOARD_PAGE = `<!DOCTYPE html>
 
     function renderSupplierRow(s) {
       const folderUrl = s.cards_folder_id ? 'https://drive.google.com/drive/folders/' + s.cards_folder_id : null;
-      return '<div style="display:flex;align-items:center;justify-content:space-between;padding:0.85rem 1.25rem;border-bottom:1px solid rgba(255,255,255,0.05);">' +
-        '<div>' +
-          '<div style="font-weight:600;color:#F5F5F5;">' + (s.company || 'Unknown') + (s.contact_name ? ' <span style="color:#94A3B8;font-weight:400">· ' + s.contact_name + '</span>' : '') + '</div>' +
-          '<div style="font-size:0.8rem;color:#94A3B8;margin-top:0.15rem;">' + (s.show_name || '') + ' · ' + new Date(s.created_at).toLocaleString() + (s.email ? ' · ' + s.email : '') + '</div>' +
+      const btnStyle = 'background:rgba(212,175,55,0.08);border:1px solid rgba(212,175,55,0.2);color:#D4AF37;border-radius:8px;padding:0.35rem 0.7rem;font-size:0.75rem;font-family:inherit;cursor:pointer;display:inline-block;';
+      return '<div style="padding:0.85rem 1.25rem;border-bottom:1px solid rgba(255,255,255,0.05);">' +
+        '<div style="display:flex;align-items:flex-start;justify-content:space-between;gap:1rem;">' +
+          '<div>' +
+            '<div style="font-weight:600;color:#F5F5F5;">' + (s.company || 'Unknown') + (s.contact_name ? ' <span style="color:#94A3B8;font-weight:400">· ' + s.contact_name + '</span>' : '') + '</div>' +
+            '<div style="font-size:0.8rem;color:#94A3B8;margin-top:0.15rem;">' + (s.show_name || '') + ' · ' + new Date(s.created_at).toLocaleString() + (s.email ? ' · ' + s.email : '') + '</div>' +
+          '</div>' +
+          (folderUrl ? '<a href="' + folderUrl + '" target="_blank" style="font-size:0.75rem;color:#4ade80;text-transform:uppercase;letter-spacing:0.05em;text-decoration:none;white-space:nowrap;">Folder →</a>' : '') +
         '</div>' +
-        (folderUrl ? '<a href="' + folderUrl + '" target="_blank" style="font-size:0.75rem;color:#4ade80;text-transform:uppercase;letter-spacing:0.05em;text-decoration:none;">Folder →</a>' : '') +
+        '<div style="margin-top:0.65rem;display:flex;gap:0.5rem;flex-wrap:wrap;">' +
+          '<label style="' + btnStyle + '">📷 Card back<input type="file" accept="image/*" capture="environment" style="display:none;" onchange="uploadExtension(\'' + s.id + '\', \'card-back\', this)" /></label>' +
+          '<label style="' + btnStyle + '">👤 Person photo<input type="file" accept="image/*" capture="environment" style="display:none;" onchange="uploadExtension(\'' + s.id + '\', \'person-photo\', this)" /></label>' +
+        '</div>' +
       '</div>';
+    }
+
+    async function uploadExtension(companyId, kind, inputEl) {
+      const file = inputEl.files && inputEl.files[0];
+      if (!file) return;
+      inputEl.value = '';
+      captureStatus.style.display = 'block';
+      captureStatus.textContent = '📤 Uploading ' + (kind === 'card-back' ? 'card back' : 'person photo') + '…';
+      const fd = new FormData();
+      fd.append('photo', file);
+      try {
+        const res = await fetch('/api/suppliers/' + companyId + '/' + kind, {
+          method: 'POST',
+          headers: { Authorization: 'Bearer ' + token },
+          body: fd,
+        });
+        const data = await res.json();
+        if (!res.ok) {
+          captureStatus.textContent = '⚠️ ' + (data.error || 'Upload failed.');
+          return;
+        }
+        captureStatus.textContent = kind === 'person-photo' && data.description
+          ? '✅ Saved — ' + data.description
+          : '✅ Saved.';
+        loadList();
+      } catch (e) {
+        captureStatus.textContent = '⚠️ Network error.';
+      }
     }
 
     async function loadInsights() {

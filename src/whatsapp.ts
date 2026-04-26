@@ -3,7 +3,7 @@
 import type { Env } from './types';
 import { routeToDemoBot, tryClaimAsDemoBot } from './demobot_wa';
 import { handleCardCapture, resolveActiveShow } from './capture';
-import { captureSupplierFromPhoto } from './sourcebot_core';
+import { captureSupplierFromPhoto, attachCardBack, attachPersonPhoto } from './sourcebot_core';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // WhatsApp Cloud API integration. Behind a feature flag (isWhatsAppEnabled):
@@ -235,6 +235,26 @@ interface WaMapping {
   user_id:  string | null;
   buyer_id: string | null;
   bot_role: string;
+  session?: string | null;        // JSON-serialized session state (SourceBot multi-step)
+}
+
+// SourceBot multi-step session — parallel to sourcebot.ts SourceBotSession but
+// keyed by phone (wa_user_mappings.session) instead of telegram_chat_id.
+interface SbWaSession {
+  step?:            'awaiting_card_back' | 'awaiting_person_photo';
+  activeCompanyId?: string;
+}
+
+function parseSbSession(raw: string | null | undefined): SbWaSession {
+  if (!raw) return {};
+  try { return JSON.parse(raw) as SbWaSession; } catch { return {}; }
+}
+
+async function saveSbSession(phone: string, session: SbWaSession, env: Env): Promise<void> {
+  const value = Object.keys(session).length === 0 ? null : JSON.stringify(session);
+  await env.DB.prepare(
+    `UPDATE wa_user_mappings SET session = ?, updated_at = datetime('now') WHERE phone = ?`
+  ).bind(value, phone).run();
 }
 
 async function routeToBoothBot(msg: WaInboundMessage, mapping: WaMapping, env: Env): Promise<void> {
@@ -284,10 +304,13 @@ async function routeToBoothBot(msg: WaInboundMessage, mapping: WaMapping, env: E
   }, env);
 }
 
-// SourceBot WhatsApp router. Phase 1 supports the supplier-card capture leg
-// (front of card → sb_companies + sb_contacts + Suppliers sheet row + Drive
-// folder). Multi-step extensions (card back, person photo, voice notes,
-// products) come in subsequent phases — non-image inputs get a help nudge.
+// SourceBot WhatsApp router.
+//   Phase 1: front-of-card supplier capture
+//   Phase 2: card-back + person-photo extensions (this phase). After a supplier
+//            is captured we send a quick-reply button set; tapping a button
+//            stores `step` + `activeCompanyId` on wa_user_mappings.session, and
+//            the next image is routed to the corresponding attach* helper.
+// Subsequent phases (voice, products, email, find/PDF) extend the same pattern.
 
 async function routeToSourceBot(msg: WaInboundMessage, mapping: WaMapping, env: Env): Promise<void> {
   console.log('[whatsapp][sourcebot] inbound', { phone: mapping.phone, type: msg.type, wamid: msg.id });
@@ -302,6 +325,50 @@ async function routeToSourceBot(msg: WaInboundMessage, mapping: WaMapping, env: 
     return;
   }
 
+  const session = parseSbSession(mapping.session);
+
+  // 1. Interactive button reply → set step + active company.
+  if (msg.type === 'interactive' && msg.interactive?.button_reply) {
+    const id = msg.interactive.button_reply.id;
+    if (id.startsWith('sb_back:')) {
+      await saveSbSession(mapping.phone, { step: 'awaiting_card_back', activeCompanyId: id.slice('sb_back:'.length) }, env);
+      await sendWhatsAppText(mapping.phone, `📷 Send the back of the card now.`, env);
+      return;
+    }
+    if (id.startsWith('sb_person:')) {
+      await saveSbSession(mapping.phone, { step: 'awaiting_person_photo', activeCompanyId: id.slice('sb_person:'.length) }, env);
+      await sendWhatsAppText(mapping.phone, `👤 Send a photo of the person, booth, or signage.`, env);
+      return;
+    }
+    if (id === 'sb_done') {
+      await saveSbSession(mapping.phone, {}, env);
+      await sendWhatsAppText(mapping.phone, `✅ Done. Send another card photo to capture the next supplier.`, env);
+      return;
+    }
+  }
+
+  // 2. Image during a multi-step extension flow.
+  if (msg.type === 'image' && session.step && session.activeCompanyId) {
+    const mediaId = msg.image?.id;
+    if (!mediaId) { await sendWhatsAppText(mapping.phone, `Couldn't read that photo. Try sending it again.`, env); return; }
+    const media = await fetchWhatsAppMedia(mediaId, env);
+    if (!media) { await sendWhatsAppText(mapping.phone, `Couldn't download that photo. Try sending it again.`, env); return; }
+
+    const fn = session.step === 'awaiting_card_back' ? attachCardBack : attachPersonPhoto;
+    await fn({
+      companyId: session.activeCompanyId,
+      buyerId:   mapping.buyer_id,
+      channel:   'whatsapp',
+      media:     { kind: 'r2_key', key: media.r2Key, mimeType: media.mimeType },
+      reply:     { channel: 'whatsapp', phone: mapping.phone },
+    }, env);
+
+    // Reset to free state — next image will be a brand-new supplier capture.
+    await saveSbSession(mapping.phone, {}, env);
+    return;
+  }
+
+  // 3. New supplier capture (default for any image not in a step flow).
   if (msg.type !== 'image') {
     await sendWhatsAppText(
       mapping.phone,
@@ -322,13 +389,32 @@ async function routeToSourceBot(msg: WaInboundMessage, mapping: WaMapping, env: 
     return;
   }
 
-  await captureSupplierFromPhoto({
+  const result = await captureSupplierFromPhoto({
     buyerId:  mapping.buyer_id,
     channel:  'whatsapp',
     media:    { kind: 'r2_key', key: media.r2Key, mimeType: media.mimeType },
     caption:  msg.image?.caption,
     reply:    { channel: 'whatsapp', phone: mapping.phone },
   }, env);
+
+  // 4. On success, prompt for extensions via interactive buttons.
+  if (result.ok && result.companyId) {
+    await saveSbSession(mapping.phone, { activeCompanyId: result.companyId }, env);
+    try {
+      await sendWhatsAppButtons(
+        mapping.phone,
+        `Add more for *${result.contact?.company || 'this supplier'}*?`,
+        [
+          { id: `sb_back:${result.companyId}`,   title: '📷 Card back'   },
+          { id: `sb_person:${result.companyId}`, title: '👤 Person photo' },
+          { id: 'sb_done',                       title: '✅ Done'          },
+        ],
+        env,
+      );
+    } catch (e) {
+      console.error('[whatsapp][sourcebot] post-capture buttons failed', e);
+    }
+  }
 }
 
 async function handleUnassignedMessage(msg: WaInboundMessage, mapping: { id: string; phone: string; bot_role: string; user_id: string | null; buyer_id: string | null; session: string | null; display_name: string | null }, env: Env): Promise<void> {

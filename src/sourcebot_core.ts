@@ -3,7 +3,7 @@
 import type { Env } from './types';
 import { extractContactFromImage } from './extract';
 import { getServiceAccountToken, createDriveFolder } from './google';
-import { appendSupplierRow } from './sb_sheets';
+import { appendSupplierRow, updateSupplierCardBack, updateSupplierPerson } from './sb_sheets';
 import { scheduleFunnelOnFirstScan, trackEvent } from './funnel';
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -265,6 +265,148 @@ export async function captureSupplierFromPhoto(input: SupplierCaptureInput, env:
   };
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Phase 2: Card back + Person photo extensions on an existing supplier.
+// Both attach the photo to the latest contact row for the company, store it
+// in the per-supplier Cards/ Drive folder, and update the matching sheet
+// column (O for card back, AB/AC for person photo + description).
+// ─────────────────────────────────────────────────────────────────────────────
+
+export interface SupplierExtensionInput {
+  companyId: string;
+  buyerId:   string;
+  channel:   'whatsapp' | 'web';
+  media:
+    | { kind: 'r2_key'; key: string; mimeType?: string }
+    | { kind: 'bytes'; bytes: Uint8Array; mimeType: string };
+  reply: ReplyTarget;
+}
+
+export interface SupplierExtensionResult {
+  ok:           boolean;
+  status:       'success' | 'no_supplier' | 'storage_failed' | 'upload_failed' | 'error';
+  url?:         string;
+  description?: string;        // person photo only
+  error?:       string;
+}
+
+export async function attachCardBack(input: SupplierExtensionInput, env: Env): Promise<SupplierExtensionResult> {
+  return attachExtensionPhoto(input, 'card_back', env);
+}
+
+export async function attachPersonPhoto(input: SupplierExtensionInput, env: Env): Promise<SupplierExtensionResult> {
+  return attachExtensionPhoto(input, 'person_photo', env);
+}
+
+async function attachExtensionPhoto(
+  input: SupplierExtensionInput,
+  kind:  'card_back' | 'person_photo',
+  env:   Env,
+): Promise<SupplierExtensionResult> {
+  const company = await env.DB.prepare(
+    `SELECT id, name, show_name, sheet_row, buyer_id FROM sb_companies WHERE id = ? AND buyer_id = ?`
+  ).bind(input.companyId, input.buyerId).first<{ id: string; name: string; show_name: string; sheet_row: number | null; buyer_id: string }>();
+  if (!company) {
+    await sendReply(input.reply, `Supplier not found.`, env);
+    return { ok: false, status: 'no_supplier' };
+  }
+
+  // Read bytes (web → bytes; WA → r2_key cached by media id).
+  let rawBuffer: ArrayBuffer;
+  try {
+    if (input.media.kind === 'bytes') {
+      const u8 = input.media.bytes;
+      const ab = new ArrayBuffer(u8.byteLength);
+      new Uint8Array(ab).set(u8);
+      rawBuffer = ab;
+    } else {
+      const obj = await env.R2_BUCKET.get(input.media.key);
+      if (!obj) throw new Error(`R2 object missing: ${input.media.key}`);
+      rawBuffer = await obj.arrayBuffer();
+    }
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    console.error('[sourcebot_core] extension media read failed', { companyId: company.id, kind, error: msg });
+    return { ok: false, status: 'storage_failed', error: msg };
+  }
+
+  // For person_photo we ask Gemini for a one-line description (best-effort).
+  let description = '';
+  if (kind === 'person_photo') {
+    try { description = await describePersonImage(rawBuffer, input.media.kind === 'bytes' ? input.media.mimeType : 'image/jpeg', env); }
+    catch (e) { console.error('[sourcebot_core] person description failed', e); }
+  }
+
+  // Resolve the per-supplier folder set (Cards/ subfolder).
+  const folders = await getSupplierFoldersById(company.id, env, company.show_name, { buyerId: company.buyer_id });
+  if (!folders) {
+    await sendReply(input.reply, `⚠️ Couldn't locate the supplier's folder. Try again later.`, env);
+    return { ok: false, status: 'upload_failed', error: 'no_folders' };
+  }
+
+  // Upload + DB update + sheet update.
+  let url: string;
+  try {
+    const tok = await getServiceAccountToken(env);
+    const fileLabel = kind === 'card_back' ? `${company.name}_back` : `${company.name}_person`;
+    url = await uploadCardImage(rawBuffer, fileLabel, '', folders.cards, tok);
+
+    if (kind === 'card_back') {
+      await env.DB.prepare(
+        `UPDATE sb_contacts SET card_back_url = ?
+          WHERE id = (SELECT id FROM sb_contacts WHERE company_id = ? ORDER BY created_at DESC LIMIT 1)`
+      ).bind(url, company.id).run();
+      if (company.sheet_row) {
+        const sheet = await env.DB.prepare(
+          `SELECT sheet_id FROM sb_buyer_shows WHERE buyer_id = ? AND show_name = ?`
+        ).bind(company.buyer_id, company.show_name).first<{ sheet_id: string }>();
+        if (sheet?.sheet_id) await updateSupplierCardBack(sheet.sheet_id, company.sheet_row, url, tok);
+      }
+    } else {
+      await env.DB.prepare(
+        `UPDATE sb_contacts SET person_photo_url = ?, person_description = ?
+          WHERE id = (SELECT id FROM sb_contacts WHERE company_id = ? ORDER BY created_at DESC LIMIT 1)`
+      ).bind(url, description || null, company.id).run();
+      if (company.sheet_row) {
+        const sheet = await env.DB.prepare(
+          `SELECT sheet_id FROM sb_buyer_shows WHERE buyer_id = ? AND show_name = ?`
+        ).bind(company.buyer_id, company.show_name).first<{ sheet_id: string }>();
+        if (sheet?.sheet_id) await updateSupplierPerson(sheet.sheet_id, company.sheet_row, { personPhotoUrl: url, personDescription: description }, tok);
+      }
+    }
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    console.error('[sourcebot_core] extension upload failed', { companyId: company.id, kind, error: msg });
+    await sendReply(input.reply, `⚠️ Couldn't save that photo. Try again.`, env);
+    return { ok: false, status: 'upload_failed', error: msg };
+  }
+
+  const replyText = kind === 'card_back'
+    ? `✅ Card back saved for *${company.name}*.`
+    : `✅ Photo saved${description ? ` — ${description}` : ''}.`;
+  await sendReply(input.reply, replyText, env);
+
+  return { ok: true, status: 'success', url, description: kind === 'person_photo' ? description : undefined };
+}
+
+// Gemini one-liner — same prompt as sourcebot.ts:2218.
+async function describePersonImage(buffer: ArrayBuffer, mimeType: string, env: Env): Promise<string> {
+  const base64 = arrayBufferToBase64(buffer);
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${env.GEMINI_API_KEY}`;
+  const r = await fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      contents: [{ parts: [
+        { text: 'Describe this image in ONE short line. It might be the supplier rep, a booth, signage, a product display, or a setup shot. Examples: "Man in blue suit holding a brochure" / "Booth #B12 with red banner reading ACME Lighting" / "Showroom wall of LED panels". Return only the description, no preface.' },
+        { inline_data: { mime_type: mimeType, data: base64 } },
+      ] }],
+    }),
+  });
+  const d = await r.json() as { candidates?: Array<{ content?: { parts?: Array<{ text?: string }> } }> };
+  return (d.candidates?.[0]?.content?.parts?.[0]?.text ?? '').trim().split('\n')[0] ?? '';
+}
+
 // ── Resolve buyer helper (for callers that only have user_id) ────────────────
 
 export async function resolveBuyerForUser(userId: string, env: Env): Promise<{ buyerId: string } | null> {
@@ -409,6 +551,34 @@ async function getOrCreateSupplierFolders(
   ).bind(parent, cards, products, companyId).run();
 
   return { parent, cards, products };
+}
+
+// getSupplierFoldersById — copy of sourcebot.ts:2776. Resolves the per-supplier
+// folder hierarchy (creates it lazily if the buyer's show folder exists but
+// the supplier hierarchy hasn't been populated yet — e.g. card was captured
+// pre-folder-rollout).
+async function getSupplierFoldersById(
+  companyId: string,
+  env:       Env,
+  showName:  string,
+  buyer:     { buyerId: string },
+  prefetchedToken?: string,
+): Promise<SupplierFolders | undefined> {
+  const c = await env.DB.prepare(
+    `SELECT name, cards_folder_id, cards_subfolder_id, products_subfolder_id FROM sb_companies WHERE id = ?`
+  ).bind(companyId).first<{ name: string; cards_folder_id: string | null; cards_subfolder_id: string | null; products_subfolder_id: string | null }>();
+  if (!c?.name) return undefined;
+
+  if (c.cards_folder_id && c.cards_subfolder_id && c.products_subfolder_id) {
+    return { parent: c.cards_folder_id, cards: c.cards_subfolder_id, products: c.products_subfolder_id };
+  }
+
+  const pass = await env.DB.prepare(
+    `SELECT drive_folder_id FROM sb_buyer_shows WHERE buyer_id = ? AND show_name = ?`
+  ).bind(buyer.buyerId, showName).first<{ drive_folder_id: string | null }>();
+  if (!pass?.drive_folder_id) return undefined;
+
+  return getOrCreateSupplierFolders(companyId, c.name, pass.drive_folder_id, env, prefetchedToken);
 }
 
 // uploadCardImage — copy of sourcebot.ts:3021.
