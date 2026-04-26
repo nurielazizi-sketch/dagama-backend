@@ -12,7 +12,11 @@ import { handleGoogleAuthStart, handleGoogleAuthCallback } from './google_auth';
 import { handleSourceBotWebhook, handleSourceBotSetupWebhook, handleSourceBotShowPassCron, handleAdminReset } from './sourcebot';
 import { handleDemoBotWebhook, handleDemoBotSetupWebhook, handleDemoBotDailySummaryCron } from './demobot';
 import { handleWhatsAppWebhook, isWhatsAppEnabled } from './whatsapp';
-import { handleWebUpload, handleListLeads, handleGetLead, handleListSuppliers, handleGetMyRole, handleSupplierExtension, handleSupplierVoice, handleSupplierProduct, handleUpdateProduct } from './web_capture';
+import {
+  handleWebUpload, handleListLeads, handleGetLead, handleListSuppliers, handleGetMyRole,
+  handleSupplierExtension, handleSupplierVoice, handleSupplierProduct, handleUpdateProduct,
+  handleEmailDraft, handleEmailSend, handleBlast,
+} from './web_capture';
 import { processFunnelQueue } from './funnel';
 import { processDemobotQueue } from './db_emails';
 import { handleListShows, handleCreateShow, handleUpdateShow, handleDeleteShow, handleIssueFreelancerToken, handleMarkConversion } from './demobot_admin';
@@ -126,6 +130,15 @@ export default {
       const m = path.match(/^\/api\/products\/([a-f0-9-]+)$/i);
       if (m) return addCors(await handleUpdateProduct(request, env, m[1]));
     }
+    {
+      const m = path.match(/^\/api\/suppliers\/([a-f0-9-]+)\/email-draft$/i);
+      if (m) return addCors(await handleEmailDraft(request, env, m[1]));
+    }
+    {
+      const m = path.match(/^\/api\/suppliers\/([a-f0-9-]+)\/email$/i);
+      if (m) return addCors(await handleEmailSend(request, env, m[1]));
+    }
+    if (path === '/api/blast') return addCors(await handleBlast(request, env));
 
     // ── DemoBot (freelancer-facing @DaGamaShow) ───────────────────────────────
     if (path === '/api/demobot/webhook')                  return handleDemoBotWebhook(request, env);
@@ -839,7 +852,11 @@ const DASHBOARD_PAGE = `<!DOCTYPE html>
       <div id="capture-result" style="margin-top:1rem;display:none;"></div>
     </div>
 
-    <div class="section-title" style="margin-top:2rem;" data-list-title>Recent leads <span class="badge badge-green" id="leads-count">0</span></div>
+    <div class="section-title" style="margin-top:2rem;display:flex;align-items:center;gap:0.6rem;flex-wrap:wrap;">
+      <span data-list-title>Recent leads</span>
+      <span class="badge badge-green" id="leads-count">0</span>
+      <button id="blast-btn" type="button" style="display:none;margin-left:auto;background:rgba(212,175,55,0.08);border:1px solid rgba(212,175,55,0.2);color:#D4AF37;border-radius:8px;padding:0.35rem 0.9rem;font-size:0.8rem;font-family:inherit;cursor:pointer;" onclick="runBlast()">📨 Blast follow-ups</button>
+    </div>
     <div id="leads-box" class="empty-state">
       <div class="icon">📇</div>
       <p>No leads yet.<br>Use the camera button above, the Telegram bot, or WhatsApp once approved.</p>
@@ -1003,6 +1020,8 @@ const DASHBOARD_PAGE = `<!DOCTYPE html>
           // SourceBot doesn't pick a per-show sheet from the web — show is
           // implicit from the buyer's active pass. Hide the show input.
           if (captureShow) captureShow.style.display = 'none';
+          const blastBtn = document.getElementById('blast-btn');
+          if (blastBtn) blastBtn.style.display = 'inline-block';
         }
         loadList();
       })
@@ -1144,9 +1163,98 @@ const DASHBOARD_PAGE = `<!DOCTYPE html>
           '<label style="' + btnStyle + '">👤 Person photo<input type="file" accept="image/*" capture="environment" style="display:none;" onchange="uploadExtension(\'' + s.id + '\', \'person-photo\', this)" /></label>' +
           '<button type="button" style="' + btnStyle + '" id="voice-btn-' + s.id + '" onclick="toggleVoice(\'' + s.id + '\')">💬 Voice note</button>' +
           '<label style="' + btnStyle + '">📦 Add product<input type="file" accept="image/*" capture="environment" style="display:none;" onchange="uploadProduct(\'' + s.id + '\', this)" /></label>' +
+          (s.email ? '<button type="button" style="' + btnStyle + '" onclick="openEmailDraft(\'' + s.id + '\')">📧 Follow up</button>' : '') +
         '</div>' +
         '<div id="product-form-' + s.id + '" style="display:none;margin-top:0.65rem;background:rgba(15,20,25,0.5);border:1px solid rgba(212,175,55,0.15);border-radius:8px;padding:0.75rem;"></div>' +
+        '<div id="email-form-' + s.id + '"   style="display:none;margin-top:0.65rem;background:rgba(15,20,25,0.5);border:1px solid rgba(212,175,55,0.15);border-radius:8px;padding:0.75rem;"></div>' +
       '</div>';
+    }
+
+    async function openEmailDraft(companyId) {
+      const wrap = document.getElementById('email-form-' + companyId);
+      if (!wrap) return;
+      wrap.style.display = 'block';
+      wrap.innerHTML = '<div style="color:#94A3B8;font-size:0.85rem;">✍️ Drafting email…</div>';
+      try {
+        const res = await fetch('/api/suppliers/' + companyId + '/email-draft', {
+          headers: { Authorization: 'Bearer ' + token },
+        });
+        const data = await res.json();
+        if (data.status === 'gmail_not_connected' && data.authUrl) {
+          wrap.innerHTML =
+            '<div style="font-size:0.85rem;color:#94A3B8;margin-bottom:0.5rem;">Connect your Gmail to send follow-ups:</div>' +
+            '<a href="' + data.authUrl + '" target="_blank" style="display:inline-block;background:linear-gradient(135deg,#D4AF37,#E8C547);color:#0F1419;padding:0.5rem 0.9rem;border-radius:8px;font-size:0.85rem;font-weight:600;text-decoration:none;">🔗 Connect Gmail</a>';
+          return;
+        }
+        if (!res.ok || !data.draft) {
+          wrap.innerHTML = '<div style="color:#f87171;font-size:0.85rem;">⚠️ ' + (data.error || data.status || 'Couldn\\'t draft.') + '</div>';
+          return;
+        }
+        renderEmailForm(companyId, data.draft);
+      } catch (e) {
+        wrap.innerHTML = '<div style="color:#f87171;font-size:0.85rem;">⚠️ Network error.</div>';
+      }
+    }
+
+    function renderEmailForm(companyId, draft) {
+      const wrap = document.getElementById('email-form-' + companyId);
+      if (!wrap) return;
+      const inp = 'padding:0.5rem;background:rgba(51,65,85,0.5);border:1px solid rgba(212,175,55,0.15);border-radius:6px;color:#F5F5F5;font-family:inherit;font-size:0.85rem;width:100%;box-sizing:border-box;';
+      wrap.innerHTML =
+        '<div style="font-size:0.85rem;color:#94A3B8;margin-bottom:0.5rem;">📧 To: ' + draft.recipient + '</div>' +
+        '<input id="ef-' + companyId + '-subject" value="' + (draft.subject || '').replace(/"/g, '&quot;') + '" style="' + inp + 'margin-bottom:0.4rem;" />' +
+        '<textarea id="ef-' + companyId + '-body" rows="10" style="' + inp + 'resize:vertical;font-family:Outfit,sans-serif;">' + (draft.body || '') + '</textarea>' +
+        '<input type="hidden" id="ef-' + companyId + '-html" value="' + (draft.html || '').replace(/"/g, '&quot;') + '" />' +
+        '<div style="margin-top:0.5rem;display:flex;gap:0.5rem;">' +
+          '<button type="button" style="background:linear-gradient(135deg,#D4AF37,#E8C547);color:#0F1419;border:none;border-radius:8px;padding:0.45rem 1rem;font-size:0.85rem;font-weight:600;cursor:pointer;font-family:inherit;" onclick="sendEmail(\'' + companyId + '\', \'' + draft.recipient.replace(/'/g, "\\'") + '\')">Send</button>' +
+          '<button type="button" style="background:transparent;border:1px solid rgba(248,113,113,0.3);color:#f87171;border-radius:8px;padding:0.45rem 1rem;font-size:0.85rem;cursor:pointer;font-family:inherit;" onclick="document.getElementById(\'email-form-' + companyId + '\').style.display=\'none\'">Cancel</button>' +
+        '</div>';
+    }
+
+    async function sendEmail(companyId, recipient) {
+      const subject = document.getElementById('ef-' + companyId + '-subject').value.trim();
+      const body    = document.getElementById('ef-' + companyId + '-body').value.trim();
+      const html    = document.getElementById('ef-' + companyId + '-html').value;
+      if (!subject || !body) { captureStatus.style.display = 'block'; captureStatus.textContent = '⚠️ Subject and body are required.'; return; }
+      try {
+        const res = await fetch('/api/suppliers/' + companyId + '/email', {
+          method: 'POST',
+          headers: { Authorization: 'Bearer ' + token, 'Content-Type': 'application/json' },
+          body: JSON.stringify({ recipient, subject, body, html }),
+        });
+        const data = await res.json();
+        if (!res.ok) {
+          captureStatus.style.display = 'block';
+          captureStatus.textContent = '⚠️ ' + (data.error || 'Send failed.');
+          return;
+        }
+        const wrap = document.getElementById('email-form-' + companyId);
+        if (wrap) wrap.style.display = 'none';
+        captureStatus.style.display = 'block';
+        captureStatus.textContent = '✅ Sent to ' + recipient + '.';
+        loadList();
+      } catch {
+        captureStatus.style.display = 'block';
+        captureStatus.textContent = '⚠️ Network error.';
+      }
+    }
+
+    async function runBlast() {
+      if (!confirm('Send a follow-up to every supplier with a contact email?')) return;
+      captureStatus.style.display = 'block';
+      captureStatus.textContent = '📨 Running blast…';
+      try {
+        const res = await fetch('/api/blast', {
+          method: 'POST',
+          headers: { Authorization: 'Bearer ' + token },
+        });
+        const data = await res.json();
+        if (!res.ok) { captureStatus.textContent = '⚠️ ' + (data.error || 'Blast failed.'); return; }
+        captureStatus.textContent = '✅ Blast: ' + data.sent + ' sent · ' + data.failed + ' failed · ' + data.skipped + ' skipped (of ' + data.total + ').';
+        loadList();
+      } catch {
+        captureStatus.textContent = '⚠️ Network error.';
+      }
     }
 
     async function uploadProduct(companyId, inputEl) {

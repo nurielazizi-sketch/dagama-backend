@@ -12,7 +12,9 @@ import {
   updateProductRow,
   ensureProductsTab,
   updateSupplierProducts,
+  updateSupplierEmailStatus,
 } from './sb_sheets';
+import { sendGmailEmailForBuyer, getGmailTokenForBuyer, getValidAccessTokenForBuyer } from './gmail';
 import { scheduleFunnelOnFirstScan, trackEvent } from './funnel';
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -883,6 +885,313 @@ async function classifyProductImage(base64: string, mimeType: string, env: Env):
   const parsed = JSON.parse(raw.replace(/```json|```/g, '').trim()) as { type?: string; name?: string; description?: string };
   const type = parsed.type === 'business_card' ? 'business_card' : 'product';
   return { type, name: parsed.name ?? '', description: parsed.description ?? '' };
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Phase 5: Email follow-ups + blast.
+//   - draftSupplierEmail(): pull supplier + contact + products + voice notes,
+//     ask Gemini for a structured draft, render plain + HTML bodies.
+//   - sendSupplierEmail():  send via gmail.ts (buyer-keyed), log to
+//     sb_emails_sent, update sheet columns V/W/X/Y.
+//   - blastSuppliers():     for every supplier in the active show with an
+//     email and no follow-up sent yet, draft + send. Returns counts.
+// All gated on the buyer having Gmail connected (Telegram OAuth or web OAuth).
+// ─────────────────────────────────────────────────────────────────────────────
+
+export interface EmailDraft {
+  recipient:   string;
+  contactName: string;
+  subject:     string;
+  body:        string;
+  html:        string;
+  companyId:   string;
+  companyName: string;
+  showName:    string;
+}
+
+export interface EmailDraftResult {
+  ok:        boolean;
+  status:    'success' | 'no_supplier' | 'no_contact_email' | 'gmail_not_connected' | 'draft_failed';
+  draft?:    EmailDraft;
+  authUrl?:  string;
+  error?:    string;
+}
+
+export async function draftSupplierEmail(companyId: string, buyerId: string, env: Env): Promise<EmailDraftResult> {
+  const company = await env.DB.prepare(
+    `SELECT id, name, show_name, sheet_row, buyer_id FROM sb_companies WHERE id = ? AND buyer_id = ?`
+  ).bind(companyId, buyerId).first<{ id: string; name: string; show_name: string; sheet_row: number | null; buyer_id: string }>();
+  if (!company) return { ok: false, status: 'no_supplier' };
+
+  const contact = await env.DB.prepare(
+    `SELECT name, title, email FROM sb_contacts
+       WHERE company_id = ? AND email IS NOT NULL AND email != ''
+       ORDER BY created_at LIMIT 1`
+  ).bind(company.id).first<{ name: string | null; title: string | null; email: string }>();
+  if (!contact) return { ok: false, status: 'no_contact_email' };
+
+  const gmail = await getGmailTokenForBuyer(buyerId, env);
+  if (!gmail) {
+    const { buildGmailAuthUrlForBuyer } = await import('./gmail');
+    return { ok: false, status: 'gmail_not_connected', authUrl: buildGmailAuthUrlForBuyer(buyerId, env) };
+  }
+
+  const products = await env.DB.prepare(
+    `SELECT name, price, moq, lead_time FROM sb_products WHERE company_id = ? ORDER BY created_at LIMIT 6`
+  ).bind(company.id).all<{ name: string | null; price: string | null; moq: string | null; lead_time: string | null }>();
+  const voiceNotes = await env.DB.prepare(
+    `SELECT transcript FROM sb_voice_notes WHERE company_id = ? ORDER BY created_at LIMIT 3`
+  ).bind(company.id).all<{ transcript: string }>();
+
+  let draftRaw: { subject: string; body: string; html: string };
+  try {
+    draftRaw = await draftFollowUpEmail({
+      buyerName:    '',
+      showName:     company.show_name,
+      company:      company.name,
+      contactName:  contact.name ?? '',
+      contactTitle: contact.title ?? '',
+      products:     products.results.map(p =>
+        `${p.name ?? ''}${p.price ? ` (${p.price})` : ''}${p.moq ? ` MOQ ${p.moq}` : ''}${p.lead_time ? ` LT ${p.lead_time}` : ''}`),
+      voiceNotes:   voiceNotes.results.map(v => v.transcript.slice(0, 240)),
+    }, env);
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    console.error('[sourcebot_core] email draft failed', { companyId, error: msg });
+    return { ok: false, status: 'draft_failed', error: msg };
+  }
+  if (!draftRaw.subject || !draftRaw.body) return { ok: false, status: 'draft_failed', error: 'empty_draft' };
+
+  return {
+    ok:     true,
+    status: 'success',
+    draft:  {
+      recipient:   contact.email,
+      contactName: contact.name ?? contact.email,
+      subject:     draftRaw.subject,
+      body:        draftRaw.body,
+      html:        draftRaw.html,
+      companyId:   company.id,
+      companyName: company.name,
+      showName:    company.show_name,
+    },
+  };
+}
+
+export interface EmailSendResult {
+  ok:         boolean;
+  status:     'success' | 'no_supplier' | 'gmail_not_connected' | 'send_failed';
+  messageId?: string;
+  sentAt?:    string;
+  error?:     string;
+}
+
+export async function sendSupplierEmail(
+  companyId: string,
+  buyerId:   string,
+  recipient: string,
+  subject:   string,
+  body:      string,
+  html:      string | undefined,
+  env:       Env,
+): Promise<EmailSendResult> {
+  const company = await env.DB.prepare(
+    `SELECT id, name, show_name, sheet_row, buyer_id FROM sb_companies WHERE id = ? AND buyer_id = ?`
+  ).bind(companyId, buyerId).first<{ id: string; name: string; show_name: string; sheet_row: number | null; buyer_id: string }>();
+  if (!company) return { ok: false, status: 'no_supplier' };
+
+  try {
+    const result = await sendGmailEmailForBuyer(buyerId, recipient, `Subject: ${subject}\n\n${body}`, env, html);
+
+    await env.DB.prepare(
+      `INSERT INTO sb_emails_sent
+         (company_id, buyer_id, show_name, recipient_email, subject, body, status, sent_at)
+       VALUES (?, ?, ?, ?, ?, ?, 'sent', ?)`
+    ).bind(company.id, buyerId, company.show_name, recipient, subject, body, result.sentAt).run();
+
+    if (company.sheet_row) {
+      try {
+        const sheet = await env.DB.prepare(
+          `SELECT sheet_id FROM sb_buyer_shows WHERE buyer_id = ? AND show_name = ?`
+        ).bind(buyerId, company.show_name).first<{ sheet_id: string }>();
+        if (sheet?.sheet_id) {
+          const { accessToken } = await getValidAccessTokenForBuyer(buyerId, env);
+          await updateSupplierEmailStatus(sheet.sheet_id, company.sheet_row, {
+            sent: 'Yes', sentAt: result.sentAt, subject, status: 'Sent',
+          }, accessToken);
+        }
+      } catch (e) { console.error('[sourcebot_core] sheet email status update failed', e); }
+    }
+
+    await trackEvent(env, {
+      buyerId,
+      eventName:  'email_sent',
+      properties: { company: company.name, show: company.show_name, recipient },
+    });
+
+    return { ok: true, status: 'success', messageId: result.messageId, sentAt: result.sentAt };
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    console.error('[sourcebot_core] email send failed', { companyId, error: msg });
+
+    if (msg.startsWith('GMAIL_NOT_CONNECTED')) {
+      return { ok: false, status: 'gmail_not_connected', error: msg };
+    }
+    await env.DB.prepare(
+      `INSERT INTO sb_emails_sent
+         (company_id, buyer_id, show_name, recipient_email, subject, body, status, error_msg)
+       VALUES (?, ?, ?, ?, ?, ?, 'failed', ?)`
+    ).bind(company.id, buyerId, company.show_name, recipient, subject, body, msg.slice(0, 500)).run();
+    return { ok: false, status: 'send_failed', error: msg };
+  }
+}
+
+export interface BlastResult {
+  ok:        boolean;
+  total:     number;
+  sent:      number;
+  failed:    number;
+  skipped:   number;          // suppliers without email or already-sent
+  details:   Array<{ companyId: string; companyName: string; status: 'sent' | 'failed' | 'skipped'; error?: string }>;
+}
+
+// Run a blast across the buyer's active show. For every supplier with a contact
+// email and no follow-up sent yet, draft + send.
+export async function blastSuppliers(buyerId: string, env: Env): Promise<BlastResult> {
+  const pass = await env.DB.prepare(
+    `SELECT show_name FROM sb_buyer_shows
+       WHERE buyer_id = ? AND status IN ('active','grace')
+       ORDER BY created_at DESC LIMIT 1`
+  ).bind(buyerId).first<{ show_name: string }>();
+  if (!pass) return { ok: false, total: 0, sent: 0, failed: 0, skipped: 0, details: [] };
+
+  const suppliers = await env.DB.prepare(
+    `SELECT c.id, c.name FROM sb_companies c
+       WHERE c.buyer_id = ? AND c.show_name = ?
+         AND EXISTS (SELECT 1 FROM sb_contacts ct WHERE ct.company_id = c.id AND ct.email IS NOT NULL AND ct.email != '')
+         AND NOT EXISTS (SELECT 1 FROM sb_emails_sent e WHERE e.company_id = c.id AND e.status = 'sent')
+       ORDER BY c.created_at`
+  ).bind(buyerId, pass.show_name).all<{ id: string; name: string }>();
+
+  const details: BlastResult['details'] = [];
+  let sent = 0, failed = 0, skipped = 0;
+
+  for (const s of suppliers.results) {
+    try {
+      const draft = await draftSupplierEmail(s.id, buyerId, env);
+      if (!draft.ok || !draft.draft) {
+        if (draft.status === 'gmail_not_connected') {
+          // Whole blast can't proceed without Gmail.
+          return { ok: false, total: suppliers.results.length, sent, failed, skipped, details };
+        }
+        skipped++;
+        details.push({ companyId: s.id, companyName: s.name, status: 'skipped', error: draft.status });
+        continue;
+      }
+      const out = await sendSupplierEmail(s.id, buyerId, draft.draft.recipient, draft.draft.subject, draft.draft.body, draft.draft.html, env);
+      if (out.ok) { sent++; details.push({ companyId: s.id, companyName: s.name, status: 'sent' }); }
+      else        { failed++; details.push({ companyId: s.id, companyName: s.name, status: 'failed', error: out.error }); }
+    } catch (e) {
+      failed++;
+      details.push({ companyId: s.id, companyName: s.name, status: 'failed', error: e instanceof Error ? e.message : String(e) });
+    }
+  }
+
+  return { ok: true, total: suppliers.results.length, sent, failed, skipped, details };
+}
+
+// Gemini email drafter — copy of sourcebot.ts:921 (draftFollowUpEmail).
+interface DraftContext {
+  buyerName:    string;
+  showName:     string;
+  company:      string;
+  contactName:  string;
+  contactTitle: string;
+  products:     string[];
+  voiceNotes:   string[];
+}
+
+async function draftFollowUpEmail(ctx: DraftContext, env: Env): Promise<{ subject: string; body: string; html: string }> {
+  const prompt =
+    `You are drafting a professional follow-up email from a B2B buyer to a supplier they met at a trade show. ` +
+    `It must read like it was written by a person — warm but businesslike, no marketing fluff, no ALL CAPS, no exclamation points. ` +
+    `Context:\n` +
+    `- Show: ${ctx.showName}\n` +
+    `- Supplier: ${ctx.company}\n` +
+    `- Contact: ${ctx.contactName}${ctx.contactTitle ? ` (${ctx.contactTitle})` : ''}\n` +
+    (ctx.products.length    ? `- Products discussed: ${ctx.products.join('; ')}\n`             : '') +
+    (ctx.voiceNotes.length  ? `- Buyer's notes: ${ctx.voiceNotes.join(' | ')}\n`               : '') +
+    `\nReturn ONLY a JSON object with these exact fields:\n` +
+    `- subject: concise, 60 chars max. No emojis. Start with "Following up — {Show}" or "Re: {product}" style.\n` +
+    `- greeting: one short line, e.g. "Hi {firstName},". Use the contact's first name if available; "Hi there," otherwise. End with a comma.\n` +
+    `- intro: ONE paragraph, 1-2 sentences, referencing the show by name and where you met (booth, conversation).\n` +
+    `- discussed_intro: a single short sentence introducing the product list, e.g. "I'm especially interested in:" — empty string if no products.\n` +
+    `- products: array of strings, one per product discussed (use the names from "Products discussed" — keep them as-is). Empty array if no products.\n` +
+    `- ask: ONE paragraph, 1-2 sentences asking a clear next step (samples, pricing sheet, MOQ confirmation, lead times). Don't fabricate prices.\n` +
+    `- closing: a polite sign-off line ending with a comma, e.g. "Best regards,".\n` +
+    `- signature_name: empty string — the buyer's signature is appended downstream.\n` +
+    `Don't include greetings/closings inside intro/ask. Don't repeat the same idea twice.`;
+
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${env.GEMINI_API_KEY}`;
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      contents: [{ parts: [{ text: prompt }] }],
+      generationConfig: { responseMimeType: 'application/json' },
+    }),
+  });
+  const data = await res.json() as { candidates?: Array<{ content?: { parts?: Array<{ text?: string }> } }> };
+  if (!data.candidates?.length) return { subject: '', body: '', html: '' };
+  const raw = data.candidates[0]?.content?.parts?.[0]?.text ?? '{}';
+  const parsed = JSON.parse(raw.replace(/```json|```/g, '').trim()) as {
+    subject?: string; greeting?: string; intro?: string;
+    discussed_intro?: string; products?: string[]; ask?: string; closing?: string;
+  };
+
+  const subject  = parsed.subject  ?? '';
+  const greeting = parsed.greeting ?? 'Hi there,';
+  const intro    = parsed.intro    ?? '';
+  const discussedIntro = parsed.discussed_intro ?? '';
+  const products = Array.isArray(parsed.products) ? parsed.products.filter(Boolean) : [];
+  const ask      = parsed.ask      ?? '';
+  const closing  = parsed.closing  ?? 'Best regards,';
+
+  const body = renderEmailPlain({ greeting, intro, discussedIntro, products, ask, closing });
+  const html = renderEmailHtml({ greeting, intro, discussedIntro, products, ask, closing });
+  return { subject, body, html };
+}
+
+interface EmailParts { greeting: string; intro: string; discussedIntro: string; products: string[]; ask: string; closing: string }
+
+function renderEmailPlain(p: EmailParts): string {
+  const productLines = p.products.length
+    ? '\n' + p.discussedIntro + '\n' + p.products.map(name => `  - ${name}`).join('\n') + '\n'
+    : '';
+  return [p.greeting, '', p.intro, productLines, p.ask, '', p.closing]
+    .filter(s => s !== undefined)
+    .join('\n')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+}
+
+function renderEmailHtml(p: EmailParts): string {
+  const esc = (s: string) => s
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+  const productHtml = p.products.length
+    ? `<p style="margin:16px 0 6px;">${esc(p.discussedIntro)}</p>` +
+      `<ul style="margin:0 0 16px;padding-left:22px;">` +
+      p.products.map(name => `<li style="margin:4px 0;">${esc(name)}</li>`).join('') +
+      `</ul>`
+    : '';
+  return `<!DOCTYPE html><html><body style="font-family:-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;font-size:15px;line-height:1.55;color:#222;max-width:560px;">
+<p style="margin:0 0 16px;">${esc(p.greeting)}</p>
+<p style="margin:0 0 16px;">${esc(p.intro)}</p>
+${productHtml}
+<p style="margin:0 0 16px;">${esc(p.ask)}</p>
+<p style="margin:24px 0 0;">${esc(p.closing)}</p>
+</body></html>`;
 }
 
 // ── Resolve buyer helper (for callers that only have user_id) ────────────────

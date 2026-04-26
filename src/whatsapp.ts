@@ -11,6 +11,10 @@ import {
   attachProductFromPhoto,
   updateProductDetails,
   parseProductDetailsText,
+  draftSupplierEmail,
+  sendSupplierEmail,
+  blastSuppliers,
+  type EmailDraft,
 } from './sourcebot_core';
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -252,6 +256,7 @@ interface SbWaSession {
   step?:            'awaiting_card_back' | 'awaiting_person_photo' | 'awaiting_voice_note';
   activeCompanyId?: string;
   activeProductId?: string;     // last product captured — used for free-text detail replies
+  activeEmailDraft?: EmailDraft & { draftId: string };
 }
 
 function parseSbSession(raw: string | null | undefined): SbWaSession {
@@ -357,6 +362,91 @@ async function routeToSourceBot(msg: WaInboundMessage, mapping: WaMapping, env: 
     if (id === 'sb_done') {
       await saveSbSession(mapping.phone, {}, env);
       await sendWhatsAppText(mapping.phone, `✅ Done. Send another card photo to capture the next supplier.`, env);
+      return;
+    }
+    if (id.startsWith('sb_email_send:')) {
+      const draftId = id.slice('sb_email_send:'.length);
+      const draft = session.activeEmailDraft;
+      if (!draft || draft.draftId !== draftId) {
+        await sendWhatsAppText(mapping.phone, `That draft is no longer available. Send /email <supplier> again.`, env);
+        return;
+      }
+      await saveSbSession(mapping.phone, { ...session, activeEmailDraft: undefined }, env);
+      const out = await sendSupplierEmail(draft.companyId, mapping.buyer_id, draft.recipient, draft.subject, draft.body, draft.html, env);
+      if (out.ok) await sendWhatsAppText(mapping.phone, `✅ Email sent to ${draft.recipient}.`, env);
+      else        await sendWhatsAppText(mapping.phone, `❌ Send failed: ${(out.error ?? out.status).slice(0, 200)}`, env);
+      return;
+    }
+    if (id === 'sb_email_discard') {
+      await saveSbSession(mapping.phone, { ...session, activeEmailDraft: undefined }, env);
+      await sendWhatsAppText(mapping.phone, `🗑 Draft discarded.`, env);
+      return;
+    }
+  }
+
+  // 1b. Text commands: /email <name>, /blast.
+  if (msg.type === 'text') {
+    const text = msg.text?.body?.trim() ?? '';
+    if (text.toLowerCase().startsWith('/email')) {
+      const query = text.slice('/email'.length).trim();
+      if (!query) {
+        await sendWhatsAppText(mapping.phone, `Usage: */email <supplier name>* — drafts a follow-up to that supplier.`, env);
+        return;
+      }
+      // Fuzzy match the supplier name within the buyer's data.
+      const company = await env.DB.prepare(
+        `SELECT id, name FROM sb_companies
+           WHERE buyer_id = ? AND lower(name) LIKE lower(?)
+           ORDER BY created_at DESC LIMIT 1`
+      ).bind(mapping.buyer_id, `%${query}%`).first<{ id: string; name: string }>();
+      if (!company) {
+        await sendWhatsAppText(mapping.phone, `🔍 No supplier matching *${query}*.`, env);
+        return;
+      }
+
+      const result = await draftSupplierEmail(company.id, mapping.buyer_id, env);
+      if (!result.ok || !result.draft) {
+        if (result.status === 'gmail_not_connected' && result.authUrl) {
+          await sendWhatsAppText(mapping.phone, `📧 Connect your Gmail first: ${result.authUrl}`, env);
+        } else if (result.status === 'no_contact_email') {
+          await sendWhatsAppText(mapping.phone, `❌ *${company.name}* has no contact email on file.`, env);
+        } else {
+          await sendWhatsAppText(mapping.phone, `❌ Couldn't draft the email (${result.status}). Try again later.`, env);
+        }
+        return;
+      }
+
+      const draftId = crypto.randomUUID();
+      await saveSbSession(mapping.phone, { ...session, activeEmailDraft: { ...result.draft, draftId } }, env);
+      const preview =
+        `📧 *Draft for ${result.draft.recipient}*\n\n` +
+        `*Subject:* ${result.draft.subject}\n\n` +
+        result.draft.body.slice(0, 900) + (result.draft.body.length > 900 ? '…' : '');
+      await sendWhatsAppText(mapping.phone, preview, env);
+      await sendWhatsAppButtons(
+        mapping.phone,
+        `Send this draft?`,
+        [
+          { id: `sb_email_send:${draftId}`, title: '✅ Send'    },
+          { id: 'sb_email_discard',          title: '🗑 Discard' },
+        ],
+        env,
+      );
+      return;
+    }
+
+    if (text.toLowerCase() === '/blast') {
+      await sendWhatsAppText(mapping.phone, `📨 Blasting follow-ups to suppliers with email…`, env);
+      const result = await blastSuppliers(mapping.buyer_id, env);
+      if (!result.ok && result.total === 0) {
+        await sendWhatsAppText(mapping.phone, `No suppliers to blast (or Gmail not connected).`, env);
+        return;
+      }
+      await sendWhatsAppText(
+        mapping.phone,
+        `Blast complete: ✅ ${result.sent} sent · ⚠️ ${result.failed} failed · ↪️ ${result.skipped} skipped (of ${result.total}).`,
+        env,
+      );
       return;
     }
   }

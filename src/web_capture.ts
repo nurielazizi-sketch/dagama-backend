@@ -11,6 +11,9 @@ import {
   attachVoiceNote,
   attachProductFromPhoto,
   updateProductDetails,
+  draftSupplierEmail,
+  sendSupplierEmail,
+  blastSuppliers,
 } from './sourcebot_core';
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -483,6 +486,80 @@ export async function handleUpdateProduct(request: Request, env: Env, productId:
     return jsonResponse({ error: result.error ?? result.status, status: result.status }, result.status === 'no_product' ? 404 : 500);
   }
   return jsonResponse({ status: 'success' });
+}
+
+// ── GET /api/suppliers/:id/email-draft ───────────────────────────────────────
+// Draft a follow-up email to the supplier's primary contact. Returns
+// { authUrl } when Gmail isn't connected so the dashboard can prompt OAuth.
+
+export async function handleEmailDraft(request: Request, env: Env, companyId: string): Promise<Response> {
+  if (request.method !== 'GET') return new Response('Method not allowed', { status: 405 });
+
+  const auth = await requireAuth(request, env);
+  if (auth instanceof Response) return auth;
+
+  const buyer = await resolveBuyerForUser(auth.userId, env);
+  if (!buyer) return jsonResponse({ error: 'SourceBot account required' }, 403);
+
+  const result = await draftSupplierEmail(companyId, buyer.buyerId, env);
+  if (!result.ok) {
+    if (result.status === 'gmail_not_connected') {
+      return jsonResponse({ status: result.status, authUrl: result.authUrl }, 200);
+    }
+    const code = result.status === 'no_supplier'        ? 404
+               : result.status === 'no_contact_email'   ? 422
+               : 502;
+    return jsonResponse({ error: result.status, status: result.status }, code);
+  }
+  return jsonResponse({ status: 'success', draft: result.draft });
+}
+
+// ── POST /api/suppliers/:id/email ────────────────────────────────────────────
+// JSON body: { recipient, subject, body, html? }. Sends via the buyer's Gmail,
+// logs sb_emails_sent, updates the sheet's email columns.
+
+export async function handleEmailSend(request: Request, env: Env, companyId: string): Promise<Response> {
+  if (request.method !== 'POST') return new Response('Method not allowed', { status: 405 });
+
+  const auth = await requireAuth(request, env);
+  if (auth instanceof Response) return auth;
+
+  const buyer = await resolveBuyerForUser(auth.userId, env);
+  if (!buyer) return jsonResponse({ error: 'SourceBot account required' }, 403);
+
+  let body: { recipient?: string; subject?: string; body?: string; html?: string };
+  try { body = await request.json() as typeof body; }
+  catch { return jsonResponse({ error: 'Invalid JSON' }, 400); }
+
+  if (!body.recipient || !body.subject || !body.body) {
+    return jsonResponse({ error: 'recipient, subject, and body are required' }, 400);
+  }
+
+  const result = await sendSupplierEmail(companyId, buyer.buyerId, body.recipient, body.subject, body.body, body.html, env);
+  if (!result.ok) {
+    const code = result.status === 'no_supplier'        ? 404
+               : result.status === 'gmail_not_connected' ? 401
+               : 502;
+    return jsonResponse({ error: result.error ?? result.status, status: result.status }, code);
+  }
+  return jsonResponse({ status: 'success', messageId: result.messageId, sentAt: result.sentAt });
+}
+
+// ── POST /api/blast ──────────────────────────────────────────────────────────
+// Iterate every supplier in the active show with an email + no follow-up sent
+// yet, draft + send. Returns counts and per-supplier status for the dashboard.
+
+export async function handleBlast(request: Request, env: Env): Promise<Response> {
+  if (request.method !== 'POST') return new Response('Method not allowed', { status: 405 });
+
+  const auth = await requireAuth(request, env);
+  if (auth instanceof Response) return auth;
+
+  const buyer = await resolveBuyerForUser(auth.userId, env);
+  if (!buyer) return jsonResponse({ error: 'SourceBot account required' }, 403);
+
+  const result = await blastSuppliers(buyer.buyerId, env);
+  return jsonResponse(result);
 }
 
 // ── GET /api/me/role ─────────────────────────────────────────────────────────
