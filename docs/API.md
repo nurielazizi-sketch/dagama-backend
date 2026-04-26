@@ -40,6 +40,10 @@ Source: [src/index.ts](../src/index.ts).
 | POST | `/api/sourcebot/setup` | `handleSourceBotSetupWebhook` |
 | POST | `/api/sourcebot/admin/reset-buyer` | `handleAdminReset` |
 | POST | `/api/whatsapp/webhook` | `handleWhatsAppWebhook` |
+| ANY | `/api/upload` | `handleWebUpload` |
+| ANY | `/api/leads` | `handleListLeads` |
+| ANY | `/api/suppliers` | `handleListSuppliers` |
+| GET | `/api/me/role` | `handleGetMyRole` |
 | POST | `/api/demobot/webhook` | `handleDemoBotWebhook` |
 | POST | `/api/demobot/setup` | `handleDemoBotSetupWebhook` |
 | ANY | `/api/demobot/admin/freelancer-token` | `handleIssueFreelancerToken` |
