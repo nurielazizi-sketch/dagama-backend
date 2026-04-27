@@ -58,6 +58,13 @@ Source: [src/index.ts](../src/index.ts).
 | ANY | `/api/demobot/admin/conversion` | `handleMarkConversion` |
 | POST | `/api/expensebot/webhook` | `handleExpenseBotWebhook` |
 | POST | `/api/expensebot/setup` | `handleExpenseBotSetupWebhook` |
+| ANY | `/api/expensebot/link-token` | `handleExpenseBotLinkToken` |
+| GET | `/api/me/expensebot-status` | `handleExpenseBotStatus` |
+| ANY | `/api/admin/whoami` | `handleAdminWhoami` |
+| ANY | `/api/admin/inventory` | `handleAdminInventory` |
+| GET | `/api/admin/config` | `handleAdminConfigList` |
+| GET | `(regex) /^\/api\/admin\/probe\/([A-Za-z0-9_-]+` | `handleListShows` |
+| POST | `(regex) /^\/api\/admin\/probe\/([A-Za-z0-9_-]+` | `handleCreateShow` |
 | GET | `/api/shows-catalog` | `handleListShows` |
 | POST | `/api/shows-catalog` | `handleCreateShow` |
 | PUT | `(regex) /^\/api\/shows-catalog\/([a-z0-9-]+` | `handleUpdateShow` |
@@ -66,6 +73,7 @@ Source: [src/index.ts](../src/index.ts).
 | ANY | `/login` | `` |
 | ANY | `/register` | `` |
 | ANY | `/dashboard` | `` |
+| ANY | `/admin` | `` |
 | ANY | `/onboard-complete` | `` |
 <!-- AUTO:ROUTES:END -->
 

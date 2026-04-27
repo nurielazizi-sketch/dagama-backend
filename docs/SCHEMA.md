@@ -298,6 +298,9 @@ Same dedup as SourceBot but for DemoBot's webhook.
 | 026 | `026_expensebot_schema.sql` | ───────────────────────────────────────────────────────────────────────────── |
 | 027 | `027_expensebot_telegram.sql` | ───────────────────────────────────────────────────────────────────────────── |
 | 028 | `028_passes_and_web_chat.sql` | ───────────────────────────────────────────────────────────────────────────── |
+| 029 | `029_app_config.sql` | Runtime-tunable config + audit log for the /admin console. |
+| 030 | `030_channel_migrations.sql` | Pending channel migrations. |
+| 031 | `031_expensebot_link_tokens.sql` | One-shot deeplink tokens for "Connect ExpenseBot" from the dashboard. |
 <!-- AUTO:MIGRATIONS:END -->
 
 ### Hand-curated highlights
