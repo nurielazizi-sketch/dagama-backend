@@ -53,6 +53,22 @@ export interface Env {
   // Bearer token gating /api/demobot/admin/* + /api/shows-catalog mutations.
   // Optional in dev (admin endpoints reject if unset). Set in production via wrangler secret.
   DEMOBOT_ADMIN_TOKEN?: string;
+  // Comma-separated allowlist of admin user emails (gates /admin + /api/admin/*).
+  // Empty/unset = admin console disabled (every request 403s). Email match is
+  // case-insensitive. Reuses the existing user JWT for auth — no second login.
+  ADMIN_EMAILS?: string;
+  // ── Cloudflare Access (Zero Trust) belt-and-braces verification ───────────
+  // Both must be set together to activate Worker-side CF Access JWT verification.
+  // When set, /api/admin/* requires a valid Cf-Access-Jwt-Assertion header
+  // (CF Access at the edge adds it automatically). When unset, the admin gate
+  // falls back to the user-JWT path. See src/cloudflare_access.ts.
+  CF_ACCESS_TEAM_DOMAIN?: string;   // e.g. "dagama.cloudflareaccess.com"
+  CF_ACCESS_AUD_TAG?: string;       // unique application AUD (from CF Access app config)
+  // ── Cloudflare Turnstile (bot mitigation on /api/auth/register) ───────────
+  // Both must be set together. When unset, verification is skipped (dev fallback).
+  // Site key is public (embedded in /register HTML). Secret key is server-only.
+  TURNSTILE_SITE_KEY?: string;
+  TURNSTILE_SECRET_KEY?: string;
   R2_BUCKET: R2Bucket;
   CARD_QUEUE: Queue;
 }

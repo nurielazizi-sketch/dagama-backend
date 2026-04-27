@@ -31,3 +31,23 @@ WHATSAPP_APP_SECRET=
 WHATSAPP_ACCESS_TOKEN=
 WHATSAPP_PHONE_NUMBER_ID=
 WHATSAPP_BUSINESS_ACCOUNT_ID=
+
+# /admin console allowlist — comma-separated emails. Match is case-insensitive
+# and reuses the existing user JWT (no second login). Empty = /admin disabled.
+ADMIN_EMAILS=
+
+# Cloudflare Access (Zero Trust) — when both set, /admin requires Google login
+# + MFA via the CF Access edge gate AND the Worker re-verifies the
+# Cf-Access-Jwt-Assertion header. Leave empty in dev unless you have a tunnel
+# set up to /admin via Cloudflare Access.
+CF_ACCESS_TEAM_DOMAIN=
+CF_ACCESS_AUD_TAG=
+
+# Cloudflare Turnstile — bot mitigation on /register. When both unset,
+# /api/auth/register accepts requests without a captcha token (dev fallback).
+# For local testing without registering a real site, use Cloudflare's
+# always-passes test keys:
+#   TURNSTILE_SITE_KEY=1x00000000000000000000AA
+#   TURNSTILE_SECRET_KEY=1x0000000000000000000000000000000AA
+TURNSTILE_SITE_KEY=
+TURNSTILE_SECRET_KEY=

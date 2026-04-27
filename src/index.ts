@@ -12,6 +12,7 @@ import { handleGoogleAuthStart, handleGoogleAuthCallback } from './google_auth';
 import { handleSourceBotWebhook, handleSourceBotSetupWebhook, handleSourceBotShowPassCron, handleAdminReset } from './sourcebot';
 import { handleDemoBotWebhook, handleDemoBotSetupWebhook, handleDemoBotDailySummaryCron } from './demobot';
 import { handleExpenseBotWebhook, handleExpenseBotSetupWebhook } from './expensebot';
+import { handleExpenseBotLinkToken, handleExpenseBotStatus } from './expensebot_api';
 import { handleWhatsAppWebhook, isWhatsAppEnabled } from './whatsapp';
 import {
   handleWebUpload, handleListLeads, handleGetLead, handleListSuppliers, handleGetMyRole,
@@ -23,6 +24,7 @@ import { handleChatStart, handleChatMessage, handleChatPoll } from './web_chat';
 import { processFunnelQueue } from './funnel';
 import { processDemobotQueue } from './db_emails';
 import { handleListShows, handleCreateShow, handleUpdateShow, handleDeleteShow, handleIssueFreelancerToken, handleMarkConversion } from './demobot_admin';
+import { handleAdminPage, handleAdminInventory, handleAdminConfigList, handleAdminConfigUpdate, handleAdminProbe, handleAdminWhoami } from './admin';
 import type { Env } from './types';
 
 const CORS_HEADERS = {
@@ -163,6 +165,22 @@ export default {
     // ── ExpenseBot (bridge between Expedition + Basecamp) ─────────────────────
     if (path === '/api/expensebot/webhook')               return handleExpenseBotWebhook(request, env);
     if (path === '/api/expensebot/setup')                 return addCors(await handleExpenseBotSetupWebhook(request, env));
+    if (path === '/api/expensebot/link-token')            return addCors(await handleExpenseBotLinkToken(request, env));
+    if (path === '/api/me/expensebot-status')             return addCors(await handleExpenseBotStatus(request, env));
+
+    // ── Admin console (/admin + /api/admin/*) ─────────────────────────────────
+    // Gated by user JWT + ADMIN_EMAILS allowlist. See src/admin.ts.
+    if (path === '/api/admin/whoami')    return addCors(await handleAdminWhoami(request, env));
+    if (path === '/api/admin/inventory') return addCors(await handleAdminInventory(request, env));
+    if (path === '/api/admin/config' && request.method === 'GET') return addCors(await handleAdminConfigList(request, env));
+    {
+      const m = path.match(/^\/api\/admin\/config\/([A-Za-z0-9_-]+)$/);
+      if (m) return addCors(await handleAdminConfigUpdate(request, env, m[1]));
+    }
+    {
+      const m = path.match(/^\/api\/admin\/probe\/([A-Za-z0-9_-]+)$/);
+      if (m) return addCors(await handleAdminProbe(request, env, m[1]));
+    }
 
     // ── shows_catalog (public read, admin mutations) ──────────────────────────
     if (path === '/api/shows-catalog' && request.method === 'GET')  return addCors(await handleListShows(request, env));
@@ -200,7 +218,7 @@ export default {
     }
 
     if (path === '/register') {
-      return new Response(REGISTER_PAGE, {
+      return new Response(renderRegisterPage(env), {
         headers: { 'Content-Type': 'text/html; charset=utf-8' }
       });
     }
@@ -209,6 +227,10 @@ export default {
       return new Response(DASHBOARD_PAGE, {
         headers: { 'Content-Type': 'text/html; charset=utf-8' }
       });
+    }
+
+    if (path === '/admin') {
+      return handleAdminPage();
     }
 
     if (path === '/onboard-complete') {
@@ -577,13 +599,28 @@ const LOGIN_PAGE = `<!DOCTYPE html>
 </body>
 </html>`;
 
-const REGISTER_PAGE = `<!DOCTYPE html>
+function renderRegisterPage(env: Env): string {
+  const siteKey = env.TURNSTILE_SITE_KEY ?? '';
+  const turnstileScript = siteKey
+    ? '<script src="https://challenges.cloudflare.com/turnstile/v0/api.js" async defer></script>'
+    : '';
+  const turnstileWidget = siteKey
+    ? '<div class="cf-turnstile" data-sitekey="' + siteKey + '" data-callback="onTurnstileSuccess" data-expired-callback="onTurnstileExpired" data-error-callback="onTurnstileError" style="margin-bottom:1.2rem"></div>'
+    : '';
+  return REGISTER_PAGE_TEMPLATE
+    .replace('<!--TURNSTILE_SCRIPT-->', turnstileScript)
+    .replace('<!--TURNSTILE_WIDGET-->', turnstileWidget)
+    .replace(/__TURNSTILE_ENABLED__/g, siteKey ? 'true' : 'false');
+}
+
+const REGISTER_PAGE_TEMPLATE = `<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Sign Up — DaGama</title>
   <link href="https://fonts.googleapis.com/css2?family=Playfair+Display:wght@700&family=Outfit:wght@400;600&display=swap" rel="stylesheet">
+  <!--TURNSTILE_SCRIPT-->
   <style>
     * { margin: 0; padding: 0; box-sizing: border-box; }
     body { 
@@ -675,10 +712,17 @@ const REGISTER_PAGE = `<!DOCTYPE html>
     <input id="name" type="text" placeholder="Full name" />
     <input id="email" type="email" placeholder="Email address" />
     <input id="password" type="password" placeholder="Password (min 8 characters)" />
+    <!--TURNSTILE_WIDGET-->
     <button id="btn" onclick="doRegister()">Sign Up</button>
     <p>Already have an account? <a href="/login">Log in</a></p>
   </div>
   <script>
+    const TURNSTILE_ENABLED = __TURNSTILE_ENABLED__;
+    let turnstileToken = null;
+    window.onTurnstileSuccess = function(token) { turnstileToken = token; };
+    window.onTurnstileExpired = function() { turnstileToken = null; };
+    window.onTurnstileError   = function() { turnstileToken = null; };
+
     async function doRegister() {
       const name = document.getElementById('name').value.trim();
       const email = document.getElementById('email').value.trim();
@@ -688,12 +732,13 @@ const REGISTER_PAGE = `<!DOCTYPE html>
       err.style.display = 'none';
       if (!name || !email || !password) { err.textContent = 'Please fill in all fields.'; err.style.display = 'block'; return; }
       if (password.length < 8) { err.textContent = 'Password must be at least 8 characters.'; err.style.display = 'block'; return; }
+      if (TURNSTILE_ENABLED && !turnstileToken) { err.textContent = 'Please complete the captcha first.'; err.style.display = 'block'; return; }
       btn.textContent = 'Creating account…'; btn.disabled = true;
       try {
         const res = await fetch('/api/auth/register', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ name, email, password })
+          body: JSON.stringify({ name, email, password, cf_turnstile_response: turnstileToken })
         });
         const data = await res.json();
         if (!res.ok) { err.textContent = data.error || 'Registration failed.'; err.style.display = 'block'; return; }
@@ -897,6 +942,22 @@ const DASHBOARD_PAGE = `<!DOCTYPE html>
     <div id="sheets-box" class="empty-state">
       <div class="icon">📊</div>
       <p>No sheets yet.<br>Capture your first lead via the Telegram bot — a Google Sheet is created automatically and shared to your email.</p>
+    </div>
+
+    <!-- ExpenseBot tile (the Bridge product) ───────────────────────────────── -->
+    <div class="section-title" style="margin-top:3rem;">ExpenseBot <span class="badge badge-gold">Free with any pass</span></div>
+    <div id="expensebot-box" style="background: linear-gradient(135deg, rgba(30,41,59,0.9), rgba(30,41,59,0.6)); border: 1px solid rgba(212,175,55,0.15); border-radius: 16px; padding: 1.5rem;">
+      <div id="expensebot-loading" style="color:#94A3B8;font-size:0.9rem;">Checking ExpenseBot status…</div>
+      <div id="expensebot-disconnected" style="display:none;">
+        <p style="margin:0 0 0.75rem 0;color:#F5F5F5;font-weight:500;">Track every coffee, taxi, and booth fee at the show.</p>
+        <p style="margin:0 0 1rem 0;color:#94A3B8;font-size:0.9rem;">Just type expenses like <em>"45 USD coffee at the booth"</em> — Gemini extracts the amount, currency, and category. Auto-tagged as <strong>expedition</strong> at trade shows or <strong>basecamp</strong> for personal use.</p>
+        <button id="expensebot-connect-btn" class="action-btn" style="margin-top:0;" onclick="connectExpenseBot()">🧭 Connect ExpenseBot in Telegram</button>
+        <div id="expensebot-pending" style="display:none;margin-top:0.75rem;color:#94A3B8;font-size:0.85rem;">⏳ Waiting for you to tap <strong>Start</strong> in Telegram… (this updates automatically)</div>
+      </div>
+      <div id="expensebot-connected" style="display:none;">
+        <p style="margin:0 0 0.5rem 0;color:#4ade80;font-weight:500;">✅ Linked to Telegram</p>
+        <p style="margin:0;color:#94A3B8;font-size:0.9rem;">Default context: <strong id="expensebot-context">expedition</strong>. Open <a href="https://t.me/DaGaMaExpenseBot" target="_blank" style="color:#D4AF37;">@DaGaMaExpenseBot</a> and type an expense.</p>
+      </div>
     </div>
   </main>
 
@@ -1596,6 +1657,65 @@ const DASHBOARD_PAGE = `<!DOCTYPE html>
         ).join('');
       })
       .catch(() => {});
+
+    // ── ExpenseBot tile ────────────────────────────────────────────────────
+    let expensebotPollTimer = null;
+
+    async function refreshExpenseBotStatus() {
+      try {
+        const r = await fetch('/api/me/expensebot-status', { headers: { Authorization: 'Bearer ' + token } });
+        if (!r.ok) throw new Error('status_' + r.status);
+        const d = await r.json();
+        document.getElementById('expensebot-loading').style.display = 'none';
+        if (d.connected) {
+          document.getElementById('expensebot-connected').style.display = 'block';
+          document.getElementById('expensebot-disconnected').style.display = 'none';
+          document.getElementById('expensebot-context').textContent = d.default_context || 'expedition';
+          if (expensebotPollTimer) { clearInterval(expensebotPollTimer); expensebotPollTimer = null; }
+          return true;
+        }
+        document.getElementById('expensebot-connected').style.display = 'none';
+        document.getElementById('expensebot-disconnected').style.display = 'block';
+        return false;
+      } catch (e) {
+        document.getElementById('expensebot-loading').textContent = 'Could not check ExpenseBot status.';
+        return false;
+      }
+    }
+
+    async function connectExpenseBot() {
+      const btn = document.getElementById('expensebot-connect-btn');
+      btn.disabled = true;
+      btn.textContent = '⏳ Generating link…';
+      try {
+        const r = await fetch('/api/expensebot/link-token', { method: 'POST', headers: { Authorization: 'Bearer ' + token } });
+        if (!r.ok) throw new Error('link_' + r.status);
+        const d = await r.json();
+        window.open(d.deeplink, '_blank');
+        document.getElementById('expensebot-pending').style.display = 'block';
+        btn.textContent = '🔗 Open Telegram again';
+        btn.disabled = false;
+        // Poll every 3s for up to 60s — stops automatically once connected.
+        let elapsed = 0;
+        if (expensebotPollTimer) clearInterval(expensebotPollTimer);
+        expensebotPollTimer = setInterval(async () => {
+          elapsed += 3;
+          const linked = await refreshExpenseBotStatus();
+          if (linked) showToast('ExpenseBot connected ✅', 'success');
+          if (linked || elapsed >= 60) {
+            clearInterval(expensebotPollTimer);
+            expensebotPollTimer = null;
+            if (!linked) document.getElementById('expensebot-pending').textContent = 'No connection detected. Tap Connect again to retry.';
+          }
+        }, 3000);
+      } catch (e) {
+        btn.disabled = false;
+        btn.textContent = '🧭 Connect ExpenseBot in Telegram';
+        showToast('Could not generate ExpenseBot link.', 'error');
+      }
+    }
+
+    refreshExpenseBotStatus();
 
     function showToast(msg, type) {
       const t = document.getElementById('toast');

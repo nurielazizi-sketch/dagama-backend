@@ -3,6 +3,7 @@
 import { hashPassword, verifyPassword, signJwt, verifyJwt } from './crypto';
 import { ask, buildSummaryPrompt } from './gemini';
 import { sendVerificationEmail } from './email';
+import { verifyTurnstile } from './turnstile';
 import type { Env } from './types';
 
 interface User {
@@ -43,7 +44,7 @@ function jsonResponse(body: unknown, status = 200): Response {
 export async function handleRegister(request: Request, env: Env): Promise<Response> {
   if (request.method !== 'POST') return new Response('Method not allowed', { status: 405 });
 
-  let body: { email?: string; role?: string };
+  let body: { email?: string; role?: string; cf_turnstile_response?: string };
   try { body = await request.json() as typeof body; }
   catch { return jsonResponse({ error: 'Invalid JSON' }, 400); }
 
@@ -51,6 +52,15 @@ export async function handleRegister(request: Request, env: Env): Promise<Respon
   const role  = body.role === 'sourcebot' ? 'sourcebot' : 'boothbot';   // default to BoothBot
   if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
     return jsonResponse({ error: 'Valid email is required' }, 400);
+  }
+
+  // Turnstile check before any DB write or Resend call. When secrets unset
+  // (dev), verifyTurnstile returns success with skipped:true. In production
+  // this is the gate that stops bots from using us as a Resend spam relay.
+  const ip = request.headers.get('CF-Connecting-IP');
+  const captcha = await verifyTurnstile(body.cf_turnstile_response, ip, env);
+  if (!captcha.success) {
+    return jsonResponse({ error: 'captcha verification failed', detail: captcha.error }, 400);
   }
 
   // Find or create the user. PENDING: prefix marks the row as pre-activation.

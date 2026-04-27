@@ -92,6 +92,17 @@ binding = "CARD_QUEUE"
 # - DAGAMA_NOREPLY_REFRESH_TOKEN          (Gmail OAuth refresh token for transactional sender)
 # - DAGAMA_NOREPLY_FROM_EMAIL             (e.g. noreply@heydagama.com)
 # - DEMOBOT_ADMIN_TOKEN                   (Bearer token for /api/demobot/admin/* + shows_catalog endpoints)
+# - ADMIN_EMAILS                          (comma-separated emails allowed to load /admin + call /api/admin/*)
+# ── Cloudflare Access (Zero Trust) — belt-and-braces edge MFA gate ────────────
+# Set both together. When set, /api/admin/* additionally requires a valid
+# Cf-Access-Jwt-Assertion header (CF Access at the edge adds it automatically).
+# - CF_ACCESS_TEAM_DOMAIN                 (e.g. dagama.cloudflareaccess.com)
+# - CF_ACCESS_AUD_TAG                     (Application AUD tag from Zero Trust dashboard)
+# ── Cloudflare Turnstile (bot mitigation on /register) ────────────────────────
+# Both must be set together. When unset, /api/auth/register accepts requests
+# without a captcha token (dev fallback). Site key is public; secret is private.
+# - TURNSTILE_SITE_KEY                    (public, embedded in /register HTML)
+# - TURNSTILE_SECRET_KEY                  (private, server siteverify)
 # ── WhatsApp Cloud API (Meta) ──────────────────────────────────────────────────
 # All five required to activate the channel. When unset, the webhook returns 503
 # and outbound sends are no-ops (see src/whatsapp.ts isWhatsAppEnabled).
