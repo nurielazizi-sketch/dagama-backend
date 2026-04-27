@@ -22,6 +22,9 @@ Source: [src/index.ts](../src/index.ts).
 | ANY | `/api/auth/register` | `handleRegister` |
 | ANY | `/api/auth/login` | `handleLogin` |
 | ANY | `/api/auth/activate` | `handleActivate` |
+| ANY | `/api/chat/start` | `handleChatStart` |
+| ANY | `/api/chat/message` | `handleChatMessage` |
+| ANY | `/api/chat/poll` | `handleChatPoll` |
 | GET | `/api/me` | `handleMe` |
 | GET | `/api/stats` | `handleStats` |
 | GET | `/api/insights` | `handleInsights` |
@@ -53,6 +56,8 @@ Source: [src/index.ts](../src/index.ts).
 | POST | `/api/demobot/setup` | `handleDemoBotSetupWebhook` |
 | ANY | `/api/demobot/admin/freelancer-token` | `handleIssueFreelancerToken` |
 | ANY | `/api/demobot/admin/conversion` | `handleMarkConversion` |
+| POST | `/api/expensebot/webhook` | `handleExpenseBotWebhook` |
+| POST | `/api/expensebot/setup` | `handleExpenseBotSetupWebhook` |
 | GET | `/api/shows-catalog` | `handleListShows` |
 | POST | `/api/shows-catalog` | `handleCreateShow` |
 | PUT | `(regex) /^\/api\/shows-catalog\/([a-z0-9-]+` | `handleUpdateShow` |
