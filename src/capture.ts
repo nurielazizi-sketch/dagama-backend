@@ -194,14 +194,21 @@ async function runPhase1(
 
   // Insert leads row keyed by user_id (channel-agnostic). chat_id stays NULL
   // for non-Telegram captures; the existing Telegram queue path keeps writing
-  // chat_id, so the column remains optional.
+  // chat_id, so the column remains optional. wa_phone is set for WhatsApp
+  // captures so reply-attribution + per-phone diagnostics survive without a
+  // bot_users join.
+  const waPhone = input.reply.channel === 'whatsapp' ? input.reply.phone : null;
   const inserted = await env.DB.prepare(`
     INSERT INTO leads (
-      chat_id, show_name, name, company, email, phone, title,
+      user_id, channel, chat_id, wa_phone,
+      show_name, name, company, email, phone, title,
       website, linkedin, address, country, status
-    ) VALUES (NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'extraction_done')
+    ) VALUES (?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'extraction_done')
     RETURNING id
   `).bind(
+    input.userId,
+    input.channel,
+    waPhone,
     input.showName,
     contact.name || 'Unknown',
     contact.company || null,
