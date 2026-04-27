@@ -21,6 +21,7 @@ Source: [src/index.ts](../src/index.ts).
 | GET | `/api/health` | `handleHealth` |
 | ANY | `/api/auth/register` | `handleRegister` |
 | ANY | `/api/auth/login` | `handleLogin` |
+| ANY | `/api/auth/activate` | `handleActivate` |
 | GET | `/api/me` | `handleMe` |
 | GET | `/api/stats` | `handleStats` |
 | GET | `/api/insights` | `handleInsights` |
