@@ -40,8 +40,12 @@ export interface Env {
   SHARED_DRIVE_ID: string;
   GMAIL_CLIENT_ID: string;
   GMAIL_CLIENT_SECRET: string;
-  // Central transactional email — once nurielazizi@gmail.com (later noreply@heydagama.com)
-  // is OAuth'd, store the refresh token + from-address here. Until then, sendWelcomeEmail logs.
+  // Central transactional email — Resend. heydagama.com is the verified
+  // sending domain (see memory/dagama_email_infra.md). When RESEND_API_KEY is
+  // unset, sendVerificationEmail falls back to console.log so dev still works.
+  RESEND_API_KEY?: string;
+  // Legacy stubs from the abandoned Gmail-OAuth approach. Kept for now so
+  // callers that reference them don't break; remove after migration off.
   DAGAMA_NOREPLY_REFRESH_TOKEN?: string;
   DAGAMA_NOREPLY_FROM_EMAIL?: string;
   // Bearer token gating /api/demobot/admin/* + /api/shows-catalog mutations.

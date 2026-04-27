@@ -4,6 +4,102 @@ import type { Env } from './types';
 
 const GMAIL_SEND_URL  = 'https://gmail.googleapis.com/gmail/v1/users/me/messages/send';
 const GMAIL_TOKEN_URL = 'https://oauth2.googleapis.com/token';
+const RESEND_ENDPOINT = 'https://api.resend.com/emails';
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Transactional email — Resend (primary) with Gmail-OAuth fallback (legacy).
+//
+// When RESEND_API_KEY is set, every send goes through Resend. heydagama.com is
+// the verified sending domain (DKIM/SPF/DMARC); we send AS any *@heydagama.com
+// address. Replies route to the Workspace inbox — one seat at hello@ with
+// admin@/billing@/noreply@/support@ as aliases (memory/dagama_email_infra.md).
+//
+// If RESEND_API_KEY is absent, we fall through to the legacy Gmail-OAuth path
+// (DAGAMA_NOREPLY_REFRESH_TOKEN). If that's also absent, we log and return —
+// dev keeps working without any email infra.
+// ─────────────────────────────────────────────────────────────────────────────
+
+export interface SendEmailInput {
+  from:     string;          // e.g. 'Vasco DaGaMa <hello@heydagama.com>'
+  to:       string;
+  subject:  string;
+  html:     string;
+  text?:    string;          // optional plain-text alternative
+  replyTo?: string;          // defaults to support@heydagama.com when via Resend
+  tag?:     string;          // analytics tag (verification | trial_expiry | …)
+}
+
+export interface SendEmailResult { ok: boolean; id?: string; error?: string; }
+
+/** Primitive Resend send. Returns {ok:false} on failure rather than throwing. */
+export async function sendEmail(input: SendEmailInput, env: Env): Promise<SendEmailResult> {
+  if (!env.RESEND_API_KEY) {
+    console.log('[email] RESEND_API_KEY not set — skipping send', {
+      to: input.to, subject: input.subject, tag: input.tag,
+    });
+    return { ok: true, id: 'dev-noop' };
+  }
+
+  const payload: Record<string, unknown> = {
+    from:     input.from,
+    to:       input.to,
+    subject:  input.subject,
+    html:     input.html,
+    reply_to: input.replyTo ?? 'support@heydagama.com',
+  };
+  if (input.text) payload.text = input.text;
+  if (input.tag)  payload.tags = [{ name: 'category', value: input.tag }];
+
+  const res = await fetch(RESEND_ENDPOINT, {
+    method:  'POST',
+    headers: {
+      'Authorization': `Bearer ${env.RESEND_API_KEY}`,
+      'Content-Type':  'application/json',
+    },
+    body: JSON.stringify(payload),
+  });
+
+  if (!res.ok) {
+    const errorText = await res.text();
+    console.error('[email] Resend send failed', { status: res.status, errorText, to: input.to, tag: input.tag });
+    return { ok: false, error: `resend_${res.status}` };
+  }
+
+  const data = await res.json() as { id?: string };
+  return { ok: true, id: data.id };
+}
+
+// ── Verification email (Day-1 onboarding) ───────────────────────────────────
+// Sent immediately after email-only signup. Three functional deep-link CTAs
+// (WA / TG / web) auto-authenticate the user via the onboarding_tokens table.
+// Same token redeemable on whichever channel the user clicks first; first
+// redemption wins (single-active rule).
+
+export interface VerificationEmailInput {
+  to:       string;
+  token:    string;
+  role:     'boothbot' | 'sourcebot';
+}
+
+export async function sendVerificationEmail(input: VerificationEmailInput, env: Env): Promise<SendEmailResult> {
+  const tgUrl  = telegramDeepLink(input.role, input.token, env);
+  const waUrl  = whatsappDeepLink(input.role, input.token, env);
+  const webOrigin = (env.ORIGIN ?? 'https://heydagama.com').replace(/\/$/, '');
+  const webUrl    = `${webOrigin}/activate?token=${encodeURIComponent(input.token)}`;
+
+  const productName  = input.role === 'boothbot' ? 'BoothBot' : 'SourceBot';
+  const html    = renderVerificationHtml({ role: input.role, tgUrl, waUrl, webUrl });
+  const text    = renderVerificationText({ productName, tgUrl, waUrl, webUrl });
+  const subject = `✅ Your DaGama ${productName} is ready — pick a channel`;
+
+  return sendEmail({
+    from: 'Vasco DaGaMa <hello@heydagama.com>',
+    to:   input.to,
+    subject, html, text,
+    replyTo: 'support@heydagama.com',
+    tag:     'verification',
+  }, env);
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Welcome email sent at registration. Includes:
@@ -131,31 +227,52 @@ interface GmailSendArgs {
   env:          Env;
 }
 
-// Public wrapper used by the funnel scheduler so it can send any rendered email
-// via the central transactional Gmail account (DAGAMA_NOREPLY_REFRESH_TOKEN).
-// Returns false if the central account isn't configured (caller should log).
+// Public wrapper used by the funnel scheduler + db_emails. Tries Resend first
+// (heydagama.com verified sender), falls back to the legacy Gmail-OAuth path,
+// finally falls through to log-only. Returns false only when nothing was sent.
 export async function sendTransactionalEmail(
   args: { to: string; toName: string; subject: string; html: string; text: string },
   env: Env,
 ): Promise<boolean> {
+  // Primary path: Resend.
+  if (env.RESEND_API_KEY) {
+    const r = await sendEmail({
+      from:     'Vasco DaGaMa <hello@heydagama.com>',
+      to:       args.to,
+      subject:  args.subject,
+      html:     args.html,
+      text:     args.text,
+      replyTo:  'support@heydagama.com',
+      tag:      'transactional',
+    }, env);
+    if (r.ok) return true;
+    console.warn('[email] Resend failed, attempting Gmail-OAuth fallback', { error: r.error });
+  }
+
+  // Legacy fallback: Gmail OAuth (still wired in case anyone has the refresh token set).
   const refreshToken = env.DAGAMA_NOREPLY_REFRESH_TOKEN;
   const fromEmail    = env.DAGAMA_NOREPLY_FROM_EMAIL;
-  if (!refreshToken || !fromEmail) {
-    console.log(`[email] (no DAGAMA_NOREPLY config) would send to=${args.to} subject="${args.subject}"`);
-    return false;
+  if (refreshToken && fromEmail) {
+    try {
+      await sendViaGmail({
+        to:       args.to,
+        toName:   args.toName,
+        from:     fromEmail,
+        fromName: 'DaGama',
+        subject:  args.subject,
+        html:     args.html,
+        text:     args.text,
+        refreshToken,
+        env,
+      });
+      return true;
+    } catch (e) {
+      console.error('[email] Gmail-OAuth fallback failed', e);
+    }
   }
-  await sendViaGmail({
-    to:       args.to,
-    toName:   args.toName,
-    from:     fromEmail,
-    fromName: 'DaGama',
-    subject:  args.subject,
-    html:     args.html,
-    text:     args.text,
-    refreshToken,
-    env,
-  });
-  return true;
+
+  console.log(`[email] (no transactional sender configured) would send to=${args.to} subject="${args.subject}"`);
+  return false;
 }
 
 async function sendViaGmail(args: GmailSendArgs): Promise<void> {
@@ -209,4 +326,131 @@ function encodeMimeHeader(s: string): string {
 
 function escapeHtml(s: string): string {
   return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+}
+
+// ── Verification email renderers (Day-1 onboarding) ─────────────────────────
+// Inline-CSS HTML — required for email-client compatibility (Gmail strips
+// <style>, Outlook ignores flex/grid). Brand tokens are hardcoded copies of
+// the Digital Ledger palette: obsidian #0D0D0D background, titanium #F2F2F2
+// text, mint #00FF94 / violet #8B5CF6 per role, ghost-gold #C5A059 accents.
+
+function renderVerificationHtml(args: {
+  role:   'boothbot' | 'sourcebot';
+  tgUrl:  string;
+  waUrl:  string;
+  webUrl: string;
+}): string {
+  const isExhibitor  = args.role === 'boothbot';
+  const productName  = isExhibitor ? 'BoothBot' : 'SourceBot';
+  const productColor = isExhibitor ? '#00FF94' : '#8B5CF6';
+  const audienceLine = isExhibitor
+    ? 'Capture every buyer that walks past your booth.'
+    : 'Capture every supplier on the show floor — products, prices, voice notes.';
+
+  return `<!doctype html>
+<html lang="en"><head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Your DaGama bot is ready</title>
+</head>
+<body style="margin:0;padding:0;background:#0D0D0D;font-family:Inter,system-ui,sans-serif;color:#F2F2F2;">
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#0D0D0D;">
+<tr><td align="center" style="padding:40px 16px;">
+<table role="presentation" width="560" cellpadding="0" cellspacing="0" style="max-width:560px;width:100%;background:#16161A;border:1px solid rgba(38,38,38,0.5);border-radius:4px;">
+
+<tr><td style="padding:32px 32px 16px 32px;">
+  <div style="font-size:11px;letter-spacing:0.32em;text-transform:uppercase;color:rgba(242,242,242,0.5);margin-bottom:8px;">Trade show intelligence</div>
+  <div style="font-size:32px;font-weight:800;letter-spacing:-0.03em;color:#F2F2F2;line-height:1;">DAGAMA</div>
+</td></tr>
+
+<tr><td style="padding:8px 32px 0 32px;">
+  <h1 style="margin:0;font-size:28px;font-weight:800;letter-spacing:-0.02em;line-height:1.1;color:#F2F2F2;">
+    Your ${productName} is ready.
+  </h1>
+  <p style="margin:12px 0 0 0;font-size:15px;line-height:1.5;color:rgba(242,242,242,0.7);">
+    ${audienceLine}
+  </p>
+</td></tr>
+
+<tr><td style="padding:32px 32px 8px 32px;">
+  <div style="font-size:13px;font-weight:600;letter-spacing:0.04em;text-transform:uppercase;color:${productColor};margin-bottom:14px;">
+    Pick how you'll use it
+  </div>
+
+  <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="margin-bottom:10px;"><tr><td>
+    <a href="${args.waUrl}" style="display:block;padding:14px 18px;background:rgba(37,211,102,0.10);border:1px solid rgba(37,211,102,0.4);border-radius:4px;color:#F2F2F2;text-decoration:none;font-size:15px;font-weight:600;">
+      <span style="display:inline-block;width:24px;text-align:center;color:#25D366;font-weight:800;">●</span>
+      <span style="margin-left:8px;">Open in WhatsApp</span>
+      <span style="float:right;color:rgba(242,242,242,0.5);">→</span>
+    </a>
+  </td></tr></table>
+
+  <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="margin-bottom:10px;"><tr><td>
+    <a href="${args.tgUrl}" style="display:block;padding:14px 18px;background:rgba(0,136,204,0.10);border:1px solid rgba(0,136,204,0.4);border-radius:4px;color:#F2F2F2;text-decoration:none;font-size:15px;font-weight:600;">
+      <span style="display:inline-block;width:24px;text-align:center;color:#0088CC;font-weight:800;">●</span>
+      <span style="margin-left:8px;">Open in Telegram</span>
+      <span style="float:right;color:rgba(242,242,242,0.5);">→</span>
+    </a>
+  </td></tr></table>
+
+  <table role="presentation" width="100%" cellpadding="0" cellspacing="0"><tr><td>
+    <a href="${args.webUrl}" style="display:block;padding:14px 18px;background:rgba(242,242,242,0.04);border:1px solid rgba(242,242,242,0.2);border-radius:4px;color:#F2F2F2;text-decoration:none;font-size:15px;font-weight:600;">
+      <span style="display:inline-block;width:24px;text-align:center;color:#F2F2F2;font-weight:800;">●</span>
+      <span style="margin-left:8px;">Open in your browser</span>
+      <span style="float:right;color:rgba(242,242,242,0.5);">→</span>
+    </a>
+  </td></tr></table>
+</td></tr>
+
+<tr><td style="padding:24px 32px 8px 32px;">
+  <div style="padding:14px 16px;background:rgba(255,184,0,0.08);border:1px solid rgba(255,184,0,0.25);border-radius:4px;font-size:13px;line-height:1.5;color:rgba(242,242,242,0.85);">
+    <strong style="color:#FFB800;">Your 24-hour free trial</strong> starts the moment you send your first message — not now. Take your time. Sign up today, activate at your next show.
+  </div>
+</td></tr>
+
+<tr><td style="padding:16px 32px 8px 32px;">
+  <div style="padding:14px 16px;background:rgba(197,160,89,0.08);border:1px solid rgba(197,160,89,0.3);border-radius:4px;font-size:13px;line-height:1.5;color:rgba(242,242,242,0.85);">
+    <strong style="color:#C5A059;">Plus ExpenseBot, on us.</strong> Track every coffee, taxi, and booth fee at the show. Free with your trial; stays free with any paid show pass.
+  </div>
+</td></tr>
+
+<tr><td style="padding:24px 32px 32px 32px;">
+  <p style="margin:0;font-size:12px;line-height:1.5;color:rgba(242,242,242,0.4);">
+    Each link above can only be used once. Whichever you tap first becomes your active channel — you can switch later from the dashboard.
+  </p>
+</td></tr>
+
+<tr><td style="padding:0 32px 28px 32px;border-top:1px solid rgba(38,38,38,0.5);padding-top:20px;">
+  <p style="margin:0;font-size:11px;line-height:1.5;color:rgba(242,242,242,0.35);">
+    DaGama · The Explorer's Toolkit for global trade.<br>
+    Replies go to support@heydagama.com.
+  </p>
+</td></tr>
+
+</table>
+</td></tr>
+</table>
+</body></html>`;
+}
+
+function renderVerificationText(args: { productName: string; tgUrl: string; waUrl: string; webUrl: string; }): string {
+  return `Your DaGama ${args.productName} is ready.
+
+Pick how you'll use it — tap one link below:
+
+  WhatsApp: ${args.waUrl}
+  Telegram: ${args.tgUrl}
+  Browser:  ${args.webUrl}
+
+Your 24-hour free trial starts when you send your first message — not now.
+Take your time. Sign up today, activate at your next show.
+
+Plus ExpenseBot, on us. Track every coffee, taxi, and booth fee at the show.
+Free with your trial; stays free with any paid show pass.
+
+Each link can only be used once. Whichever you tap first becomes your active channel.
+
+— DaGama · The Explorer's Toolkit for global trade
+Replies go to support@heydagama.com.
+`;
 }

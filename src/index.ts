@@ -1,6 +1,6 @@
 /// <reference types="@cloudflare/workers-types" />
 
-import { handleLogin, handleRegister, handleMe, handleStats, handleInsights } from './auth';
+import { handleLogin, handleRegister, handleActivate, handleMe, handleStats, handleInsights } from './auth';
 import { handleTelegramWebhook, handleSetupWebhook } from './telegram';
 import { handleGmailCallback } from './gmail';
 import { handleCreateCheckout, handleStripeWebhook, handleBillingPortal, handleSubscriptionStatus } from './stripe';
@@ -79,6 +79,7 @@ export default {
     if (path === '/api/health')        return addCors(await handleHealth(env));
     if (path === '/api/auth/register') return addCors(await handleRegister(request, env));
     if (path === '/api/auth/login')    return addCors(await handleLogin(request, env));
+    if (path === '/api/auth/activate') return addCors(await handleActivate(request, env));
     if (path === '/api/me')                  return addCors(await handleMe(request, env));
     if (path === '/api/stats')               return addCors(await handleStats(request, env));
     if (path === '/api/insights')            return addCors(await handleInsights(request, env));
