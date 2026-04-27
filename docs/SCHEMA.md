@@ -301,6 +301,7 @@ Same dedup as SourceBot but for DemoBot's webhook.
 | 029 | `029_app_config.sql` | Runtime-tunable config + audit log for the /admin console. |
 | 030 | `030_channel_migrations.sql` | Pending channel migrations. |
 | 031 | `031_expensebot_link_tokens.sql` | One-shot deeplink tokens for "Connect ExpenseBot" from the dashboard. |
+| 032 | `032_coupons_and_retargeting.sql` | ───────────────────────────────────────────────────────────────────────────── |
 <!-- AUTO:MIGRATIONS:END -->
 
 ### Hand-curated highlights
