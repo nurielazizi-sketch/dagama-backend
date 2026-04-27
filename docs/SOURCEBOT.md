@@ -2,7 +2,7 @@
 
 SourceBot is the **buyer-side** Telegram bot used at sourcing trade shows (Canton Fair, Yiwu, etc.). It captures suppliers, products, and AI-drafted follow-up emails into a per-buyer Google Sheet + Drive folder.
 
-Source: [src/sourcebot.ts](../src/sourcebot.ts) · [src/sb_sheets.ts](../src/sb_sheets.ts) · [src/funnel.ts](../src/funnel.ts) · [src/pdf.ts](../src/pdf.ts)
+Source: [src/sourcebot.ts](../src/sourcebot.ts) · [src/sourcebot_core.ts](../src/sourcebot_core.ts) · [src/sb_sheets.ts](../src/sb_sheets.ts) · [src/funnel.ts](../src/funnel.ts) · [src/pdf.ts](../src/pdf.ts) · [src/web_capture.ts](../src/web_capture.ts)
 
 ---
 
@@ -116,6 +116,25 @@ Terminal callbacks strip the keyboard so the user can't double-tap; non-terminal
 - **Smart photo classification**: `extractProductFromImage` returns `{ type: 'business_card' | 'product' }` so a card sent in product mode is auto-routed.
 - **Admin reset**: `POST /api/sourcebot/admin/reset-buyer` (gated by `WEBHOOK_SECRET`) trashes the buyer's Drive assets, wipes per-buyer D1 rows, re-provisions a fresh sheet + folder, leaves one placeholder show "Setup".
 
+## Cross-channel support (WhatsApp + web)
+
+All major SourceBot capabilities are now available on WhatsApp and the web dashboard in addition to Telegram. The shared logic lives in `src/sourcebot_core.ts`:
+
+- **Supplier capture** — `captureSupplierFromPhoto()` (phase 1)
+- **Card back + person photo** — `attachCardBack()`, `attachPersonPhoto()` (phase 2)
+- **Voice notes** — `attachVoiceNote()` (phase 3)
+- **Products** — `attachProductFromPhoto()`, `updateProductDetails()` (phase 4)
+- **Email follow-ups + blast** — `draftSupplierEmail()`, `sendSupplierEmail()`, `blastSuppliers()` (phase 5)
+- **Find / compare / PDF** — `findAcrossSupplierData()`, `compareProducts()`, `exportSupplierPdf()`, `exportShowPdf()` (phase 6)
+
+WhatsApp text commands: `/find`, `/compare`, `/pdf`, `/pdfshow`, `/email`, `/blast`.
+
+Web API endpoints (all auth'd): `GET /api/search`, `POST /api/compare`, `GET /api/suppliers`, `POST /api/suppliers/:id/products`, `PATCH /api/products/:id`, `POST /api/suppliers/:id/voice`, `GET /api/suppliers/:id/email-draft`, `POST /api/suppliers/:id/email`, `POST /api/blast`, `POST /api/suppliers/:id/pdf`, `POST /api/show/pdf`.
+
+Gmail for cross-channel buyers is keyed by `buyer_id` (migration 024); falls back to Telegram `chat_id` for buyers who connected Gmail via Telegram.
+
+---
+
 ## Schema touched (current as of 2026-04-26)
 
 - `sb_buyers`, `sb_buyers_telegram`, `sb_buyer_shows`
@@ -124,7 +143,9 @@ Terminal callbacks strip the keyboard so the user can't double-tap; non-terminal
 - `sb_products` (incl. `image_url`, `sheet_row`, `confirmation_message_id`, `deleted_at`)
 - `sb_voice_notes`, `sb_emails_sent`
 - `email_queue`, `events`, `referrals`
-- `sb_tg_updates_seen`, `onboarding_tokens`, `gmail_tokens`
+- `sb_tg_updates_seen`, `onboarding_tokens`, `gmail_tokens` (incl. `buyer_id` column for cross-channel Gmail)
+- `wa_user_mappings` (for WhatsApp session + step tracking)
+- `leads` (multi-channel: `channel`, `user_id`, `wa_phone`, `web_session_id`)
 
 ## Sheet layout
 

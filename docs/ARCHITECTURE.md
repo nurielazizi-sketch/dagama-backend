@@ -1,8 +1,8 @@
 # Architecture
 
-DaGama is a single Cloudflare Worker that serves three Telegram bots, a WhatsApp Cloud API webhook, the marketing website, and a thin authenticated dashboard. State is in Cloudflare D1 (SQLite). User-uploaded photos are in R2. Long-running OCR + Gemini work is offloaded to a Cloudflare Queue.
+DaGama is a single Cloudflare Worker that serves three Telegram bots, a WhatsApp Cloud API webhook, the marketing website, and a thin authenticated dashboard. State is in Cloudflare D1 (SQLite). User-uploaded photos are in R2. Long-running OCR + Gemini work is offloaded to a Cloudflare Queue. A `ChannelAdapter` interface (`src/channel.ts`) unifies send-side I/O across Telegram, WhatsApp, and the upcoming web channel so bot brain code targets one interface.
 
-Source: [src/index.ts](../src/index.ts), [wrangler.toml](../wrangler.toml)
+Source: [src/index.ts](../src/index.ts) · [src/capture.ts](../src/capture.ts) · [src/channel.ts](../src/channel.ts) · [wrangler.toml](../wrangler.toml)
 
 ---
 
@@ -51,7 +51,7 @@ Every entrypoint is one `fetch` handler. Path-based dispatch in `src/index.ts`:
 | Route prefix | Owner | Notes |
 |---|---|---|
 | `/` | website | landing/login/register/dashboard/onboard-complete (HTML constants in `index.ts`) |
-| `/api/auth/*` | dashboard | password + Google OAuth signin |
+| `/api/auth/*` | dashboard | email-only signup (`/register`), token activation (`/activate`), login, Google OAuth signin |
 | `/api/me`, `/api/stats`, `/api/insights` | dashboard | bearer-token authed JSON |
 | `/api/telegram/webhook` | BoothBot | secret-validated |
 | `/api/telegram/setup` | BoothBot | one-shot webhook installer |
@@ -91,6 +91,7 @@ Every entrypoint is one `fetch` handler. Path-based dispatch in `src/index.ts`:
    - hard-purges soft-deleted rows whose 24h grace has elapsed
    - trims the `sb_tg_updates_seen` dedup table (>1h old)
 3. `processFunnelQueue` — sends due rows from `email_queue` (welcome / digest_6pm / morning_8am / midday_2pm / post_3d / retarget_4w).
+4. `processDemobotQueue` — sends due DemoBot prospect nurture emails (`demobot_e2`, `demobot_e3`, `demobot_e4`) with engagement-gating.
 
 ---
 
@@ -109,12 +110,14 @@ Every entrypoint is one `fetch` handler. Path-based dispatch in `src/index.ts`:
 
 ### D1 — `dagama`
 
-19 tables — see [SCHEMA.md](SCHEMA.md). Three logical clusters:
+See [SCHEMA.md](SCHEMA.md) for the full table list. Logical clusters:
 
-- **Auth + users**: `users`, `subscriptions`, `gmail_tokens`, `onboarding_tokens`, `google_sheets`, `buyer_shows` (BoothBot show passes).
-- **BoothBot data**: `leads` (with `sheet_row`, `card_url`, `confirmation_message_id`).
+- **Auth + users**: `users` (with `role`), `subscriptions`, `gmail_tokens` (now also keyed by `buyer_id`), `onboarding_tokens`, `google_sheets`, `buyer_shows` (BoothBot show passes).
+- **BoothBot data**: `leads` (multi-channel: `channel`, `user_id`, `wa_phone`, `web_session_id`; `chat_id` is now nullable).
 - **SourceBot data**: `sb_buyers`, `sb_buyers_telegram`, `sb_buyer_shows`, `sb_companies`, `sb_contacts`, `sb_products`, `sb_voice_notes`, `sb_emails_sent`, `email_queue`, `events`, `referrals`, `sb_tg_updates_seen`.
-- **DemoBot data**: `freelancers`, `prospects`, `demobot_pending_registrations`, `demobot_shows`.
+- **DemoBot data**: `demobot_prospects`, `demobot_freelancer_demos`, `demobot_freelancers_telegram`, `demobot_pending_registrations`, `demobot_tg_updates_seen`, `shows_catalog`.
+- **WhatsApp**: `wa_user_mappings` (bot_role now includes `'demobot'`), `wa_inbound_messages`, `wa_outbound_messages`, `wa_message_status`, `wa_templates`, `wa_media_cache`.
+- **ExpenseBot (schema-only, v1 draft)**: `expense_currencies` (9 ISO codes seeded), `expenses`, `recurring_expenses`.
 
 ### R2 — `dagama-cards`
 
@@ -190,7 +193,8 @@ DemoBot's WhatsApp surface — text + image webhooks, with an outbound `sendMess
 | `GOOGLE_SERVICE_ACCOUNT_EMAIL` + `_PRIVATE_KEY` | Drive + Sheets writes |
 | `GMAIL_CLIENT_ID` + `_CLIENT_SECRET` | per-user Gmail OAuth |
 | `STRIPE_SECRET_KEY`, `STRIPE_WEBHOOK_SECRET`, `STRIPE_PRICE_*` | billing |
-| `DAGAMA_NOREPLY_REFRESH_TOKEN` | (deferred) transactional outbound mail for funnel emails |
+| `DAGAMA_NOREPLY_REFRESH_TOKEN` | (deferred) transactional outbound mail fallback via Gmail OAuth |
+| `RESEND_API_KEY` | Resend HTTP API — primary transactional email (verification emails, DemoBot sequence); falls back to Gmail-OAuth then logs if unset |
 
 ---
 
@@ -206,4 +210,4 @@ Migrations:
 npx wrangler d1 execute dagama --env production --remote --file=migrations/NNN_name.sql
 ```
 
-Migrations live in [migrations/](../migrations) and are idempotent. Latest: `019_sb_tg_updates_seen.sql`.
+Migrations live in [migrations/](../migrations) and are idempotent. Latest: `026_expensebot_schema.sql`.
