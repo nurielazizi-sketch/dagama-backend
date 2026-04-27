@@ -113,7 +113,10 @@ export async function provisionBuyer(opts: {
     sheetUrl = sheet.sheetUrl;
   }
 
-  await shareDriveItem(folderId, opts.email, token, 'writer', true);
+  // notify=false suppresses Drive's auto-share email. We send our own branded
+  // welcome email via Resend instead so users don't get the off-brand
+  // "lead-manager-bot@…iam.gserviceaccount.com via Google Drive" notification.
+  await shareDriveItem(folderId, opts.email, token, 'writer', false);
 
   // 3. Persist per-role rows.
   const now            = Math.floor(Date.now() / 1000);

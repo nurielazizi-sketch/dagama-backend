@@ -707,14 +707,25 @@ const REGISTER_PAGE_TEMPLATE = `<!DOCTYPE html>
 </head>
 <body>
   <div class="container">
-    <h1>Get Started</h1>
-    <div id="error" style="display:none;color:#f87171;background:rgba(248,113,113,0.1);border:1px solid rgba(248,113,113,0.3);border-radius:8px;padding:0.75rem 1rem;margin-bottom:1.2rem;font-size:0.9rem;"></div>
-    <input id="name" type="text" placeholder="Full name" />
-    <input id="email" type="email" placeholder="Email address" />
-    <input id="password" type="password" placeholder="Password (min 8 characters)" />
-    <!--TURNSTILE_WIDGET-->
-    <button id="btn" onclick="doRegister()">Sign Up</button>
-    <p>Already have an account? <a href="/login">Log in</a></p>
+    <div id="form-state">
+      <h1>Get Started</h1>
+      <p style="text-align:center;margin-top:-1rem;margin-bottom:1.5rem;color:#94A3B8;font-size:0.95rem;">Enter your email — we'll send a verification link to set your password.</p>
+      <div id="error" style="display:none;color:#f87171;background:rgba(248,113,113,0.1);border:1px solid rgba(248,113,113,0.3);border-radius:8px;padding:0.75rem 1rem;margin-bottom:1.2rem;font-size:0.9rem;"></div>
+      <input id="email" type="email" placeholder="Email address" autocomplete="email" />
+      <!--TURNSTILE_WIDGET-->
+      <button id="btn" onclick="doRegister()">Send verification link</button>
+      <p>Already have an account? <a href="/login">Log in</a></p>
+    </div>
+    <div id="sent-state" style="display:none;text-align:center;">
+      <h1>Check your email</h1>
+      <p style="margin-top:1rem;color:#94A3B8;line-height:1.6;">We just sent a verification link to <strong id="sent-email" style="color:#F5F5F5;"></strong>. Click the link to set your password and finish signing up.</p>
+      <p style="margin-top:1.5rem;color:#94A3B8;font-size:0.9rem;">Didn't get it? Check spam, or <a href="#" onclick="resetForm();return false;">try again</a>.</p>
+    </div>
+    <div id="already-state" style="display:none;text-align:center;">
+      <h1>Welcome back</h1>
+      <p style="margin-top:1rem;color:#94A3B8;line-height:1.6;">An account with this email already exists. Log in to continue.</p>
+      <a href="/login" style="display:inline-block;margin-top:1.5rem;padding:1rem 2rem;background:linear-gradient(135deg, #D4AF37, #E8C547);color:#0F1419;border-radius:8px;font-weight:600;text-decoration:none;">Log in</a>
+    </div>
   </div>
   <script>
     const TURNSTILE_ENABLED = __TURNSTILE_ENABLED__;
@@ -723,35 +734,50 @@ const REGISTER_PAGE_TEMPLATE = `<!DOCTYPE html>
     window.onTurnstileExpired = function() { turnstileToken = null; };
     window.onTurnstileError   = function() { turnstileToken = null; };
 
+    function showState(which) {
+      document.getElementById('form-state').style.display    = which === 'form'    ? 'block' : 'none';
+      document.getElementById('sent-state').style.display    = which === 'sent'    ? 'block' : 'none';
+      document.getElementById('already-state').style.display = which === 'already' ? 'block' : 'none';
+    }
+    function resetForm() {
+      document.getElementById('email').value = '';
+      turnstileToken = null;
+      if (window.turnstile && TURNSTILE_ENABLED) { try { window.turnstile.reset(); } catch (e) {} }
+      showState('form');
+    }
+
     async function doRegister() {
-      const name = document.getElementById('name').value.trim();
       const email = document.getElementById('email').value.trim();
-      const password = document.getElementById('password').value;
       const err = document.getElementById('error');
       const btn = document.getElementById('btn');
       err.style.display = 'none';
-      if (!name || !email || !password) { err.textContent = 'Please fill in all fields.'; err.style.display = 'block'; return; }
-      if (password.length < 8) { err.textContent = 'Password must be at least 8 characters.'; err.style.display = 'block'; return; }
-      if (TURNSTILE_ENABLED && !turnstileToken) { err.textContent = 'Please complete the captcha first.'; err.style.display = 'block'; return; }
-      btn.textContent = 'Creating account…'; btn.disabled = true;
+      if (!email || !/^[^\\s@]+@[^\\s@]+\\.[^\\s@]+$/.test(email)) {
+        err.textContent = 'Please enter a valid email address.'; err.style.display = 'block'; return;
+      }
+      if (TURNSTILE_ENABLED && !turnstileToken) {
+        err.textContent = 'Please complete the captcha first.'; err.style.display = 'block'; return;
+      }
+      btn.textContent = 'Sending…'; btn.disabled = true;
       try {
         const res = await fetch('/api/auth/register', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ name, email, password, cf_turnstile_response: turnstileToken })
+          body: JSON.stringify({ email, cf_turnstile_response: turnstileToken })
         });
         const data = await res.json();
         if (!res.ok) { err.textContent = data.error || 'Registration failed.'; err.style.display = 'block'; return; }
-        localStorage.setItem('dagama_token', data.token);
-        localStorage.setItem('dagama_user', JSON.stringify(data.user));
-        window.location.href = '/dashboard';
+        if (data.alreadyRegistered) { showState('already'); return; }
+        document.getElementById('sent-email').textContent = email;
+        showState('sent');
       } catch (e) {
         err.textContent = 'Network error. Please try again.'; err.style.display = 'block';
       } finally {
-        btn.textContent = 'Sign Up'; btn.disabled = false;
+        btn.textContent = 'Send verification link'; btn.disabled = false;
       }
     }
-    document.addEventListener('keydown', e => { if (e.key === 'Enter') doRegister(); });
+    document.addEventListener('keydown', e => {
+      if (e.key === 'Enter' && document.getElementById('form-state').style.display !== 'none') doRegister();
+    });
   </script>
 </body>
 </html>`;
