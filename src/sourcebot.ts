@@ -8,6 +8,13 @@ import { generateSupplierPdf, generateShowPdf } from './pdf';
 import { appendSupplierRow, updateSupplierProducts, updateSupplierVoiceNote, updateSupplierEmailStatus, appendProductRow, updateProductRow, ensureProductsTab, updateSupplierCardBack, updateSupplierPerson, createSourceBotSheet, updateSupplierInterest, strikethroughRow } from './sb_sheets';
 import { buildGmailAuthUrl, getGmailToken, getValidAccessToken, sendGmailEmail } from './gmail';
 import { extractContactFromImage } from './extract';
+import { getChannelAdapter } from './channel';
+import {
+  welcomeMessage,
+  helpMessage,
+  pendingActivationMessage,
+  dispatchBotMessage,
+} from './bot_copy';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // SourceBot Telegram webhook handler.
@@ -66,7 +73,7 @@ interface SourceBotSession {
   activeEmailDraft?: { draftId: string; companyId: string; recipient: string; subject: string; body: string; html?: string };
 }
 
-export async function handleSourceBotWebhook(request: Request, env: Env): Promise<Response> {
+export async function handleSourceBotWebhook(request: Request, env: Env, ctx?: ExecutionContext): Promise<Response> {
   const secret = request.headers.get('X-Telegram-Bot-Api-Secret-Token');
   if (secret !== env.WEBHOOK_SECRET) return new Response('Unauthorized', { status: 401 });
 
@@ -89,14 +96,14 @@ export async function handleSourceBotWebhook(request: Request, env: Env): Promis
     if ((r.meta.changes ?? 0) === 0) return new Response('OK (dedup)', { status: 200 });
   }
 
-  if (update.message)        await handleMessage(update.message, env);
+  if (update.message)        await handleMessage(update.message, env, ctx);
   else if (update.callback_query) await handleCallback(update.callback_query, env);
   return new Response('OK', { status: 200 });
 }
 
 // ── Message dispatch ─────────────────────────────────────────────────────────
 
-async function handleMessage(msg: TgMessage, env: Env): Promise<void> {
+async function handleMessage(msg: TgMessage, env: Env, ctx?: ExecutionContext): Promise<void> {
   const chatId = msg.chat.id;
   const text = (msg.text ?? '').trim();
 
@@ -305,7 +312,7 @@ async function handleMessage(msg: TgMessage, env: Env): Promise<void> {
 
   // Idle: a photo means a supplier card
   if (msg.photo && msg.photo.length > 0) {
-    await handleSupplierCard(chatId, msg.photo, buyer, env);
+    await handleSupplierCard(chatId, msg.photo, buyer, env, ctx);
     return;
   }
 
@@ -544,24 +551,34 @@ function toastFor(data: string): string {
 // ── /start handlers ──────────────────────────────────────────────────────────
 
 async function cmdStart(chatId: number, firstName: string, env: Env): Promise<void> {
+  const adapter = getChannelAdapter({ channel: 'telegram', recipient: String(chatId), botRole: 'sourcebot' }, env);
   const buyer = await getBuyerForChat(chatId, env);
+
   if (buyer) {
-    const sheet = await env.DB.prepare(
-      `SELECT sheet_url FROM sb_buyer_shows WHERE buyer_id = ? AND status IN ('active','grace')
+    // If the user's only/most-recent show is still the Setup placeholder, they
+    // never finished naming their show in the lazy-provisioning flow. Re-open
+    // the picker instead of greeting them as if they're already set up — that
+    // greeting would otherwise overwrite the show prompt and strand them.
+    const latestShow = await env.DB.prepare(
+      `SELECT show_name, sheet_url FROM sb_buyer_shows WHERE buyer_id = ?
         ORDER BY created_at DESC LIMIT 1`
-    ).bind(buyer.buyerId).first<{ sheet_url: string | null }>();
-    await send(chatId,
-      `👋 Welcome back, ${firstName}!\n\n` +
-      `📸 Send a supplier's business card photo to capture them, or 📦 a product photo to attach it to your last supplier.\n\n` +
-      `Type /help for the full command list` +
-      (sheet?.sheet_url ? ` · 📊 [Open your Sheet](${sheet.sheet_url})` : '') + `.`,
-      env, true);
+    ).bind(buyer.buyerId).first<{ show_name: string; sheet_url: string | null }>();
+    if (latestShow?.show_name === PLACEHOLDER_SHOW_NAME) {
+      await cmdAskShow(chatId, firstName, buyer.buyerId, env);
+      return;
+    }
+    // Returning user — canonical welcome with sheet deep-link if available.
+    // No firstName context means the welcome uses the no-greet variant; we
+    // explicitly want "Welcome back" wording, so pass the firstName.
+    await dispatchBotMessage(adapter, welcomeMessage('sourcebot', {
+      firstName,
+      sheetUrl: latestShow?.sheet_url ?? undefined,
+    }));
     return;
   }
-  await send(chatId,
-    `👋 Welcome to DaGama SourceBot, ${firstName}.\n\n` +
-    `To get started, open the welcome email we sent you and tap the Telegram link.`,
-    env);
+
+  // Pre-onboarding: nudge them back to the verification email.
+  await dispatchBotMessage(adapter, pendingActivationMessage('sourcebot', firstName));
 }
 
 async function cmdStartWithToken(chatId: number, firstName: string, token: string, env: Env): Promise<void> {
@@ -626,24 +643,14 @@ async function cmdStartWithToken(chatId: number, firstName: string, token: strin
     return;
   }
 
-  await send(chatId,
-    `✅ *Connected, ${firstName}!* I'm DaGama SourceBot — your trade-show companion.\n\n` +
-    `*What I do:*\n` +
-    `📇 *Capture suppliers* — send me a photo of a business card and I'll extract name, title, email, phone, website, LinkedIn, address, and country into your Sheet.\n` +
-    `📦 *Capture products* — send a product photo right after a card and I'll attach it to that supplier with an image, name, and AI-written description.\n` +
-    `💬 *Voice + text notes* — reply to any photo with text or a voice note and I'll pull out price, MOQ, lead time, colors, materials, and add them to the row.\n` +
-    `✏️ *Fix mistakes* — reply to any of my confirmations with a correction (e.g. "phone is +1 415 555 1234") and I'll update the field.\n` +
-    `🔥 *Rank interest* — tap Hot / Warm / Cold on a supplier so you remember the best leads.\n` +
-    `📧 *AI follow-ups* — /email <supplier> drafts and sends a personal email from your Gmail. /blast sends one to every supplier you haven't contacted.\n` +
-    `📑 *PDFs* — /pdf <supplier> for a one-pager, /pdfshow for a full-show recap.\n` +
-    `🔍 */find <text>* searches everything · */compare <product>* AI-ranks suppliers · */summary* recaps the show.\n\n` +
-    `*Quick start:*\n` +
-    `1. Send the next supplier's *business card photo* 📸\n` +
-    `2. Send their *product photos* 📦 right after\n` +
-    `3. *Reply* with details — by voice or text 🎤\n\n` +
-    `Use /help anytime for the full command list` +
-    (sheet?.sheet_url ? ` · 📊 [Open your Sheet](${sheet.sheet_url})` : '') + `.`,
-    env, true);
+  // Canonical post-onboarding welcome — wording lives in bot_copy.ts so all
+  // three channels (TG/WA/web) emit identical text. Sheet deep-link is TG-/
+  // sourcebot-specific and gets injected via WelcomeContext.sheetUrl.
+  const adapter = getChannelAdapter({ channel: 'telegram', recipient: String(chatId), botRole: 'sourcebot' }, env);
+  await dispatchBotMessage(adapter, welcomeMessage('sourcebot', {
+    firstName,
+    sheetUrl: sheet?.sheet_url ?? undefined,
+  }));
 }
 
 // ── Show picker (lazy-provisioning Day-1 signup follow-up) ──────────────────
@@ -801,36 +808,8 @@ async function applyShowName(chatId: number, firstName: string, buyerId: string,
 }
 
 async function cmdHelp(chatId: number, env: Env): Promise<void> {
-  await send(chatId,
-    `*DaGama SourceBot — quick reference*\n\n` +
-    `📸 *Send a business card photo* → supplier saved\n` +
-    `📦 *Send product photos* → captured under that supplier\n` +
-    `💬 *Reply to any photo* with text or voice → details extracted (price, MOQ, lead time, colors)\n` +
-    `✏️ *Reply to a confirmation* with corrections → fields fixed automatically\n\n` +
-    `*Lookup commands*\n` +
-    `/supplier [query] — list captured suppliers\n` +
-    `/products [query] — list captured products\n` +
-    `/find <query> — search across suppliers, products, voice notes\n` +
-    `/compare <product> — AI ranking across your suppliers\n` +
-    `/summary — AI summary of this show\n\n` +
-    `*Action commands*\n` +
-    `/pending — products missing price or MOQ\n` +
-    `/followups — suppliers with email but no follow-up sent\n` +
-    `/email <supplier> — draft + send a follow-up email\n` +
-    `/blast — bulk send follow-ups to all uncontacted suppliers\n` +
-    `/pdf <supplier> — one-pager PDF for a supplier\n` +
-    `/pdfshow — PDF recap of the whole show\n` +
-    `/connectgmail — connect your Gmail (sends from your address)\n\n` +
-    `*Shows + billing*\n` +
-    `/shows — list your shows · /switch <name> — change active show\n` +
-    `/newshow <name> [days] — register another show\n` +
-    `/allshows — cross-show summary\n` +
-    `/upgrade — unlock unlimited scans (Stripe)\n\n` +
-    `*Account*\n` +
-    `/share — your referral link · /tutorial — quick walkthrough\n` +
-    `/language [code] — set your language preference\n` +
-    `/done · /cancel · /clear — exit current step`,
-    env, true);
+  const adapter = getChannelAdapter({ channel: 'telegram', recipient: String(chatId), botRole: 'sourcebot' }, env);
+  await dispatchBotMessage(adapter, helpMessage('sourcebot'));
 }
 
 // ── /find ────────────────────────────────────────────────────────────────────
@@ -1901,6 +1880,7 @@ async function handleSupplierCard(
   photos: TgPhotoSize[],
   buyer: { buyerId: string },
   env: Env,
+  ctx?: ExecutionContext,
 ): Promise<void> {
   const photo = photos.reduce((a, b) => (b.file_size ?? 0) > (a.file_size ?? 0) ? b : a);
 
@@ -1977,30 +1957,12 @@ async function handleSupplierCard(
   ).bind(buyer.buyerId, pass.show_name, companyName, extracted.website || null, null).first<{ id: string }>())?.id;
   if (!companyId) { await send(chatId, `❌ Failed to save the supplier.`, env); return; }
 
-  // 3b. Per-supplier folder set: "{Company} — {Month YYYY}" / Cards / Products
-  let folders: SupplierFolders | undefined;
-  if (pass.drive_folder_id) {
-    try {
-      folders = await getOrCreateSupplierFolders(companyId, companyName, pass.drive_folder_id, env, saToken);
-    } catch (e) {
-      console.error('[sourcebot] supplier folder create failed:', e);
-    }
-  }
-
-  // 3c. Upload card front to Cards/ subfolder (or fall back to the show folder).
-  let cardUrl: string | undefined;
-  try {
-    const parent = folders?.cards ?? pass.drive_folder_id;
-    if (parent) {
-      cardUrl = await uploadCardImage(rawBuffer, extracted.name || 'card', extracted.company, parent, saToken);
-    }
-  } catch (e) {
-    console.error('[sourcebot] card upload failed:', e);
-  }
-
-  await env.DB.prepare(
+  // 3b. Persist the contact NOW (without card_front_url — that's filled by the
+  // background pass once Drive upload completes). Capturing the row id lets us
+  // update card_front_url asynchronously.
+  const contactInsert = await env.DB.prepare(
     `INSERT INTO sb_contacts (company_id, buyer_id, show_name, name, title, email, phone, linkedin_url, address, card_front_url)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL) RETURNING id`
   ).bind(
     companyId, buyer.buyerId, pass.show_name,
     extracted.name || null,
@@ -2009,36 +1971,10 @@ async function handleSupplierCard(
     extracted.phone || null,
     extracted.linkedin || null,
     extracted.address || null,
-    cardUrl || null,
-  ).run();
+  ).first<{ id: string }>();
+  const contactId = contactInsert?.id;
 
-  // 5. Append row to the buyer's Sheet + record sheet_row on the company so we can update later
-  try {
-    const folderUrl = folders?.parent ? `https://drive.google.com/drive/folders/${folders.parent}` : undefined;
-    const { rowIndex } = await appendSupplierRow(pass.sheet_id, {
-      timestamp:    new Date().toISOString(),
-      company:      companyName,
-      contactName:  extracted.name    || '',
-      title:        extracted.title   || '',
-      email:        extracted.email   || '',
-      phone:        extracted.phone   || '',
-      website:      extracted.website || '',
-      linkedin:     extracted.linkedin|| '',
-      industry:     '',
-      cardFrontUrl: cardUrl,
-      folderUrl,
-    }, saToken);
-
-    if (!existingCompany) {
-      await env.DB.prepare(`UPDATE sb_companies SET sheet_row = ? WHERE id = ?`).bind(rowIndex, companyId).run();
-    }
-  } catch (e) {
-    console.error('[sourcebot] sheet append failed:', e);
-    await send(chatId, `⚠️ Saved to database, but couldn't write to your sheet. We'll retry later.`, env);
-    return;
-  }
-
-  // 6. Confirm + auto-enter product-photo mode so the user can just keep snapping product photos
+  // 4. Auto-enter product-photo mode so the user can keep snapping right after.
   await setSession(chatId, { step: 'awaiting_product_photo', activeCompanyId: companyId }, env);
 
   const preview =
@@ -2073,13 +2009,109 @@ async function handleSupplierCard(
   // Remember this message_id so reply-to-corrections can route back to this row.
   if (messageId) {
     await env.DB.prepare(`UPDATE sb_companies SET confirmation_message_id = ? WHERE id = ?`).bind(messageId, companyId).run();
-    await env.DB.prepare(
-      `UPDATE sb_contacts SET confirmation_message_id = ?
-        WHERE id = (SELECT id FROM sb_contacts WHERE company_id = ? ORDER BY created_at DESC LIMIT 1)`
-    ).bind(messageId, companyId).run();
+    if (contactId) {
+      await env.DB.prepare(`UPDATE sb_contacts SET confirmation_message_id = ? WHERE id = ?`).bind(messageId, contactId).run();
+    }
   }
 
+  // Slow path — runs in the background so the user already has the preview by
+  // the time these complete. ctx.waitUntil keeps the worker alive until the
+  // background promise resolves. If ctx is unavailable (synthetic call from
+  // handleProductPhoto fallback), we await inline so nothing is dropped.
+  const finalize = finalizeSupplierCardInBackground({
+    buyerId:          buyer.buyerId,
+    companyId,
+    companyName,
+    contactId:        contactId ?? null,
+    showName:         pass.show_name,
+    parentFolderId:   pass.drive_folder_id ?? null,
+    sheetId:          pass.sheet_id,
+    saToken,
+    rawBuffer,
+    extracted,
+    isNewCompany:     !existingCompany,
+    chatId,
+    env,
+  });
+  if (ctx) ctx.waitUntil(finalize); else await finalize;
+
   await trackEvent(env, { buyerId: buyer.buyerId, eventName: 'supplier_captured', properties: { company: companyName, has_email: !!extracted.email } });
+}
+
+// Background tail of handleSupplierCard. Creates the per-supplier Drive
+// folder, uploads the card image, appends a row to the buyer's Sheet, and
+// patches sb_contacts.card_front_url + sb_companies.sheet_row once those IDs
+// are known. Failures are logged but never bubble up — the user already has
+// the supplier confirmed in their bot UI; the Sheet is recoverable later.
+async function finalizeSupplierCardInBackground(opts: {
+  buyerId:        string;
+  companyId:      string;
+  companyName:    string;
+  contactId:      string | null;
+  showName:       string;
+  parentFolderId: string | null;
+  sheetId:        string;
+  saToken:        string;
+  rawBuffer:      ArrayBuffer;
+  extracted:      ExtractedContactLocal;
+  isNewCompany:   boolean;
+  chatId:         number;
+  env:            Env;
+}): Promise<void> {
+  const { env } = opts;
+  let folders: SupplierFolders | undefined;
+  if (opts.parentFolderId) {
+    try {
+      folders = await getOrCreateSupplierFolders(opts.companyId, opts.companyName, opts.parentFolderId, env, opts.saToken);
+    } catch (e) {
+      console.error('[sourcebot bg] supplier folder create failed:', e);
+    }
+  }
+
+  let cardUrl: string | undefined;
+  try {
+    const parent = folders?.cards ?? opts.parentFolderId;
+    if (parent) {
+      cardUrl = await uploadCardImage(opts.rawBuffer, opts.extracted.name || 'card', opts.extracted.company, parent, opts.saToken);
+    }
+  } catch (e) {
+    console.error('[sourcebot bg] card upload failed:', e);
+  }
+
+  if (cardUrl && opts.contactId) {
+    try {
+      await env.DB.prepare(`UPDATE sb_contacts SET card_front_url = ? WHERE id = ?`).bind(cardUrl, opts.contactId).run();
+    } catch (e) {
+      console.error('[sourcebot bg] sb_contacts.card_front_url update failed:', e);
+    }
+  }
+
+  try {
+    const folderUrl = folders?.parent ? `https://drive.google.com/drive/folders/${folders.parent}` : undefined;
+    const { rowIndex } = await appendSupplierRow(opts.sheetId, {
+      timestamp:    new Date().toISOString(),
+      company:      opts.companyName,
+      contactName:  opts.extracted.name    || '',
+      title:        opts.extracted.title   || '',
+      email:        opts.extracted.email   || '',
+      phone:        opts.extracted.phone   || '',
+      website:      opts.extracted.website || '',
+      linkedin:     opts.extracted.linkedin|| '',
+      industry:     '',
+      cardFrontUrl: cardUrl,
+      folderUrl,
+    }, opts.saToken);
+
+    if (opts.isNewCompany) {
+      await env.DB.prepare(`UPDATE sb_companies SET sheet_row = ? WHERE id = ?`).bind(rowIndex, opts.companyId).run();
+    }
+  } catch (e) {
+    console.error('[sourcebot bg] sheet append failed:', e);
+    // Best-effort user nudge so they aren't silently missing a Sheet row.
+    try {
+      await send(opts.chatId, `⚠️ Saved to your account, but couldn't write to your sheet right now. We'll keep retrying — your data is safe.`, env);
+    } catch {}
+  }
 }
 
 // ── Reply-to-confirmation correction handler ───────────────────────────────

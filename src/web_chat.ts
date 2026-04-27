@@ -3,6 +3,15 @@
 import type { Env } from './types';
 import { sendVerificationEmail } from './email';
 import { getChannelAdapter } from './channel';
+import {
+  welcomeMessage,
+  textReceivedAck,
+  imageReceivedAck,
+  voiceReceivedAck,
+  trialExpiredMessage,
+  dispatchBotMessage,
+  type BotRole,
+} from './bot_copy';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Web chat HTTP surface (Sprint 2 phase 4).
@@ -125,14 +134,14 @@ export async function handleChatStart(request: Request, env: Env): Promise<Respo
     .bind(userId, role)
     .run();
 
-  // Send a system "welcome" message into the session so the user sees activity
-  // immediately when the widget opens. This is the first thing the polling
-  // frontend will pull on /api/chat/poll.
+  // Send the canonical welcome message — same wording + same menu as the
+  // Telegram bot's /start handler, sourced from bot_copy.ts. The user sees
+  // an actionable menu (Capture, My leads, Sheet) instead of a flat blurb,
+  // matching the experience on TG/WA.
   const adapter = getChannelAdapter({ channel: 'web', recipient: session.id }, env);
-  const productName = role === 'boothbot' ? 'BoothBot' : 'SourceBot';
-  await adapter.sendText(
-    `Welcome to ${productName}! Your 24-hour free trial starts when you send your first message. Send "hi" to get going.`
-  );
+  await dispatchBotMessage(adapter, welcomeMessage(role as BotRole));
+  // Note: web users don't have firstName / gmailStatus / sheetUrl yet at this
+  // gate (they just dropped an email). TG/WA pass those when they have them.
 
   return jsonResponse({
     session_token:    sessionToken,
@@ -174,13 +183,11 @@ export async function handleChatMessage(request: Request, env: Env): Promise<Res
   // bot processing, just a reply telling them to upgrade.
   const passOk = await activatePassIfNeeded(session.user_id, session.bot_role, env);
   if (!passOk.allowed) {
-    // Write the inbound row regardless (audit trail), then write a system
-    // outbound nudging upgrade.
+    // Write the inbound row regardless (audit trail), then dispatch the
+    // canonical trial-expired message (same wording on TG / WA / web).
     await insertInbound(session.id, text, body.dedupe_key, env);
     const adapter = getChannelAdapter({ channel: 'web', recipient: session.id }, env);
-    await adapter.sendText(
-      `Your 24-hour free trial ended. Grab a 96-hour show pass to keep going — ExpenseBot stays included.`
-    );
+    await dispatchBotMessage(adapter, trialExpiredMessage(session.bot_role as BotRole));
     return jsonResponse({ ok: true, status: 'trial_expired' }, 200);
   }
 
@@ -190,15 +197,177 @@ export async function handleChatMessage(request: Request, env: Env): Promise<Res
   if (inbound.duplicate)        return jsonResponse({ ok: true, status: 'duplicate_ignored' }, 200);
 
   // Bot brain dispatch happens in Sprint 2 phase 6 (refactor onto adapter).
-  // For v1 MVP we send a placeholder ack so the widget round-trip works
-  // end-to-end. After phase 6, this is replaced by routeToBoothBot/SourceBot.
+  // For v1 MVP we send the canonical "got it" ack from bot_copy.ts so the
+  // wording matches TG / WA exactly. Once phase 6 ships this is replaced by
+  // routeToBoothBot/SourceBot which run the real LLM extraction.
   const adapter = getChannelAdapter({ channel: 'web', recipient: session.id }, env);
-  await adapter.sendText(
-    `Got it: "${text.slice(0, 200)}". (Brain dispatch lands in the next sprint — your trial clock is running.)`
-  );
+  await dispatchBotMessage(adapter, textReceivedAck(session.bot_role as BotRole));
 
   return jsonResponse({ ok: true, status: 'received' }, 200);
 }
+
+
+// ── POST /api/chat/upload ────────────────────────────────────────────────────
+// multipart/form-data:
+//   session_token (text)
+//   kind          ('image' | 'voice')
+//   file          (binary)
+//   dedupe_key?   (text)
+//   caption?      (text — only meaningful for image)
+//
+// Stores the blob in R2 at `web-chat/<session_id>/<rand>.<ext>`, inserts an
+// inbound row with kind=image|voice + media_r2_key, sends a role-aware ack
+// outbound so the user gets immediate feedback.
+
+const MAX_IMAGE_BYTES = 6 * 1024 * 1024;   // 6 MB — matches app_config card_image_max_kb
+const MAX_VOICE_BYTES = 12 * 1024 * 1024;  // ~3 min at opus 64kbps
+
+export async function handleChatUpload(request: Request, env: Env): Promise<Response> {
+  if (request.method !== 'POST') return new Response('Method not allowed', { status: 405 });
+
+  let form: FormData;
+  try { form = await request.formData(); }
+  catch { return jsonResponse({ error: 'Invalid form data' }, 400); }
+
+  const sessionToken = String(form.get('session_token') ?? '').trim();
+  const kindRaw      = String(form.get('kind') ?? '').trim();
+  const dedupeKey    = String(form.get('dedupe_key') ?? '').trim() || null;
+  const caption      = String(form.get('caption') ?? '').trim() || null;
+  const file         = form.get('file');
+
+  if (!sessionToken)                 return jsonResponse({ error: 'session_token is required' }, 400);
+  if (kindRaw !== 'image' && kindRaw !== 'voice')
+                                     return jsonResponse({ error: 'kind must be image or voice' }, 400);
+  // FormData entries that came from a binary part are Blob-like (have .size +
+  // .arrayBuffer + .type). Workers runtime exposes them as Blob/File but the
+  // TS lib doesn't always include `File` — a duck-typed Blob check is enough.
+  if (!file || typeof file === 'string' || !('arrayBuffer' in (file as object))) {
+    return jsonResponse({ error: 'file is required' }, 400);
+  }
+  const blob = file as Blob & { type?: string; name?: string };
+
+  const kind: 'image' | 'voice' = kindRaw;
+  const maxBytes = kind === 'image' ? MAX_IMAGE_BYTES : MAX_VOICE_BYTES;
+  if (blob.size > maxBytes)          return jsonResponse({ error: `File too large (max ${maxBytes / 1024 / 1024}MB)` }, 413);
+  if (blob.size === 0)               return jsonResponse({ error: 'Empty file' }, 400);
+
+  const session = await env.DB
+    .prepare(`
+      SELECT s.id, s.user_id, s.bot_role
+        FROM web_chat_sessions s
+       WHERE s.session_token = ? AND s.ended_at IS NULL
+       LIMIT 1
+    `)
+    .bind(sessionToken)
+    .first<{ id: string; user_id: string; bot_role: string }>();
+  if (!session) return jsonResponse({ error: 'Invalid or ended session' }, 401);
+
+  // Same hard-cut policy as /api/chat/message.
+  const passOk = await activatePassIfNeeded(session.user_id, session.bot_role, env);
+  if (!passOk.allowed) {
+    const adapter = getChannelAdapter({ channel: 'web', recipient: session.id }, env);
+    await dispatchBotMessage(adapter, trialExpiredMessage(session.bot_role as BotRole));
+    return jsonResponse({ ok: true, status: 'trial_expired' }, 200);
+  }
+
+  // Choose extension from MIME (best-effort — falls back to bin).
+  const mime = blob.type ?? '';
+  const ext = pickExtension(mime, kind);
+  const rand = generateToken().slice(0, 16);
+  const r2Key = `web-chat/${session.id}/${Date.now()}-${rand}.${ext}`;
+  try {
+    await env.R2_BUCKET.put(r2Key, await blob.arrayBuffer(), {
+      httpMetadata: { contentType: mime || (kind === 'image' ? 'application/octet-stream' : 'audio/webm') },
+    });
+  } catch (e) {
+    console.error('[chat/upload] R2 put failed', e);
+    return jsonResponse({ error: 'Storage failed' }, 500);
+  }
+
+  // Insert inbound row. text holds caption (for image) or NULL (for voice).
+  try {
+    await env.DB
+      .prepare(`
+        INSERT INTO web_chat_messages
+          (session_id, direction, kind, text, media_r2_key, client_dedupe_key, produced_by)
+        VALUES (?, 'inbound', ?, ?, ?, ?, 'web_chat_endpoint')
+      `)
+      .bind(session.id, kind, caption, r2Key, dedupeKey)
+      .run();
+    await env.DB
+      .prepare(`UPDATE web_chat_sessions SET last_inbound_at = datetime('now') WHERE id = ?`)
+      .bind(session.id)
+      .run();
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    if (msg.includes('UNIQUE') && dedupeKey) {
+      return jsonResponse({ ok: true, status: 'duplicate_ignored' }, 200);
+    }
+    console.error('[chat/upload] inbound insert failed', { sessionId: session.id, error: msg });
+    return jsonResponse({ error: 'Failed to record message' }, 500);
+  }
+
+  // Canonical media ack from bot_copy.ts — same wording + same menu on TG/WA/web.
+  const adapter = getChannelAdapter({ channel: 'web', recipient: session.id }, env);
+  const ack = kind === 'image'
+    ? imageReceivedAck(session.bot_role as BotRole)
+    : voiceReceivedAck(session.bot_role as BotRole);
+  await dispatchBotMessage(adapter, ack);
+
+  return jsonResponse({ ok: true, status: 'received', kind, r2_key: r2Key }, 200);
+}
+
+// ── GET /api/chat/media?session_token=X&key=web-chat/<sid>/<file> ────────────
+// Streams an R2 object back. Auth-gates by:
+//   1. session_token matches a live web_chat_session,
+//   2. requested key starts with `web-chat/<that_session_id>/`.
+// This stops a leaked key from being read with someone else's token, and also
+// stops a session token from grabbing a key under another session's prefix.
+
+export async function handleChatMedia(request: Request, env: Env): Promise<Response> {
+  if (request.method !== 'GET') return new Response('Method not allowed', { status: 405 });
+
+  const url = new URL(request.url);
+  const sessionToken = (url.searchParams.get('session_token') ?? '').trim();
+  const key          = (url.searchParams.get('key')           ?? '').trim();
+  if (!sessionToken) return jsonResponse({ error: 'session_token is required' }, 400);
+  if (!key)          return jsonResponse({ error: 'key is required' }, 400);
+
+  const session = await env.DB
+    .prepare(`SELECT id FROM web_chat_sessions WHERE session_token = ? AND ended_at IS NULL LIMIT 1`)
+    .bind(sessionToken)
+    .first<{ id: string }>();
+  if (!session) return jsonResponse({ error: 'Invalid or ended session' }, 401);
+
+  if (!key.startsWith(`web-chat/${session.id}/`)) {
+    return jsonResponse({ error: 'Forbidden' }, 403);
+  }
+
+  const obj = await env.R2_BUCKET.get(key);
+  if (!obj) return new Response('Not found', { status: 404 });
+
+  const headers = new Headers();
+  headers.set('Content-Type', obj.httpMetadata?.contentType ?? 'application/octet-stream');
+  headers.set('Cache-Control', 'private, max-age=300');
+  return new Response(obj.body, { status: 200, headers });
+}
+
+function pickExtension(mime: string, kind: 'image' | 'voice'): string {
+  if (kind === 'image') {
+    if (mime.includes('jpeg') || mime.includes('jpg')) return 'jpg';
+    if (mime.includes('png'))  return 'png';
+    if (mime.includes('webp')) return 'webp';
+    if (mime.includes('heic') || mime.includes('heif')) return 'heic';
+    return 'jpg';
+  }
+  if (mime.includes('webm')) return 'webm';
+  if (mime.includes('mpeg') || mime.includes('mp3')) return 'mp3';
+  if (mime.includes('ogg'))  return 'ogg';
+  if (mime.includes('wav'))  return 'wav';
+  if (mime.includes('mp4') || mime.includes('m4a')) return 'm4a';
+  return 'webm';
+}
+
 
 // ── GET /api/chat/poll?session_token=X&since=<message_id> ────────────────────
 // Returns: { messages: [{id, kind, text, buttons?, media_url?, created_at}], next_since }
@@ -209,6 +378,7 @@ export async function handleChatPoll(request: Request, env: Env): Promise<Respon
   const url = new URL(request.url);
   const sessionToken = (url.searchParams.get('session_token') ?? '').trim();
   const since        = (url.searchParams.get('since')         ?? '').trim();   // last seen message id (TEXT)
+  const apiOrigin    = `${url.protocol}//${url.host}`;
   if (!sessionToken) return jsonResponse({ error: 'session_token is required' }, 400);
 
   const session = await env.DB
@@ -217,17 +387,18 @@ export async function handleChatPoll(request: Request, env: Env): Promise<Respon
     .first<{ id: string }>();
   if (!session) return jsonResponse({ error: 'Invalid or ended session' }, 401);
 
-  // Pull outbound messages newer than `since`. We use created_at + id as the
-  // ordering pair to stay correct under high concurrency. For v1, ordering by
-  // created_at is sufficient since outbound writes are sequential per session.
+  // Pull both inbound + outbound messages newer than `since`. Inbound rows
+  // matter because the user's own uploads (images, voice notes) only land
+  // server-side after /api/chat/upload; the widget renders them optimistically
+  // with a blob URL but loses that on reload, so we have to ship them via
+  // poll. The widget reconciles pending optimistic entries by client_dedupe_key.
   const sinceClause = since
     ? `AND created_at > (SELECT created_at FROM web_chat_messages WHERE id = ?)`
     : '';
   const sql = `
-    SELECT id, kind, text, media_r2_key, buttons_json, created_at
+    SELECT id, direction, kind, text, media_r2_key, buttons_json, client_dedupe_key, created_at
       FROM web_chat_messages
      WHERE session_id = ?
-       AND direction = 'outbound'
        ${sinceClause}
      ORDER BY created_at ASC
      LIMIT 50
@@ -236,31 +407,50 @@ export async function handleChatPoll(request: Request, env: Env): Promise<Respon
     ? env.DB.prepare(sql).bind(session.id, since)
     : env.DB.prepare(sql).bind(session.id);
   const rows = await stmt.all<{
-    id: string; kind: string; text: string | null;
-    media_r2_key: string | null; buttons_json: string | null; created_at: string;
+    id: string; direction: string; kind: string; text: string | null;
+    media_r2_key: string | null; buttons_json: string | null;
+    client_dedupe_key: string | null; created_at: string;
   }>();
 
   const messages = rows.results.map(r => {
-    let textOut: string | null = r.text;
+    let textOut:  string | null = r.text;
     let mediaUrl: string | null = null;
-    let caption: string | null = null;
-    // Image rows store {url, caption} JSON in text.
-    if (r.kind === 'image' && r.text) {
-      try {
-        const parsed = JSON.parse(r.text) as { url?: string; caption?: string };
-        mediaUrl = parsed.url ?? null;
-        caption  = parsed.caption ?? null;
-        textOut  = null;
-      } catch { /* leave as raw text */ }
+    let caption:  string | null = null;
+    // Bot-side image rows can carry the URL in two ways:
+    //   (a) {url, caption} JSON stored in `text` — used when bot links to an
+    //       externally hosted asset (e.g. the buyer card preview).
+    //   (b) `media_r2_key` populated — bot wrote the asset to R2 directly.
+    //       Convert to a tokenized /api/chat/media URL the widget can fetch.
+    if (r.kind === 'image' || r.kind === 'voice') {
+      if (r.text) {
+        try {
+          const parsed = JSON.parse(r.text) as { url?: string; caption?: string };
+          if (parsed.url) {
+            mediaUrl = parsed.url;
+            caption  = parsed.caption ?? null;
+            textOut  = null;
+          }
+        } catch { /* leave as raw text */ }
+      }
+      if (!mediaUrl && r.media_r2_key) {
+        const tok = encodeURIComponent(sessionToken);
+        const key = encodeURIComponent(r.media_r2_key);
+        // Absolute URL — the widget reads this from a different origin.
+        mediaUrl  = `${apiOrigin}/api/chat/media?session_token=${tok}&key=${key}`;
+        caption   = r.text;
+        textOut   = null;
+      }
     }
     return {
-      id:         r.id,
-      kind:       r.kind,
-      text:       textOut,
-      media_url:  mediaUrl,
+      id:                r.id,
+      direction:         r.direction,
+      kind:              r.kind,
+      text:              textOut,
+      media_url:         mediaUrl,
       caption,
-      buttons:    r.buttons_json ? JSON.parse(r.buttons_json) : null,
-      created_at: r.created_at,
+      buttons:           r.buttons_json ? JSON.parse(r.buttons_json) : null,
+      client_dedupe_key: r.client_dedupe_key,
+      created_at:        r.created_at,
     };
   });
 

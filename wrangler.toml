@@ -47,7 +47,11 @@ crons = ["0 * * * *"]
 
 [env.production.vars]
 ENVIRONMENT = "production"
-ORIGIN = "https://heydagama.com"
+# Until heydagama.com is cut over from Worker to Pages, the React app (with
+# /activate, /login, /dashboard, …) lives on the Pages preview domain. The
+# verification email's "Open in browser" CTA targets ${ORIGIN}/activate, so
+# point this at Pages, not the legacy Worker route.
+ORIGIN = "https://dagama-website.pages.dev"
 SHARED_DRIVE_ID = "0AKPcQEYiY_9IUk9PVA"
 TELEGRAM_BOT_USERNAME_DEMO = "DaGaMaDemoBot"
 

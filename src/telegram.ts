@@ -7,6 +7,14 @@ import { buildGmailAuthUrl, getGmailToken, getValidAccessToken, sendGmailEmail }
 import { buildLinkedInSearchURL, isLinkedInProfileURL, cleanLinkedInURL } from './utils/linkedin';
 import { getServiceAccountToken } from './google';
 import { ocrThenExtract } from './extract';
+import { getChannelAdapter } from './channel';
+import {
+  welcomeMessage,
+  helpMessage,
+  paywallMessage,
+  pendingActivationMessage,
+  dispatchBotMessage,
+} from './bot_copy';
 
 // ── Telegram types ────────────────────────────────────────────────────────────
 
@@ -198,11 +206,8 @@ async function handleMessage(msg: TgMessage, env: Env): Promise<void> {
   if (msg.photo && msg.photo.length > 0) {
     const hasAccess = await checkSubscription(chatId, env);
     if (!hasAccess) {
-      await sendButtons(chatId,
-        '🔒 *No active plan*\n\nYou need a DaGama plan to capture leads.\n\nVisit heydagama.com to get started.',
-        [[{ text: '🌐 Get a plan', url: 'https://heydagama.com' }]],
-        env, true
-      );
+      const adapter = getChannelAdapter({ channel: 'telegram', recipient: String(chatId), botRole: 'boothbot' }, env);
+      await dispatchBotMessage(adapter, paywallMessage('boothbot', 'no_plan'));
       return;
     }
     const photo = msg.photo.reduce((a, b) => (b.file_size ?? 0) > (a.file_size ?? 0) ? b : a);
@@ -233,11 +238,8 @@ async function handleCallback(cb: TgCallbackQuery, env: Env): Promise<void> {
   if (data === 'new_lead') {
     const hasAccess = await checkSubscription(chatId, env);
     if (!hasAccess) {
-      await sendButtons(chatId,
-        '🔒 *No active plan*\n\nYou need a DaGama plan to capture leads.\n\nVisit heydagama.com to get started.',
-        [[{ text: '🌐 Get a plan', url: 'https://heydagama.com' }]],
-        env, true
-      );
+      const adapter = getChannelAdapter({ channel: 'telegram', recipient: String(chatId), botRole: 'boothbot' }, env);
+      await dispatchBotMessage(adapter, paywallMessage('boothbot', 'no_plan'));
       return;
     }
     await startLeadCapture(chatId, cb.from.first_name, env, undefined);
@@ -614,45 +616,28 @@ async function transcribeVoice(voice: TgVoice, env: Env): Promise<string> {
 async function cmdStart(chatId: number, firstName: string, env: Env): Promise<void> {
   await setSession(chatId, { step: 'idle', lead: {} }, env);
 
+  const adapter = getChannelAdapter({ channel: 'telegram', recipient: String(chatId), botRole: 'boothbot' }, env);
   const hasAccess = await checkSubscription(chatId, env);
 
   if (!hasAccess) {
-    await sendButtons(chatId,
-      `👋 *Welcome to DaGama, ${firstName}!*\n\nI help you capture leads at trade shows — just photograph a business card and I'll do the rest.\n\n🔒 You need a plan to start capturing.`,
-      [[{ text: '🌐 Get started at heydagama.com', url: 'https://heydagama.com' }]],
-      env, true
-    );
+    // Pre-onboarding: nudge them back to the activation email so they can
+    // bind this chat to their account. Same copy as web's "no token yet".
+    await dispatchBotMessage(adapter, pendingActivationMessage('boothbot', firstName));
     return;
   }
 
+  // Active subscription — TG-specific Gmail status feeds into the canonical
+  // welcome body via the gmailStatus context field. Web/WA don't have Gmail
+  // wired yet so they pass nothing and the line is omitted.
   const gmailToken = await getGmailToken(chatId, env);
   const gmailStatus = gmailToken
     ? `✅ Gmail connected as *${gmailToken.gmail_address}*`
     : `⚠️ Gmail not connected — run /connectgmail to enable email sending`;
 
-  // 1. Welcome + commands (with action buttons)
-  const welcome =
-    `👋 *Welcome back, ${firstName}!*\n\n` +
-    `${gmailStatus}\n\n` +
-    `*Commands:*\n` +
-    `📸 *Capture a lead* — photograph a business card\n` +
-    `📋 /leads — see your recent leads\n` +
-    `📊 /sheet — open your Google Sheet\n` +
-    `🤖 /summary — AI analysis of your leads\n` +
-    `📧 /connectgmail — link Gmail for email sending\n` +
-    `✉️ /sendemail N — send follow-up to lead #N\n` +
-    `✍️ /followup N — draft a follow-up for lead #N\n` +
-    `❌ /cancel — cancel current action`;
+  await dispatchBotMessage(adapter, welcomeMessage('boothbot', { firstName, gmailStatus }));
 
-  await sendButtons(chatId, welcome,
-    [
-      [{ text: '📸 Capture a lead', callback_data: 'new_lead' }],
-      [{ text: '📋 My leads', callback_data: 'view_leads' }, { text: '📊 Google Sheet', callback_data: 'view_sheet' }],
-    ],
-    env, true
-  );
-
-  // 2. Photo tip image with caption
+  // Photo tip image — TG-only because the web composer already shows tips
+  // inline and WA users came from email which has its own card-shot guidance.
   const tipCaption =
     `*📸 Tips for a clean scan:*\n` +
     `• Hold the phone *directly above* the card\n` +
@@ -669,17 +654,8 @@ async function cmdStart(chatId: number, firstName: string, env: Env): Promise<vo
 }
 
 async function cmdHelp(chatId: number, env: Env): Promise<void> {
-  await sendButtons(chatId,
-    `*DaGama — Lead Capture Bot*\n\n` +
-    `📸 Tap *Capture a lead* to start\n` +
-    `📋 /leads — See your recent leads\n` +
-    `📊 /sheet — Open your Google Sheet\n` +
-    `🤖 /summary — AI analysis of your leads\n` +
-    `📧 /connectgmail — Link Gmail to send emails\n` +
-    `❌ /cancel — Cancel current action`,
-    [[{ text: '📸 Capture a lead', callback_data: 'new_lead' }]],
-    env, true
-  );
+  const adapter = getChannelAdapter({ channel: 'telegram', recipient: String(chatId), botRole: 'boothbot' }, env);
+  await dispatchBotMessage(adapter, helpMessage('boothbot'));
 }
 
 async function cmdLeads(chatId: number, env: Env): Promise<void> {
@@ -786,8 +762,8 @@ async function cmdStatus(chatId: number, env: Env): Promise<void> {
   ).bind(chatId, now).first<{ show_name: string; status: string; pass_expires_at: number; grace_period_end: number }>();
 
   if (!pass) {
-    await sendButtons(chatId, '⚫ No active Show Pass.\n\nCapture a lead to start a 96-hour pass for your current show.',
-      [[{ text: '📸 Capture a lead', callback_data: 'new_lead' }]], env, true);
+    const adapter = getChannelAdapter({ channel: 'telegram', recipient: String(chatId), botRole: 'boothbot' }, env);
+    await dispatchBotMessage(adapter, paywallMessage('boothbot', 'pass_expired'));
     return;
   }
 

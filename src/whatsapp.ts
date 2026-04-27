@@ -20,6 +20,12 @@ import {
   exportShowPdf,
   type EmailDraft,
 } from './sourcebot_core';
+import { getChannelAdapter } from './channel';
+import {
+  joinSuccessMessage,
+  whatsappOnboardingHint,
+  dispatchBotMessage,
+} from './bot_copy';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // WhatsApp Cloud API integration. Behind a feature flag (isWhatsAppEnabled):
@@ -689,21 +695,16 @@ async function handleUnassignedMessage(msg: WaInboundMessage, mapping: { id: str
     const token = joinMatch[1];
     const consumed = await consumeJoinToken(token, mapping.phone, env);
     if (consumed) {
-      const role = consumed.bot_role === 'sourcebot' ? 'SourceBot' : 'BoothBot';
-      await sendWhatsAppText(
-        mapping.phone,
-        `✅ Connected to ${role}. Send a card photo${consumed.bot_role === 'sourcebot' ? ' (front of supplier card)' : ''} to begin.`,
-        env,
-      );
+      // Canonical post-join confirmation — same wording on every channel.
+      const adapter = getChannelAdapter({ channel: 'whatsapp', recipient: mapping.phone }, env);
+      await dispatchBotMessage(adapter, joinSuccessMessage(consumed.bot_role));
       return;
     }
   }
 
-  await sendWhatsAppText(
-    mapping.phone,
-    `👋 Welcome to DaGama. To start, sign up at ${env.ORIGIN} — you'll get a join code that activates this chat.\n\nIf you're a freelancer, just reply "demo" to register.`,
-    env,
-  );
+  // No token / unknown join code — point them at signup.
+  const adapter = getChannelAdapter({ channel: 'whatsapp', recipient: mapping.phone }, env);
+  await dispatchBotMessage(adapter, whatsappOnboardingHint());
 }
 
 // Consume an onboarding_tokens row and bind this phone to the user/role.
