@@ -5,9 +5,11 @@ export interface Env {
   TELEGRAM_BOT_TOKEN: string;                       // BoothBot
   TELEGRAM_BOT_TOKEN_SOURCE?: string;               // SourceBot — optional until set
   TELEGRAM_BOT_TOKEN_DEMO?: string;                 // DemoBot (@DaGamaShow) — freelancer-facing
+  TELEGRAM_BOT_TOKEN_EXPENSE?: string;              // ExpenseBot — bridge between Expedition + Basecamp
   TELEGRAM_BOT_USERNAME_BOOTH?: string;             // for deep links (defaults if absent)
   TELEGRAM_BOT_USERNAME_SOURCE?: string;
   TELEGRAM_BOT_USERNAME_DEMO?: string;              // defaults to "DaGamaShow"
+  TELEGRAM_BOT_USERNAME_EXPENSE?: string;           // for deep links
   WHATSAPP_BOT_NUMBER?: string;                     // e.g. "+1415..." — empty = "coming soon"
   // ── WhatsApp Cloud API (Meta) ─────────────────────────────────────────────
   // All five must be set together for the channel to activate. If any are
