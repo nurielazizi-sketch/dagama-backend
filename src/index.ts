@@ -20,11 +20,19 @@ import {
   handleEmailDraft, handleEmailSend, handleBlast,
   handleSearch, handleCompare, handleSupplierPdf, handleShowPdf,
 } from './web_capture';
-import { handleChatStart, handleChatMessage, handleChatPoll } from './web_chat';
+import { handleChatStart, handleChatMessage, handleChatPoll, handleChatUpload, handleChatMedia } from './web_chat';
 import { processFunnelQueue } from './funnel';
 import { processDemobotQueue } from './db_emails';
+import { processRetargetingCron } from './retargeting';
 import { handleListShows, handleCreateShow, handleUpdateShow, handleDeleteShow, handleIssueFreelancerToken, handleMarkConversion } from './demobot_admin';
 import { handleAdminPage, handleAdminInventory, handleAdminConfigList, handleAdminConfigUpdate, handleAdminProbe, handleAdminWhoami } from './admin';
+import {
+  handleValidateCoupon,
+  handleRedeemCoupon,
+  handleAdminCreateCoupon,
+  handleAdminListCoupons,
+  handleAdminRevokeCoupon,
+} from './coupons_http';
 import type { Env } from './types';
 
 const CORS_HEADERS = {
@@ -51,6 +59,12 @@ export default {
     } catch (e) { console.error('[demobot] queue cron failed:', e); }
     try { await handleDemoBotDailySummaryCron(env); }
     catch (e) { console.error('[demobot] daily summary cron failed:', e); }
+    try {
+      const r = await processRetargetingCron(env);
+      if (r.ran) {
+        console.log(`[retargeting] candidates=${r.candidates} sent=${r.sent} skipped=${r.skipped} failed=${r.failed}`);
+      }
+    } catch (e) { console.error('[retargeting] cron failed:', e); }
   },
 
   async queue(batch: MessageBatch<ProcessCardJob>, env: Env): Promise<void> {
@@ -87,6 +101,8 @@ export default {
     if (path === '/api/chat/start')    return addCors(await handleChatStart(request, env));
     if (path === '/api/chat/message')  return addCors(await handleChatMessage(request, env));
     if (path === '/api/chat/poll')     return addCors(await handleChatPoll(request, env));
+    if (path === '/api/chat/upload')   return addCors(await handleChatUpload(request, env));
+    if (path === '/api/chat/media')    return addCors(await handleChatMedia(request, env));
     if (path === '/api/me')                  return addCors(await handleMe(request, env));
     if (path === '/api/stats')               return addCors(await handleStats(request, env));
     if (path === '/api/insights')            return addCors(await handleInsights(request, env));
@@ -96,6 +112,8 @@ export default {
     if (path === '/api/stripe/webhook')      return handleStripeWebhook(request, env);
     if (path === '/api/stripe/portal')       return addCors(await handleBillingPortal(request, env));
     if (path === '/api/stripe/status')       return addCors(await handleSubscriptionStatus(request, env));
+    if (path === '/api/coupons/validate')    return addCors(await handleValidateCoupon(request, env));
+    if (path === '/api/coupons/redeem')      return addCors(await handleRedeemCoupon(request, env));
     if (path === '/api/google/sheets')       return addCors(await handleGetSheets(request, env));
     if (path === '/api/gmail/callback')      return handleGmailCallback(request, env);
     if (path === '/api/onboard')              return addCors(await handleOnboard(request, env));
@@ -181,6 +199,11 @@ export default {
       const m = path.match(/^\/api\/admin\/probe\/([A-Za-z0-9_-]+)$/);
       if (m) return addCors(await handleAdminProbe(request, env, m[1]));
     }
+
+    // Admin coupons — issue / list / revoke. Library: src/coupons.ts.
+    if (path === '/api/admin/coupons' && request.method === 'GET')  return addCors(await handleAdminListCoupons(request, env));
+    if (path === '/api/admin/coupons' && request.method === 'POST') return addCors(await handleAdminCreateCoupon(request, env));
+    if (/^\/api\/admin\/coupons\/[^/]+\/revoke$/.test(path))         return addCors(await handleAdminRevokeCoupon(request, env));
 
     // ── shows_catalog (public read, admin mutations) ──────────────────────────
     if (path === '/api/shows-catalog' && request.method === 'GET')  return addCors(await handleListShows(request, env));

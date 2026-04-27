@@ -454,3 +454,134 @@ Each link can only be used once. Whichever you tap first becomes your active cha
 Replies go to support@heydagama.com.
 `;
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Retargeting email — sent by the daily cron at T-30 / T-14 / T-7 / T-1 days
+// before the user's next-show start_date (memory: dagama_retargeting_strategy).
+// Carries a per-user single-use 30%-off coupon code.
+// ─────────────────────────────────────────────────────────────────────────────
+
+export interface RetargetingEmailInput {
+  to:            string;
+  firstName:     string;
+  showName:      string;
+  showLocation:  string | null;
+  showStart:     string;       // YYYY-MM-DD
+  daysBefore:    number;       // 30 | 14 | 7 | 1
+  couponCode:    string;
+  botRole:       'boothbot' | 'sourcebot';
+}
+
+export async function sendRetargetingEmail(input: RetargetingEmailInput, env: Env): Promise<SendEmailResult> {
+  const productName = input.botRole === 'sourcebot' ? 'SourceBot' : 'BoothBot';
+  const accentHex   = input.botRole === 'sourcebot' ? '#8B5CF6' : '#00FF94';
+  const productLabel = input.botRole === 'sourcebot' ? 'Buyer Path' : 'Exhibitor Path';
+  const ctaUrl       = `${env.ORIGIN}/pricing?role=${input.botRole}&coupon=${encodeURIComponent(input.couponCode)}`;
+  const showLine     = input.showLocation ? `${input.showName} · ${input.showLocation}` : input.showName;
+  const urgency      = input.daysBefore === 1   ? `tomorrow`
+                     : input.daysBefore === 7   ? `in 1 week`
+                     : input.daysBefore === 14  ? `in 2 weeks`
+                     :                            `in ${input.daysBefore} days`;
+  const subject = `${input.showName} is ${urgency} — 30% off your show pass`;
+
+  const html = renderRetargetingHtml({
+    firstName:    input.firstName,
+    productName,
+    productLabel,
+    accentHex,
+    showLine,
+    showStart:    input.showStart,
+    urgency,
+    couponCode:   input.couponCode,
+    ctaUrl,
+  });
+  const text = renderRetargetingText({
+    firstName:    input.firstName,
+    productName,
+    showLine,
+    urgency,
+    couponCode:   input.couponCode,
+    ctaUrl,
+  });
+
+  return sendEmail({
+    from:    'Vasco DaGaMa <hello@heydagama.com>',
+    to:      input.to,
+    subject, html, text,
+    replyTo: 'support@heydagama.com',
+    tag:     'retargeting',
+  }, env);
+}
+
+function renderRetargetingHtml(args: {
+  firstName: string; productName: string; productLabel: string; accentHex: string;
+  showLine: string; showStart: string; urgency: string; couponCode: string; ctaUrl: string;
+}): string {
+  return `<!doctype html>
+<html><body style="margin:0;padding:0;background:#0D0D0D;font-family:'Inter',Arial,sans-serif;color:#F2F2F2;">
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#0D0D0D;padding:32px 16px;">
+  <tr><td align="center">
+    <table role="presentation" width="600" cellpadding="0" cellspacing="0" style="max-width:600px;background:rgba(22,22,26,0.95);border:1px solid rgba(38,38,46,0.5);border-radius:4px;">
+
+      <tr><td style="padding:32px 32px 8px 32px;">
+        <div style="font-size:11px;letter-spacing:0.18em;text-transform:uppercase;color:${args.accentHex};margin-bottom:14px;">${args.productLabel} · DaGama ${args.productName}</div>
+        <h1 style="margin:0;font-size:28px;font-weight:800;letter-spacing:-0.02em;color:#F2F2F2;line-height:1.2;">
+          ${args.showLine} is ${args.urgency}.
+        </h1>
+        <p style="margin:14px 0 0 0;font-size:15px;line-height:1.5;color:rgba(242,242,242,0.7);">
+          Hi ${escapeHtml(args.firstName)} — ${args.showStart} is around the corner. Don't head into the floor with a phone full of unread cards. ${args.productName} captures every contact and follows up while you're still walking the booths.
+        </p>
+      </td></tr>
+
+      <tr><td style="padding:24px 32px 8px 32px;">
+        <div style="padding:18px 20px;background:rgba(255,184,0,0.08);border:1px solid rgba(255,184,0,0.3);border-radius:4px;">
+          <div style="font-size:12px;letter-spacing:0.16em;text-transform:uppercase;color:#FFB800;margin-bottom:8px;">Your coupon — single use</div>
+          <div style="font-family:'JetBrains Mono','Menlo',monospace;font-size:22px;font-weight:700;color:#F2F2F2;letter-spacing:0.06em;">
+            ${args.couponCode}
+          </div>
+          <div style="margin-top:8px;font-size:13px;color:rgba(242,242,242,0.7);">30% off any 96-hour show pass. Auto-applied if you tap the button below.</div>
+        </div>
+      </td></tr>
+
+      <tr><td style="padding:24px 32px 32px 32px;">
+        <a href="${args.ctaUrl}" style="display:inline-block;padding:14px 28px;background:${args.accentHex};color:#0D0D0D;text-decoration:none;font-weight:700;border-radius:4px;font-size:15px;">
+          Get your show pass — 30% off
+        </a>
+        <p style="margin:18px 0 0 0;font-size:12px;line-height:1.5;color:rgba(242,242,242,0.4);">
+          Coupon expires day after the show starts. Single-use per account. ExpenseBot stays free with any paid show pass through 2027.
+        </p>
+      </td></tr>
+
+      <tr><td style="padding:0 32px 32px 32px;">
+        <div style="border-top:1px solid rgba(38,38,46,0.5);padding-top:18px;font-size:11px;color:rgba(242,242,242,0.4);line-height:1.5;">
+          You're receiving this because you signed up for DaGama and told us you're going to ${escapeHtml(args.showLine)}.
+          Replies go to support@heydagama.com.
+        </div>
+      </td></tr>
+
+    </table>
+  </td></tr>
+</table>
+</body></html>`;
+}
+
+function renderRetargetingText(args: {
+  firstName: string; productName: string; showLine: string; urgency: string;
+  couponCode: string; ctaUrl: string;
+}): string {
+  return `Hi ${args.firstName},
+
+${args.showLine} is ${args.urgency}. Don't walk in cold.
+
+DaGama ${args.productName} captures every contact + product on the floor and follows up while you're still walking the booths.
+
+Your single-use coupon: ${args.couponCode}  (30% off any 96-hour show pass)
+
+Get your pass: ${args.ctaUrl}
+
+Coupon expires the day after the show starts. ExpenseBot stays free with any paid show pass through 2027.
+
+Replies → support@heydagama.com
+— DaGama
+`;
+}
