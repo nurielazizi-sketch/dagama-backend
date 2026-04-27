@@ -11,6 +11,7 @@ import { handleOnboard, handleOnboardingStatus } from './onboarding';
 import { handleGoogleAuthStart, handleGoogleAuthCallback } from './google_auth';
 import { handleSourceBotWebhook, handleSourceBotSetupWebhook, handleSourceBotShowPassCron, handleAdminReset } from './sourcebot';
 import { handleDemoBotWebhook, handleDemoBotSetupWebhook, handleDemoBotDailySummaryCron } from './demobot';
+import { handleExpenseBotWebhook, handleExpenseBotSetupWebhook } from './expensebot';
 import { handleWhatsAppWebhook, isWhatsAppEnabled } from './whatsapp';
 import {
   handleWebUpload, handleListLeads, handleGetLead, handleListSuppliers, handleGetMyRole,
@@ -18,6 +19,7 @@ import {
   handleEmailDraft, handleEmailSend, handleBlast,
   handleSearch, handleCompare, handleSupplierPdf, handleShowPdf,
 } from './web_capture';
+import { handleChatStart, handleChatMessage, handleChatPoll } from './web_chat';
 import { processFunnelQueue } from './funnel';
 import { processDemobotQueue } from './db_emails';
 import { handleListShows, handleCreateShow, handleUpdateShow, handleDeleteShow, handleIssueFreelancerToken, handleMarkConversion } from './demobot_admin';
@@ -80,6 +82,9 @@ export default {
     if (path === '/api/auth/register') return addCors(await handleRegister(request, env));
     if (path === '/api/auth/login')    return addCors(await handleLogin(request, env));
     if (path === '/api/auth/activate') return addCors(await handleActivate(request, env));
+    if (path === '/api/chat/start')    return addCors(await handleChatStart(request, env));
+    if (path === '/api/chat/message')  return addCors(await handleChatMessage(request, env));
+    if (path === '/api/chat/poll')     return addCors(await handleChatPoll(request, env));
     if (path === '/api/me')                  return addCors(await handleMe(request, env));
     if (path === '/api/stats')               return addCors(await handleStats(request, env));
     if (path === '/api/insights')            return addCors(await handleInsights(request, env));
@@ -154,6 +159,10 @@ export default {
     if (path === '/api/demobot/setup')                    return addCors(await handleDemoBotSetupWebhook(request, env));
     if (path === '/api/demobot/admin/freelancer-token')   return addCors(await handleIssueFreelancerToken(request, env));
     if (path === '/api/demobot/admin/conversion')         return addCors(await handleMarkConversion(request, env));
+
+    // ── ExpenseBot (bridge between Expedition + Basecamp) ─────────────────────
+    if (path === '/api/expensebot/webhook')               return handleExpenseBotWebhook(request, env);
+    if (path === '/api/expensebot/setup')                 return addCors(await handleExpenseBotSetupWebhook(request, env));
 
     // ── shows_catalog (public read, admin mutations) ──────────────────────────
     if (path === '/api/shows-catalog' && request.method === 'GET')  return addCors(await handleListShows(request, env));

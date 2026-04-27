@@ -106,7 +106,7 @@ export function getChannelAdapter(ctx: ChannelContext, env: Env): ChannelAdapter
     case 'whatsapp':
       return new WhatsAppAdapter(ctx.recipient, env);
     case 'web':
-      throw new Error('WebChannelAdapter not yet implemented (Sprint 2 phase 2)');
+      return new WebAdapter(ctx.recipient, env);
   }
 }
 
@@ -261,5 +261,105 @@ class WhatsAppAdapter implements ChannelAdapter {
 
   async sendReaction(targetMessageId: string, emoji: string): Promise<void> {
     await sendWhatsAppReaction(this.recipient, targetMessageId, emoji, this.env);
+  }
+}
+
+// ── Web adapter ──────────────────────────────────────────────────────────────
+// "Sending" on the web channel = inserting an outbound row into web_chat_messages.
+// The frontend long-polls GET /api/chat/poll?since=<id> for new rows since the
+// last seen message id. Durable Object WebSocket upgrade is a perf follow-up;
+// long-poll is plenty for the email-gated free-tier surface volume.
+//
+// Recipient = web_chat_sessions.id (the session_id, opaque). WebAdapter never
+// needs to know the session_token (that's auth concern, handled at HTTP route).
+
+class WebAdapter implements ChannelAdapter {
+  readonly channel = 'web' as const;
+  readonly recipient: string;             // web_chat_sessions.id
+  private readonly env: Env;
+
+  constructor(sessionId: string, env: Env) {
+    this.recipient = sessionId;
+    this.env       = env;
+  }
+
+  async sendText(text: string, _opts: { markdown?: boolean } = {}): Promise<SendTextResult> {
+    // Markdown passes through; the frontend chat renderer handles the formatting
+    // (obsidian theme + Inter font already in the website CSS).
+    return this.insertOutbound({ kind: 'text', text });
+  }
+
+  async sendPhoto(args: SendPhotoArgs): Promise<SendTextResult> {
+    // For the web channel, args.url is expected to be a URL the frontend can
+    // load directly — typically a `/_r2/<key>` route. We store it under text
+    // (URL) and the kind tells the renderer to render an <img>. Buttons (if
+    // any) are written as a SECOND outbound row of kind=buttons.
+    const photo = await this.insertOutbound({
+      kind:    'image',
+      text:    args.caption ?? null,
+      r2_url:  args.url,
+    });
+    if (args.buttons && args.buttons.length > 0) {
+      await this.insertOutbound({
+        kind:         'buttons',
+        text:         null,
+        buttons_json: JSON.stringify(args.buttons.flat()),
+      });
+    }
+    return photo;
+  }
+
+  async sendButtons(args: SendButtonsArgs): Promise<SendTextResult> {
+    return this.insertOutbound({
+      kind:         'buttons',
+      text:         args.text,
+      buttons_json: JSON.stringify(args.buttons.flat()),
+    });
+  }
+
+  // No-op on web: web frontend handles its own typing indicator + reactions
+  // are not part of v1. removeButtons is also a no-op (the frontend just
+  // disables stale button rows after a tap).
+
+  private async insertOutbound(row: {
+    kind:          'text' | 'image' | 'buttons' | 'system';
+    text:          string | null;
+    r2_url?:       string;          // for kind=image, stored in text alongside metadata
+    buttons_json?: string;
+  }): Promise<SendTextResult> {
+    // Image rows store the URL in text and the R2 key (if it's an internal
+    // /_r2/<key> path) in media_r2_key for cleanup later. For external URLs
+    // we just leave media_r2_key NULL.
+    let mediaR2Key: string | null = null;
+    let textValue = row.text;
+    if (row.kind === 'image' && row.r2_url) {
+      const m = row.r2_url.match(/\/_r2\/([^?]+)/);
+      mediaR2Key = m ? decodeURIComponent(m[1]) : null;
+      // Embed URL into text JSON so the frontend has both URL + caption together
+      textValue = JSON.stringify({ url: row.r2_url, caption: row.text });
+    }
+
+    const inserted = await this.env.DB.prepare(`
+      INSERT INTO web_chat_messages (
+        session_id, direction, kind, text, media_r2_key, buttons_json, produced_by
+      ) VALUES (?, 'outbound', ?, ?, ?, ?, 'channel_adapter')
+      RETURNING id
+    `).bind(
+      this.recipient,
+      row.kind,
+      textValue,
+      mediaR2Key,
+      row.buttons_json ?? null,
+    ).first<{ id: string }>();
+
+    if (!inserted?.id) throw new Error('web_chat_messages insert returned no id');
+
+    // Bump the session's last_outbound_at so the cron / dashboard knows it's alive.
+    await this.env.DB
+      .prepare(`UPDATE web_chat_sessions SET last_outbound_at = datetime('now') WHERE id = ?`)
+      .bind(this.recipient)
+      .run();
+
+    return { messageId: inserted.id };
   }
 }
