@@ -11,6 +11,227 @@ const SHOW_PASS_DURATION_SEC = 96 * 3600;
 const GRACE_PERIOD_SEC       = 2  * 3600;
 const ONBOARDING_TOKEN_TTL_SEC = 24 * 3600;
 
+// Placeholder show name used when a user lands on the bot via the Day-1
+// signup flow without picking a show on the website. The bot prompts them
+// to pick a real show right after `cmdStartWithToken` and renames this row
+// via `renameProvisionedShow()` once they choose.
+export const PLACEHOLDER_SHOW_NAME = 'Setup';
+
+export interface ProvisionResult {
+  buyerId:            string | null;     // sb_buyers.id (sourcebot) or null (boothbot)
+  showName:           string;
+  sheetId:            string;
+  sheetUrl:           string;
+  folderId:           string;
+  folderUrl:          string;
+  alreadyProvisioned: boolean;            // true if we found a pre-existing sheet/folder and skipped creation
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// provisionBuyer — idempotent Drive folder + Sheet + per-role row creation.
+//
+// Called from:
+//   - handleOnboard (POST /api/onboard) — website form path, with showName
+//   - SourceBot cmdStartWithToken — Day-1 signup, lazy-provision with PLACEHOLDER_SHOW_NAME
+//   - BoothBot start handler — same lazy path
+//   - WhatsApp `join <token>` handler — same
+//   - Web channel redemption — same
+//
+// Idempotency: looks up an existing row keyed on (userId, showName) for the
+// requested role. If the show already has a sheet, returns the existing
+// folder/sheet URLs and `alreadyProvisioned: true`. This makes it safe to
+// call from any code path without worrying about duplicate Drive items.
+// ─────────────────────────────────────────────────────────────────────────────
+export async function provisionBuyer(opts: {
+  userId:        string;
+  email:         string;
+  name:          string;
+  role:          'sourcebot' | 'boothbot';
+  showName?:     string;
+  referrerCode?: string;
+  env:           Env;
+}): Promise<ProvisionResult> {
+  const env       = opts.env;
+  const showName  = (opts.showName ?? PLACEHOLDER_SHOW_NAME).trim() || PLACEHOLDER_SHOW_NAME;
+
+  if (!env.SHARED_DRIVE_ID) {
+    throw new Error('SHARED_DRIVE_ID not configured — service account cannot create files outside a Shared Drive.');
+  }
+
+  // 1. Idempotency check — skip Drive/Sheet creation if we've already provisioned this (user, show).
+  if (opts.role === 'sourcebot') {
+    const existing = await env.DB.prepare(
+      `SELECT b.id AS buyer_id, s.sheet_id, s.sheet_url, s.drive_folder_id, s.drive_folder_url
+         FROM sb_buyers b
+         JOIN sb_buyer_shows s ON s.buyer_id = b.id AND s.show_name = ?
+        WHERE b.user_id = ?`
+    ).bind(showName, opts.userId).first<{
+      buyer_id: string; sheet_id: string; sheet_url: string;
+      drive_folder_id: string; drive_folder_url: string;
+    }>();
+    if (existing) {
+      return {
+        buyerId: existing.buyer_id, showName,
+        sheetId: existing.sheet_id, sheetUrl: existing.sheet_url,
+        folderId: existing.drive_folder_id, folderUrl: existing.drive_folder_url,
+        alreadyProvisioned: true,
+      };
+    }
+  } else {
+    const existing = await env.DB.prepare(
+      `SELECT sheet_id, sheet_url, drive_folder_id, drive_folder_url
+         FROM google_sheets
+        WHERE user_id = ? AND show_name = ? AND owner_type = 'service_account'`
+    ).bind(opts.userId, showName).first<{
+      sheet_id: string; sheet_url: string;
+      drive_folder_id: string; drive_folder_url: string;
+    }>();
+    if (existing) {
+      return {
+        buyerId: null, showName,
+        sheetId: existing.sheet_id, sheetUrl: existing.sheet_url,
+        folderId: existing.drive_folder_id, folderUrl: existing.drive_folder_url,
+        alreadyProvisioned: true,
+      };
+    }
+  }
+
+  // 2. Create Drive folder + Sheet via service account.
+  const token   = await getServiceAccountToken(env);
+  const folder  = await createDriveFolder(`DaGama — ${showName} (${opts.email})`, env.SHARED_DRIVE_ID, token);
+  const folderId  = folder.id;
+  const folderUrl = folder.url;
+
+  let sheetId: string, sheetUrl: string;
+  if (opts.role === 'sourcebot') {
+    const sheet = await createSourceBotSheet(showName, folderId, token);
+    sheetId  = sheet.sheetId;
+    sheetUrl = sheet.sheetUrl;
+  } else {
+    const sheet = await createBoothBotSheetInFolder(showName, folderId, token);
+    sheetId  = sheet.sheetId;
+    sheetUrl = sheet.sheetUrl;
+  }
+
+  await shareDriveItem(folderId, opts.email, token, 'writer', true);
+
+  // 3. Persist per-role rows.
+  const now            = Math.floor(Date.now() / 1000);
+  const passExpiresAt  = now + SHOW_PASS_DURATION_SEC;
+  const gracePeriodEnd = passExpiresAt + GRACE_PERIOD_SEC;
+
+  let buyerId: string | null = null;
+
+  if (opts.role === 'sourcebot') {
+    let referrerBuyerId: string | null = null;
+    if (opts.referrerCode) {
+      const ref = await env.DB.prepare(`SELECT id FROM sb_buyers WHERE referral_code = ?`).bind(opts.referrerCode).first<{ id: string }>();
+      referrerBuyerId = ref?.id ?? null;
+    }
+
+    const newReferralCode = (crypto.randomUUID() as string).split('-')[0];
+    const buyer = await env.DB.prepare(
+      `INSERT INTO sb_buyers (user_id, email, name, referral_code, referred_by) VALUES (?, ?, ?, ?, ?)
+       ON CONFLICT(user_id) DO UPDATE SET email = excluded.email, name = excluded.name, updated_at = datetime('now')
+       RETURNING id`
+    ).bind(opts.userId, opts.email, opts.name, newReferralCode, opts.referrerCode ?? null).first<{ id: string }>();
+    buyerId = buyer?.id ?? null;
+    if (!buyerId) throw new Error('sb_buyers insert failed');
+
+    if (referrerBuyerId) {
+      await env.DB.prepare(
+        `INSERT INTO referrals (referrer_buyer_id, referred_buyer_id, referred_email, status)
+         SELECT ?, ?, ?, 'signed_up'
+          WHERE NOT EXISTS (SELECT 1 FROM referrals WHERE referred_buyer_id = ?)`
+      ).bind(referrerBuyerId, buyerId, opts.email, buyerId).run();
+    }
+
+    await env.DB.prepare(
+      `INSERT INTO sb_buyer_shows
+         (buyer_id, show_name, status, sheet_id, sheet_url, drive_folder_id, drive_folder_url, pass_expires_at, grace_period_end)
+       VALUES (?, ?, 'active', ?, ?, ?, ?, ?, ?)
+       ON CONFLICT(buyer_id, show_name) DO UPDATE SET
+         sheet_id = excluded.sheet_id,
+         sheet_url = excluded.sheet_url,
+         drive_folder_id = excluded.drive_folder_id,
+         drive_folder_url = excluded.drive_folder_url,
+         updated_at = datetime('now')`
+    ).bind(buyerId, showName, sheetId, sheetUrl, folderId, folderUrl, passExpiresAt, gracePeriodEnd).run();
+  } else {
+    await env.DB.prepare(
+      `INSERT INTO google_sheets (user_id, show_name, sheet_id, sheet_url, owner_type, drive_folder_id, drive_folder_url)
+       VALUES (?, ?, ?, ?, 'service_account', ?, ?)
+       ON CONFLICT(user_id, show_name) DO UPDATE SET
+         sheet_id = excluded.sheet_id,
+         sheet_url = excluded.sheet_url,
+         owner_type = 'service_account',
+         drive_folder_id = excluded.drive_folder_id,
+         drive_folder_url = excluded.drive_folder_url`
+    ).bind(opts.userId, showName, sheetId, sheetUrl, folderId, folderUrl).run();
+
+    await env.DB.prepare(
+      `INSERT INTO buyer_shows
+         (chat_id, user_id, show_name, status, first_scan_at, pass_expires_at, grace_period_end)
+       VALUES (0, ?, ?, 'active', ?, ?, ?)`
+    ).bind(opts.userId, showName, now, passExpiresAt, gracePeriodEnd).run();
+  }
+
+  return {
+    buyerId, showName, sheetId, sheetUrl, folderId, folderUrl,
+    alreadyProvisioned: false,
+  };
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// renameProvisionedShow — called when a SourceBot user picks a real show in
+// the bot after lazy-provisioning. Renames the Drive folder + Sheet doc + the
+// sb_buyer_shows row from the placeholder to the chosen show name. Idempotent
+// — if the row is already named correctly, returns immediately.
+// ─────────────────────────────────────────────────────────────────────────────
+export async function renameProvisionedShow(opts: {
+  buyerId:    string;
+  email:      string;
+  oldShowName: string;
+  newShowName: string;
+  env:         Env;
+}): Promise<void> {
+  const newShowName = opts.newShowName.trim();
+  if (!newShowName || newShowName === opts.oldShowName) return;
+
+  // Check the row still uses the old name (otherwise nothing to do).
+  const row = await opts.env.DB.prepare(
+    `SELECT sheet_id, drive_folder_id FROM sb_buyer_shows WHERE buyer_id = ? AND show_name = ?`
+  ).bind(opts.buyerId, opts.oldShowName).first<{ sheet_id: string; drive_folder_id: string }>();
+  if (!row) return;
+
+  // Drive renames: folder + sheet doc. Best-effort — DB rename happens regardless.
+  try {
+    const token = await getServiceAccountToken(opts.env);
+    const folderName = `DaGama — ${newShowName} (${opts.email})`;
+    await driveRename(row.drive_folder_id, folderName, token);
+    await driveRename(row.sheet_id,        newShowName, token);
+  } catch (e) {
+    console.warn('[onboarding] Drive rename failed (continuing with DB rename)', e);
+  }
+
+  await opts.env.DB.prepare(
+    `UPDATE sb_buyer_shows SET show_name = ?, updated_at = datetime('now')
+      WHERE buyer_id = ? AND show_name = ?`
+  ).bind(newShowName, opts.buyerId, opts.oldShowName).run();
+}
+
+async function driveRename(fileId: string, newName: string, token: string): Promise<void> {
+  const r = await fetch(
+    `https://www.googleapis.com/drive/v3/files/${encodeURIComponent(fileId)}?supportsAllDrives=true`,
+    {
+      method: 'PATCH',
+      headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name: newName }),
+    },
+  );
+  if (!r.ok) throw new Error(`Drive rename ${fileId} failed: ${r.status} ${await r.text()}`);
+}
+
 interface OnboardRequest {
   email:          string;
   name:           string;
@@ -66,99 +287,22 @@ export async function handleOnboard(request: Request, env: Env): Promise<Respons
     return jsonError(400, 'Either user_id (from Google OAuth) or password (for email/password signup) is required');
   }
 
-  // 2. Provision Sheet + Drive folder via service account
-  let sheetUrl = '', sheetId = '', folderUrl = '', folderId = '';
+  // 2-3. Provision Drive folder + Sheet + per-role rows.
+  let provisioned: ProvisionResult;
   try {
-    const token = await getServiceAccountToken(env);
-    if (!env.SHARED_DRIVE_ID) {
-      return jsonError(500, 'SHARED_DRIVE_ID not configured — service account cannot create files outside a Shared Drive.');
-    }
-    // Drive folder: "DaGama — {show} ({email})" — created inside the Shared Drive so the SA can own it.
-    const folder = await createDriveFolder(`DaGama — ${showName} (${body.email})`, env.SHARED_DRIVE_ID, token);
-    folderId  = folder.id;
-    folderUrl = folder.url;
-
-    if (body.role === 'sourcebot') {
-      const sheet = await createSourceBotSheet(showName, folderId, token);
-      sheetId  = sheet.sheetId;
-      sheetUrl = sheet.sheetUrl;
-    } else {
-      const sheet = await createBoothBotSheetInFolder(showName, folderId, token);
-      sheetId  = sheet.sheetId;
-      sheetUrl = sheet.sheetUrl;
-    }
-
-    // Share folder (sheet inherits via Drive permission inheritance)
-    await shareDriveItem(folderId, body.email, token, 'writer', true);
+    provisioned = await provisionBuyer({
+      userId, email: body.email, name: body.name,
+      role: body.role,
+      showName,
+      referrerCode: body.referrer_code,
+      env,
+    });
   } catch (e: unknown) {
     const msg = e instanceof Error ? e.message : String(e);
     return jsonError(500, `Sheet/Drive provisioning failed: ${msg}`);
   }
-
-  // 3. Persist per-role state
-  const now = Math.floor(Date.now() / 1000);
-  const passExpiresAt  = now + SHOW_PASS_DURATION_SEC;
-  const gracePeriodEnd = passExpiresAt + GRACE_PERIOD_SEC;
-
-  if (body.role === 'sourcebot') {
-    // Resolve referrer (if any) BEFORE inserting the buyer so we can stamp referred_by atomically.
-    let referrerBuyerId: string | null = null;
-    if (body.referrer_code) {
-      const ref = await env.DB.prepare(`SELECT id FROM sb_buyers WHERE referral_code = ?`).bind(body.referrer_code).first<{ id: string }>();
-      referrerBuyerId = ref?.id ?? null;
-    }
-
-    const newReferralCode = (crypto.randomUUID() as string).split('-')[0];
-    const buyer = await env.DB.prepare(
-      `INSERT INTO sb_buyers (user_id, email, name, referral_code, referred_by) VALUES (?, ?, ?, ?, ?)
-       ON CONFLICT(user_id) DO UPDATE SET email = excluded.email, name = excluded.name, updated_at = datetime('now')
-       RETURNING id`
-    ).bind(userId, body.email, body.name, newReferralCode, body.referrer_code ?? null).first<{ id: string }>();
-    const buyerId = buyer?.id;
-    if (!buyerId) return jsonError(500, 'sb_buyers insert failed');
-
-    // Log the referral relationship (idempotent — only inserts on first signup)
-    if (referrerBuyerId) {
-      await env.DB.prepare(
-        `INSERT INTO referrals (referrer_buyer_id, referred_buyer_id, referred_email, status)
-         SELECT ?, ?, ?, 'signed_up'
-          WHERE NOT EXISTS (SELECT 1 FROM referrals WHERE referred_buyer_id = ?)`
-      ).bind(referrerBuyerId, buyerId, body.email, buyerId).run();
-    }
-
-    await env.DB.prepare(
-      `INSERT INTO sb_buyer_shows
-         (buyer_id, show_name, status, sheet_id, sheet_url, drive_folder_id, drive_folder_url, pass_expires_at, grace_period_end)
-       VALUES (?, ?, 'active', ?, ?, ?, ?, ?, ?)
-       ON CONFLICT(buyer_id, show_name) DO UPDATE SET
-         sheet_id = excluded.sheet_id,
-         sheet_url = excluded.sheet_url,
-         drive_folder_id = excluded.drive_folder_id,
-         drive_folder_url = excluded.drive_folder_url,
-         updated_at = datetime('now')`
-    ).bind(buyerId, showName, sheetId, sheetUrl, folderId, folderUrl, passExpiresAt, gracePeriodEnd).run();
-  } else {
-    // BoothBot path — pre-populate google_sheets so existing saveLead flow finds it.
-    // owner_type='service_account' tells writers to use the service-account token, not user's Gmail.
-    await env.DB.prepare(
-      `INSERT INTO google_sheets (user_id, show_name, sheet_id, sheet_url, owner_type, drive_folder_id, drive_folder_url)
-       VALUES (?, ?, ?, ?, 'service_account', ?, ?)
-       ON CONFLICT(user_id, show_name) DO UPDATE SET
-         sheet_id = excluded.sheet_id,
-         sheet_url = excluded.sheet_url,
-         owner_type = 'service_account',
-         drive_folder_id = excluded.drive_folder_id,
-         drive_folder_url = excluded.drive_folder_url`
-    ).bind(userId, showName, sheetId, sheetUrl, folderId, folderUrl).run();
-
-    // Pre-create the show pass so the BoothBot show-pass logic recognizes the user.
-    // chat_id is set to 0 here as a placeholder — the bot links the real chat_id on /start.
-    await env.DB.prepare(
-      `INSERT INTO buyer_shows
-         (chat_id, user_id, show_name, status, first_scan_at, pass_expires_at, grace_period_end)
-       VALUES (0, ?, ?, 'active', ?, ?, ?)`
-    ).bind(userId, showName, now, passExpiresAt, gracePeriodEnd).run();
-  }
+  const sheetUrl  = provisioned.sheetUrl;
+  const folderUrl = provisioned.folderUrl;
 
   // 4. Mint onboarding token
   const onboardingToken = crypto.randomUUID();

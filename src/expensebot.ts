@@ -107,9 +107,21 @@ async function handleMessage(msg: TgMessage, env: Env): Promise<void> {
   const text = (msg.text ?? '').trim();
   const tgUsername = msg.from?.username ?? null;
 
-  // /start — drops any pending auth, opens the email-lookup flow.
+  // /start — three modes:
+  //   /start <token>  → dashboard "Connect ExpenseBot" deeplink: redeem the
+  //                     short-lived token and bind chat_id↔user_id directly.
+  //   /start (plain)  → email-lookup auth (the old self-serve path).
+  //   /start (already-linked) → friendly reminder of usage.
   if (text === '/start' || text.startsWith('/start ')) {
     await env.DB.prepare(`DELETE FROM expensebot_pending_auth WHERE chat_id = ?`).bind(chatId).run();
+    const arg = text.length > '/start '.length ? text.slice('/start '.length).trim() : '';
+    if (arg) {
+      const linked = await consumeLinkToken(arg, chatId, tgUsername, env);
+      if (linked === 'ok')        { await send(chatId, `Linked to your DaGama account ✅\n\nDefault context: *expedition*. Flip with /context basecamp.\n\nNow just type an expense — e.g. "45 USD coffee at the booth".`, env, true); return; }
+      if (linked === 'expired')   { await send(chatId, `That setup link has expired. Open the dashboard and tap *Connect ExpenseBot* again to get a fresh link.`, env, true); return; }
+      if (linked === 'used')      { await send(chatId, `That setup link was already used. Open the dashboard and tap *Connect ExpenseBot* again for a fresh link.`, env, true); return; }
+      // 'unknown' falls through to email-lookup as a graceful degrade.
+    }
     const bound = await loadBoundUser(chatId, env);
     if (bound) {
       await send(chatId, `You're already linked.\n\nJust send me an expense like:\n• "45 USD coffee at the booth"\n• "1200 HKD hotel night 2"\n• "€8 metro ticket"\n\nUse /context to switch between expedition (work) and basecamp (personal).\n/help for the full list.`, env);
@@ -373,6 +385,39 @@ function categoryKeyboard(expenseId: string, current: Category): Array<Array<{ t
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
+
+// Redeem a dashboard "Connect ExpenseBot" link-token. Single-shot — sets
+// used_at on success. Returns 'ok' on the bind, or a reason code so the
+// caller can render a meaningful Telegram reply.
+async function consumeLinkToken(
+  token:      string,
+  chatId:     number,
+  tgUsername: string | null,
+  env:        Env,
+): Promise<'ok' | 'expired' | 'used' | 'unknown'> {
+  const now = Math.floor(Date.now() / 1000);
+  const row = await env.DB.prepare(
+    `SELECT user_id, expires_at, used_at FROM expensebot_link_tokens WHERE token = ? LIMIT 1`
+  ).bind(token).first<{ user_id: string; expires_at: number; used_at: number | null }>();
+  if (!row) return 'unknown';
+  if (row.used_at) return 'used';
+  if (row.expires_at < now) return 'expired';
+
+  await env.DB.prepare(
+    `INSERT INTO expensebot_users_telegram (chat_id, user_id, tg_username, default_context, created_at)
+     VALUES (?, ?, ?, 'expedition', datetime('now'))
+     ON CONFLICT(chat_id) DO UPDATE SET
+       user_id     = excluded.user_id,
+       tg_username = excluded.tg_username,
+       created_at  = excluded.created_at`
+  ).bind(chatId, row.user_id, tgUsername).run();
+
+  await env.DB.prepare(
+    `UPDATE expensebot_link_tokens SET used_at = ? WHERE token = ?`
+  ).bind(now, token).run();
+
+  return 'ok';
+}
 
 async function loadBoundUser(chatId: number, env: Env): Promise<BoundUser | null> {
   const row = await env.DB.prepare(

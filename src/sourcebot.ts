@@ -1,7 +1,7 @@
 /// <reference types="@cloudflare/workers-types" />
 
 import type { Env } from './types';
-import { consumeOnboardingToken } from './onboarding';
+import { consumeOnboardingToken, provisionBuyer, renameProvisionedShow, PLACEHOLDER_SHOW_NAME } from './onboarding';
 import { getServiceAccountToken, createDriveFolder, shareDriveItem } from './google';
 import { scheduleFunnelOnFirstScan, trackEvent } from './funnel';
 import { generateSupplierPdf, generateShowPdf } from './pdf';
@@ -56,7 +56,8 @@ type SourceBotStep =
   | 'awaiting_product_lead_time'
   | 'awaiting_voice_note'
   | 'awaiting_card_back'
-  | 'awaiting_person_photo';
+  | 'awaiting_person_photo'
+  | 'awaiting_show_name';   // user is typing a custom show name after Day-1 lazy provisioning
 
 interface SourceBotSession {
   step: SourceBotStep;
@@ -127,6 +128,18 @@ async function handleMessage(msg: TgMessage, env: Env): Promise<void> {
       `Open the welcome email we sent you and tap the Telegram link there to connect.`,
       env);
     return;
+  }
+
+  // Day-1 lazy-provisioning follow-up: user typed their show name in reply to
+  // the "Which trade show?" prompt. Intercept BEFORE slash-command dispatch so
+  // free-text like "Canton Fair" is accepted; they can still escape with a
+  // slash command (in which case the show stays as 'Setup' for now).
+  {
+    const _peek = await getSession(chatId, env);
+    if (_peek.step === 'awaiting_show_name' && text && !text.startsWith('/')) {
+      await handleShowNameTyped(chatId, msg.from?.first_name ?? 'there', text, env);
+      return;
+    }
   }
 
   if (text === '/summary')                 { await cmdSummary(chatId, buyer, env); return; }
@@ -337,6 +350,15 @@ async function handleCallback(cb: TgCallbackQuery, env: Env): Promise<void> {
     }).catch(() => {});
   }
 
+  if (data.startsWith('show_pick:')) {
+    const showId = data.slice('show_pick:'.length);
+    await handleShowPick(chatId, cb.from.first_name ?? 'there', showId, env);
+    return;
+  }
+  if (data === 'show_pick_custom') {
+    await handleShowPickCustom(chatId, env);
+    return;
+  }
   if (data.startsWith('add_product:')) {
     const companyId = data.slice('add_product:'.length);
     await setSession(chatId, { step: 'awaiting_product_photo', activeCompanyId: companyId }, env);
@@ -514,6 +536,8 @@ function toastFor(data: string): string {
   if (data.startsWith('card_back:'))    return '📷 Card back';
   if (data.startsWith('person_photo:')) return '👤 Person';
   if (data === 'skip_field')           return '⏭ Skip';
+  if (data.startsWith('show_pick:'))   return '🎯 Show selected';
+  if (data === 'show_pick_custom')     return '✏️ Type the name';
   return '⏳';
 }
 
@@ -553,13 +577,35 @@ async function cmdStartWithToken(chatId: number, firstName: string, token: strin
     return;
   }
 
-  // Find the sb_buyers row for this user_id
-  const buyer = await env.DB.prepare(
+  // Find the sb_buyers row for this user_id. If missing, this user came in via
+  // the Day-1 email-only signup flow (POST /api/auth/register) which doesn't
+  // provision Drive/Sheet — we lazy-provision here on first connect.
+  let buyer = await env.DB.prepare(
     `SELECT id FROM sb_buyers WHERE user_id = ?`
   ).bind(claim.userId).first<{ id: string }>();
+
+  let needsShowPick = false;
   if (!buyer) {
-    await send(chatId, `Account not fully provisioned. Please complete signup at heydagama.com first.`, env);
-    return;
+    const user = await env.DB.prepare(`SELECT email, name FROM users WHERE id = ?`).bind(claim.userId)
+      .first<{ email: string; name: string | null }>();
+    if (!user) {
+      await send(chatId, `Account record missing. Please contact support.`, env);
+      return;
+    }
+    try {
+      const provisioned = await provisionBuyer({
+        userId: claim.userId, email: user.email, name: user.name ?? firstName,
+        role: 'sourcebot',
+        showName: claim.showName ?? PLACEHOLDER_SHOW_NAME,
+        env,
+      });
+      buyer = { id: provisioned.buyerId! };
+      needsShowPick = provisioned.showName === PLACEHOLDER_SHOW_NAME;
+    } catch (e) {
+      console.error('[sourcebot] lazy provisioning failed', e);
+      await send(chatId, `Sorry — couldn't set up your workspace right now. Please try the link again, or contact support.`, env);
+      return;
+    }
   }
 
   // Map this chat_id to the buyer (idempotent)
@@ -572,6 +618,13 @@ async function cmdStartWithToken(chatId: number, firstName: string, token: strin
   const sheet = await env.DB.prepare(
     `SELECT sheet_url FROM sb_buyer_shows WHERE buyer_id = ? ORDER BY created_at DESC LIMIT 1`
   ).bind(buyer.id).first<{ sheet_url: string | null }>();
+
+  // If we just lazy-provisioned with the placeholder show, ask the user to
+  // pick a real show. The full welcome message follows once the show is set.
+  if (needsShowPick) {
+    await cmdAskShow(chatId, firstName, buyer.id, env);
+    return;
+  }
 
   await send(chatId,
     `✅ *Connected, ${firstName}!* I'm DaGama SourceBot — your trade-show companion.\n\n` +
@@ -589,6 +642,160 @@ async function cmdStartWithToken(chatId: number, firstName: string, token: strin
     `2. Send their *product photos* 📦 right after\n` +
     `3. *Reply* with details — by voice or text 🎤\n\n` +
     `Use /help anytime for the full command list` +
+    (sheet?.sheet_url ? ` · 📊 [Open your Sheet](${sheet.sheet_url})` : '') + `.`,
+    env, true);
+}
+
+// ── Show picker (lazy-provisioning Day-1 signup follow-up) ──────────────────
+// After cmdStartWithToken provisions a placeholder workspace, we ask the user
+// which trade show they're at. We surface upcoming shows from shows_catalog
+// (date proximity = relevance — we don't have user location at signup) and
+// fall through to a free-text option. The picked name renames the placeholder
+// row + Drive folder + Sheet doc via renameProvisionedShow.
+
+async function cmdAskShow(chatId: number, firstName: string, buyerId: string, env: Env): Promise<void> {
+  // Pull upcoming shows: started up to a week ago (still running) through 90d ahead.
+  const upcoming = await env.DB.prepare(
+    `SELECT id, show_name, show_location, start_date
+       FROM shows_catalog
+      WHERE date(start_date) BETWEEN date('now', '-7 days') AND date('now', '+90 days')
+      ORDER BY start_date ASC
+      LIMIT 6`
+  ).all<{ id: string; show_name: string; show_location: string | null; start_date: string }>();
+
+  // Stash the buyer_id in session so the callback / free-text handler can find it.
+  // We piggyback on activeCompanyId since SourceBotSession doesn't have a dedicated
+  // "lazy buyer" slot and the supplier-capture flow hasn't started yet.
+  if (upcoming.results.length === 0) {
+    // No catalog suggestions — go straight to free-text awaiting_show_name.
+    await setSession(chatId, { step: 'awaiting_show_name', activeCompanyId: `lazy:${buyerId}` }, env);
+    await sendForceReply(chatId,
+      `👋 *Welcome, ${firstName}!* I'm DaGama SourceBot.\n\n` +
+      `Which trade show are you at? *Reply with the show name* (e.g. "Canton Fair Phase 1 2027").`,
+      env, true);
+    return;
+  }
+
+  await setSession(chatId, { step: 'idle', activeCompanyId: `lazy:${buyerId}` }, env);
+
+  const buttons: { text: string; callback_data: string }[][] = [];
+  for (const s of upcoming.results) {
+    const niceDate = formatShortDate(s.start_date);
+    const label = `${s.show_name}${s.show_location ? ` — ${s.show_location}` : ''}${niceDate ? ` (${niceDate})` : ''}`;
+    buttons.push([{ text: label, callback_data: `show_pick:${s.id}` }]);
+  }
+  buttons.push([{ text: '✏️ Other — type the name', callback_data: 'show_pick_custom' }]);
+
+  await sendButtons(chatId,
+    `👋 *Welcome, ${firstName}!* I'm DaGama SourceBot.\n\n` +
+    `Which trade show are you at? Pick from the upcoming list, or type your own:`,
+    buttons, env, true);
+}
+
+function formatShortDate(iso: string): string {
+  // YYYY-MM-DD → "May 1"
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(iso);
+  if (!m) return '';
+  const months = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+  const month = months[parseInt(m[2], 10) - 1];
+  const day = String(parseInt(m[3], 10));
+  return month && day ? `${month} ${day}` : '';
+}
+
+async function handleShowPick(chatId: number, firstName: string, showCatalogId: string, env: Env): Promise<void> {
+  const session = await getSession(chatId, env);
+  const buyerId = session.activeCompanyId?.startsWith('lazy:')
+    ? session.activeCompanyId.slice('lazy:'.length)
+    : null;
+  if (!buyerId) {
+    await send(chatId, `🤔 I lost track of your setup. Tap your welcome-email Telegram link again.`, env);
+    return;
+  }
+
+  const show = await env.DB.prepare(
+    `SELECT show_name FROM shows_catalog WHERE id = ?`
+  ).bind(showCatalogId).first<{ show_name: string }>();
+  if (!show) {
+    await send(chatId, `🤔 That show isn't in our catalog anymore. Type the name instead.`, env);
+    await setSession(chatId, { step: 'awaiting_show_name', activeCompanyId: `lazy:${buyerId}` }, env);
+    return;
+  }
+
+  await applyShowName(chatId, firstName, buyerId, show.show_name, env);
+}
+
+async function handleShowPickCustom(chatId: number, env: Env): Promise<void> {
+  const session = await getSession(chatId, env);
+  const buyerId = session.activeCompanyId?.startsWith('lazy:')
+    ? session.activeCompanyId.slice('lazy:'.length)
+    : null;
+  if (!buyerId) {
+    await send(chatId, `🤔 I lost track of your setup. Tap your welcome-email Telegram link again.`, env);
+    return;
+  }
+  await setSession(chatId, { step: 'awaiting_show_name', activeCompanyId: `lazy:${buyerId}` }, env);
+  await sendForceReply(chatId,
+    `✏️ *Reply with your show name* — e.g. "Canton Fair Phase 1 2027".`,
+    env, true);
+}
+
+async function handleShowNameTyped(chatId: number, firstName: string, text: string, env: Env): Promise<void> {
+  const session = await getSession(chatId, env);
+  const buyerId = session.activeCompanyId?.startsWith('lazy:')
+    ? session.activeCompanyId.slice('lazy:'.length)
+    : null;
+  if (!buyerId) {
+    await setSession(chatId, { step: 'idle' }, env);
+    return;
+  }
+  const showName = text.trim();
+  if (!showName || showName.length > 120) {
+    await send(chatId, `Show name should be 1–120 chars. Try again.`, env);
+    return;
+  }
+  await applyShowName(chatId, firstName, buyerId, showName, env);
+}
+
+async function applyShowName(chatId: number, firstName: string, buyerId: string, showName: string, env: Env): Promise<void> {
+  // Look up email for the Drive folder rename.
+  const buyer = await env.DB.prepare(
+    `SELECT b.email FROM sb_buyers b WHERE b.id = ?`
+  ).bind(buyerId).first<{ email: string }>();
+  if (!buyer) {
+    await send(chatId, `🤔 Couldn't find your buyer record. Contact support.`, env);
+    return;
+  }
+
+  await send(chatId, `🛠 Setting up *${escapeMd(showName)}*…`, env, true);
+
+  await renameProvisionedShow({
+    buyerId, email: buyer.email,
+    oldShowName: PLACEHOLDER_SHOW_NAME,
+    newShowName: showName,
+    env,
+  });
+
+  await setSession(chatId, { step: 'idle' }, env);
+
+  const sheet = await env.DB.prepare(
+    `SELECT sheet_url FROM sb_buyer_shows WHERE buyer_id = ? AND show_name = ?`
+  ).bind(buyerId, showName).first<{ sheet_url: string | null }>();
+
+  await send(chatId,
+    `✅ *Connected, ${firstName}!* You're set up for *${escapeMd(showName)}*.\n\n` +
+    `*What I do:*\n` +
+    `📇 *Capture suppliers* — send a business card photo and I'll extract every field into your Sheet.\n` +
+    `📦 *Capture products* — send a product photo right after a card and I'll attach it to that supplier.\n` +
+    `💬 *Voice + text notes* — reply to any photo with details and I'll pull out price, MOQ, lead time, materials.\n` +
+    `🔥 *Rank interest* — Hot / Warm / Cold buttons after each supplier.\n` +
+    `📧 *AI follow-ups* — /email <supplier> drafts + sends from your Gmail.\n` +
+    `📑 *PDFs* — /pdf <supplier> or /pdfshow.\n` +
+    `🔍 */find* · */compare* · */summary*.\n\n` +
+    `*Quick start:*\n` +
+    `1. 📸 Send a supplier's *business card photo*\n` +
+    `2. 📦 Send their *product photos* right after\n` +
+    `3. 🎤 *Reply* with voice or text for details\n\n` +
+    `/help anytime` +
     (sheet?.sheet_url ? ` · 📊 [Open your Sheet](${sheet.sheet_url})` : '') + `.`,
     env, true);
 }
