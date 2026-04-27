@@ -25,6 +25,8 @@ Source: [src/index.ts](../src/index.ts).
 | ANY | `/api/chat/start` | `handleChatStart` |
 | ANY | `/api/chat/message` | `handleChatMessage` |
 | ANY | `/api/chat/poll` | `handleChatPoll` |
+| ANY | `/api/chat/upload` | `handleChatUpload` |
+| ANY | `/api/chat/media` | `handleChatMedia` |
 | GET | `/api/me` | `handleMe` |
 | GET | `/api/stats` | `handleStats` |
 | GET | `/api/insights` | `handleInsights` |
@@ -34,6 +36,8 @@ Source: [src/index.ts](../src/index.ts).
 | POST | `/api/stripe/webhook` | `handleStripeWebhook` |
 | ANY | `/api/stripe/portal` | `handleBillingPortal` |
 | GET | `/api/stripe/status` | `handleSubscriptionStatus` |
+| ANY | `/api/coupons/validate` | `handleValidateCoupon` |
+| ANY | `/api/coupons/redeem` | `handleRedeemCoupon` |
 | GET | `/api/google/sheets` | `handleGetSheets` |
 | GET | `/api/gmail/callback` | `handleGmailCallback` |
 | ANY | `/api/onboard` | `handleOnboard` |
@@ -63,8 +67,10 @@ Source: [src/index.ts](../src/index.ts).
 | ANY | `/api/admin/whoami` | `handleAdminWhoami` |
 | ANY | `/api/admin/inventory` | `handleAdminInventory` |
 | GET | `/api/admin/config` | `handleAdminConfigList` |
-| GET | `(regex) /^\/api\/admin\/probe\/([A-Za-z0-9_-]+` | `handleListShows` |
-| POST | `(regex) /^\/api\/admin\/probe\/([A-Za-z0-9_-]+` | `handleCreateShow` |
+| GET | `(regex) /^\/api\/admin\/probe\/([A-Za-z0-9_-]+` | `handleAdminListCoupons` |
+| POST | `(regex) /^\/api\/admin\/probe\/([A-Za-z0-9_-]+` | `handleAdminCreateCoupon` |
+| GET | `/api/admin/coupons` | `handleAdminListCoupons` |
+| POST | `/api/admin/coupons` | `handleAdminCreateCoupon` |
 | GET | `/api/shows-catalog` | `handleListShows` |
 | POST | `/api/shows-catalog` | `handleCreateShow` |
 | PUT | `(regex) /^\/api\/shows-catalog\/([a-z0-9-]+` | `handleUpdateShow` |
